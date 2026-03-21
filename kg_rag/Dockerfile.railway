@@ -3,13 +3,8 @@ FROM continuumio/miniconda3
 WORKDIR /app
 
 COPY kg_rag/requirements.txt /app/requirements.txt
-RUN conda create -n kg_env python=3.10 -y && \
-    conda run -n kg_env pip install --upgrade pip && \
-    conda run -n kg_env pip install -r requirements.txt gunicorn
+RUN pip install --upgrade pip && pip install -r requirements.txt gunicorn
 
 COPY kg_rag/ /app/
-
-ENV CONDA_DEFAULT_ENV=kg_env
-ENV PATH=/opt/conda/envs/kg_env/bin:$PATH
 
 CMD bash -lc 'gunicorn api:app --bind 0.0.0.0:${PORT:-5005} --workers 1 --threads 4 --timeout 300'
