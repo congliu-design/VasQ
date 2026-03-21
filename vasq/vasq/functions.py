@@ -305,7 +305,7 @@ def gene_expression(user_input):
 # Invoke KG_RAG
 def query_kg_rag(user_input):
     response = requests.post(
-        "http://host.docker.internal:5005/query",
+        os.getenv("KG_RAG_URL", "http://kg-rag.railway.internal:5005/query"),
         json={"query": user_input}
     )
     return response.json().get("result", "").strip()
