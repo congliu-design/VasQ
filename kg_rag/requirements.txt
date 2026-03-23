@@ -44,11 +44,13 @@ executing==1.2.0
 fastapi==0.103.1
 fastjsonschema==2.18.0
 filelock==3.12.4
+flask
 flatbuffers==23.5.26
 fqdn==1.5.1
 frozenlist==1.4.0
 fsspec==2023.6.0
 greenlet==2.0.2
+gunicorn
 h11==0.14.0
 httptools==0.6.0
 huggingface-hub==0.17.2
