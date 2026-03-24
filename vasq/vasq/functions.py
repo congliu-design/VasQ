@@ -331,26 +331,30 @@ def query_kg_rag(user_input):
 
 # Search Google
 def search_google(query):
-
-    # Define credentials and parameters
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
     SE_ID = os.getenv("SEARCH_ENGINE_ID")
     url = "https://www.googleapis.com/customsearch/v1"
     params = {"key": GOOGLE_API_KEY, "cx": SE_ID, "q": query, "num": 5}
 
-    # Generate response
-    response = requests.get(url, params=params)
-    response.raise_for_status()
-    data = response.json()
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        print("Google status:", response.status_code)
+        print("Google body:", response.text[:1000])
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        print(f"Google search failed: {e}")
+        return ""
 
-    # Format output
     formatted_results = ""
     for idx, item in enumerate(data.get("items", []), start=1):
         title = item.get("title", "No Title")
         link = item.get("link", "No Link")
         snippet = item.get("snippet", "")
         formatted_results += f"{idx}. {title}\n{link}\n{snippet}\n\n"
+
     return formatted_results
+
 
 ### Function Descriptions ###
 
@@ -404,7 +408,11 @@ def chat(user_input, history):
         retrieved_info = func_call(user_input, chat_message, history)
     if retrieved_info == None:
         print ("Calling Google Search API...")
-        retrieved_info = search_google(user_input)
+        try:
+            retrieved_info = search_google(user_input)
+        except Exception as e:
+            print(f"Google search failed: {e}")
+            retrieved_info = []
 
     # Update session history and generate response
     update_history(history, "system", retrieved_info)
