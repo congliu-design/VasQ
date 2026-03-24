@@ -283,6 +283,15 @@ document.addEventListener("DOMContentLoaded", function() {
             scrollToBottom();
         }
     }
+    
+    function addTemporaryMessage(messageText) {
+        const messageElement = document.createElement('div');
+        messageElement.classList.add('system-message', 'thinking-message');
+        messageElement.textContent = messageText;
+        messagesContainer.appendChild(messageElement);
+        scrollToBottom();
+        return messageElement;
+    }
 
     // Identify message type
     function isTextMessage(message) {
@@ -291,37 +300,53 @@ document.addEventListener("DOMContentLoaded", function() {
 
     // Handle form submission
     if (form && messageInput && messagesContainer) {
-        form.onsubmit = async function(e) {
-            e.preventDefault();
-            const message = messageInput.value.trim();
-            if (message) {
-                messageInput.value = '';
-                addChatMessage(message, true);
-                scrollToBottom();
-                try {
-                    const response = await fetch(chatUrl, {
-                        method: "POST",
-                        headers: {
-                            "Content-Type": "application/json",
-                            "X-CSRFToken": csrfToken
-                        },
-                        body: JSON.stringify({ message: message })
-                    });
-                    const data = await response.json();
+    form.onsubmit = async function(e) {
+        e.preventDefault();
+        const message = messageInput.value.trim();
+
+        if (message) {
+            messageInput.value = '';
+            addChatMessage(message, true);
+            scrollToBottom();
+
+            const thinkingMessage = addTemporaryMessage("Thinking...");
+
+            try {
+                const response = await fetch(chatUrl, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "X-CSRFToken": csrfToken
+                    },
+                    body: JSON.stringify({ message: message })
+                });
+
+                const data = await response.json();
+
+                if (thinkingMessage) thinkingMessage.remove();
+
+                if (data.response) {
                     addChatMessage(data.response, false);
-                    if (data.graph_json) {
-                        const graphJson = JSON.parse(data.graph_json);
-                        const graphDiv = document.createElement('div');
-                        messagesContainer.appendChild(graphDiv);
-                        Plotly.react(graphDiv, graphJson.data, graphJson.layout);
-                        scrollToBottom();
-                    }
-                } catch (error) {
-                    console.error('Error:', error);
-                    addChatMessage("Failed to send message.", false);
+                } else {
+                    addChatMessage("I could not generate a response.", false);
+                }
+
+                if (data.graph_json) {
+                    const graphJson = JSON.parse(data.graph_json);
+                    const graphDiv = document.createElement('div');
+                    messagesContainer.appendChild(graphDiv);
+                    Plotly.react(graphDiv, graphJson.data, graphJson.layout);
                     scrollToBottom();
                 }
+
+            } catch (error) {
+                console.error('Error:', error);
+                if (thinkingMessage) thinkingMessage.remove();
+                addChatMessage("Failed to send message.", false);
+                scrollToBottom();
             }
-        };
-    }
+        }
+     };
+  }
+    
 });

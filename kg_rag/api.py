@@ -1,7 +1,10 @@
 from flask import Flask, request, jsonify
-import os, subprocess, traceback
+import subprocess
+import traceback
+import logging
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
 @app.route("/query", methods=["POST"])
 def query_kg_rag():
@@ -16,15 +19,26 @@ def query_kg_rag():
         "--query", user_input
     ]
 
+    app.logger.info("KG query received: %s", user_input)
+    app.logger.info("Running command: %s", " ".join(command))
+
     try:
         result = subprocess.check_output(
             command,
             cwd=base_dir,
             stderr=subprocess.STDOUT
         )
-        return jsonify({"result": result.decode("utf-8")})
+        output = result.decode("utf-8", errors="replace")
+        app.logger.info("KG success output:\n%s", output[:4000])
+        return jsonify({"result": output})
+
     except subprocess.CalledProcessError as e:
-        return jsonify({"error": e.output.decode("utf-8")}), 500
+        output = e.output.decode("utf-8", errors="replace")
+        app.logger.error("KG subprocess failed:\n%s", output)
+        return jsonify({"error": output}), 500
+
     except Exception:
-        return jsonify({"error": traceback.format_exc()}), 500
+        err = traceback.format_exc()
+        app.logger.error("KG unexpected failure:\n%s", err)
+        return jsonify({"error": err}), 500
 

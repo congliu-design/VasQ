@@ -27,17 +27,20 @@ def parse_input(request):
 
 # API endpoint for chat
 def api_chat(request):
-    
-    # Parse user input
-    user_input = parse_input(request)
-    print(f"Received message: {user_input}")
+    try:
+        user_input = parse_input(request)
+        logger.info("Received message: %s", user_input)
 
-    # Load history and process request
-    history = request.session.get('history', [])
-    content, history = chat(user_input, history)
-        
-    # Update history
-    request.session['history'] = history
+        history = request.session.get('history', [])
+        content, history = chat(user_input, history)
 
-    # Return formatted response
-    return JsonResponse({"response": content})
+        request.session['history'] = history
+        return JsonResponse({"response": content})
+
+    except Exception:
+        logger.exception("api_chat failed")
+        return JsonResponse(
+            {"response": "Sorry, something went wrong while processing your message."},
+            status=500
+        )
+

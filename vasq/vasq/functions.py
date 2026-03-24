@@ -434,7 +434,7 @@ def chat(user_input, history):
         try:
             retrieved_info = search_google(user_input)
         except Exception as e:
-            print(f"Google search failed: {e}")
+            logger.exception("Google search failed")
             retrieved_info = ""
 
     if retrieved_info is None:
