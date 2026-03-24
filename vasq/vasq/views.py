@@ -3,6 +3,20 @@ from django.http import JsonResponse
 from django.shortcuts import render
 from .functions import chat
 
+
+import logging
+logger = logging.getLogger(__name__)
+
+def chat_view(request):
+    logger.info("chat_view called: method=%s", request.method)
+    try:
+        # existing code
+        ...
+    except Exception:
+        logger.exception("chat_view failed")
+        raise
+
+
 # Render landing page
 def index(request):
     return render(request, 'vasq/index.html')

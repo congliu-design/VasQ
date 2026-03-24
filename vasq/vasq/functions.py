@@ -12,6 +12,22 @@ global init_flag
 func_flag = False
 init_flag = True
 
+
+import logging
+import os
+import requests
+
+logger = logging.getLogger(__name__)
+
+def query_kg_rag(user_input):
+    url = os.getenv("KG_RAG_URL", "http://kg-rag.railway.internal:8080/query")
+    logger.info("Calling KG_RAG_URL=%s", url)
+    response = requests.post(url, json={"query": user_input}, timeout=120)
+    logger.info("kg-rag status=%s body=%s", response.status_code, response.text[:500])
+    response.raise_for_status()
+    return response.json()
+
+
 # Set API key
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
@@ -305,7 +321,7 @@ def gene_expression(user_input):
 # Invoke KG_RAG
 def query_kg_rag(user_input):
     response = requests.post(
-        os.getenv("KG_RAG_URL", "http://kg-rag.railway.internal:5005/query"),
+        os.getenv("KG_RAG_URL", "http://kg-rag.railway.internal:8080/query"),
         json={"query": user_input}
     )
     return response.json().get("result", "").strip()
