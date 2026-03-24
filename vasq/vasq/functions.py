@@ -36,7 +36,8 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 # Call OpenAI API
 def call_api(history, functions=None):
     chat_co = openai.chat.completions.create(
-        model="gpt-4-turbo", messages=history,
+        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        messages=history,
         functions=functions, temperature=0.2, top_p=0.4
     )
     return chat_co.choices[0].message
