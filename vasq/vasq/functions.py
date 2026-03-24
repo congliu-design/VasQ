@@ -31,16 +31,26 @@ logger = logging.getLogger(__name__)
 # Set API key
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
+
+update_history(history, "system", retrieved_info)
+
 ### Helper Functions ###
 
 # Call OpenAI API
 def call_api(history, functions=None):
+    MAX_MESSAGES = 12
+
+    trimmed_history = history[-MAX_MESSAGES:]
+
     chat_co = openai.chat.completions.create(
         model=os.getenv("OPENAI_MODEL", "gpt-4o"),
-        messages=history,
-        functions=functions, temperature=0.2, top_p=0.4
+        messages=trimmed_history,
+        functions=functions,
+        temperature=0.2,
+        top_p=0.4,
     )
     return chat_co.choices[0].message
+
 
 # Update chat history
 def update_history(history, role, content):
@@ -433,6 +443,8 @@ def chat(user_input, history):
 
     if not isinstance(retrieved_info, str):
         retrieved_info = str(retrieved_info)
+
+    retrieved_info = retrieved_info[:4000]
 
     update_history(history, "system", retrieved_info)
     final_message = call_api(history).content
