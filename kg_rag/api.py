@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import subprocess
+import os, subprocess, traceback
 
 app = Flask(__name__)
 
@@ -25,5 +25,6 @@ def query_kg_rag():
         return jsonify({"result": result.decode("utf-8")})
     except subprocess.CalledProcessError as e:
         return jsonify({"error": e.output.decode("utf-8")}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return jsonify({"error": traceback.format_exc()}), 500
+
