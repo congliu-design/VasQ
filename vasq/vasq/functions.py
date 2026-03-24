@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 
-update_history(history, "system", retrieved_info)
 
 ### Helper Functions ###
 
@@ -431,7 +430,7 @@ def chat(user_input, history):
             retrieved_info = ""
 
     if retrieved_info is None:
-        print("Calling Google Search API...")
+        logger.info("Calling Google Search API...")
         try:
             retrieved_info = search_google(user_input)
         except Exception as e:
