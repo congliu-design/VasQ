@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import os, subprocess
+import subprocess
 
 app = Flask(__name__)
 
@@ -11,7 +11,6 @@ def query_kg_rag():
     script_path = "kg_rag.generation.text_generation"
 
     command = [
-        "conda", "run", "-n", "kg_env",
         "python", "-m", script_path,
         "-g", "gpt-4",
         "--query", user_input
@@ -26,3 +25,5 @@ def query_kg_rag():
         return jsonify({"result": result.decode("utf-8")})
     except subprocess.CalledProcessError as e:
         return jsonify({"error": e.output.decode("utf-8")}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
