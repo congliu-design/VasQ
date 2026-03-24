@@ -19,13 +19,13 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-def query_kg_rag(user_input):
-    url = os.getenv("KG_RAG_URL", "http://kg-rag.railway.internal:8080/query")
-    logger.info("Calling KG_RAG_URL=%s", url)
-    response = requests.post(url, json={"query": user_input}, timeout=120)
-    logger.info("kg-rag status=%s body=%s", response.status_code, response.text[:500])
-    response.raise_for_status()
-    return response.json()
+#def query_kg_rag(user_input):
+#    url = os.getenv("KG_RAG_URL", "http://kg-rag.railway.internal:8080/query")
+#    logger.info("Calling KG_RAG_URL=%s", url)
+#    response = requests.post(url, json={"query": user_input}, timeout=120)
+#    logger.info("kg-rag status=%s body=%s", response.status_code, response.text[:500])
+#    response.raise_for_status()
+#    return response.json()
 
 
 # Set API key
@@ -320,12 +320,23 @@ def gene_expression(user_input):
 ### KG-RAG Functions ###
 
 # Invoke KG_RAG
+
 def query_kg_rag(user_input):
-    response = requests.post(
-        os.getenv("KG_RAG_URL", "http://kg-rag.railway.internal:8080/query"),
-        json={"query": user_input}
-    )
-    return response.json().get("result", "").strip()
+    url = os.getenv("KG_RAG_URL", "http://kg-rag.railway.internal:8080/query")
+    logger.info("Calling KG_RAG_URL=%s", url)
+    try:
+        response = requests.post(
+            url,
+            json={"query": user_input},
+            timeout=60,
+        )
+        logger.info("kg-rag status=%s body=%s", response.status_code, response.text[:1000])
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logger.exception("KG query failed: %s", e)
+        return None
+
 
 ### Search Functions ###
 
@@ -393,29 +404,38 @@ functions = [
 def chat(user_input, history):
     global func_flag, init_flag
 
-    # Initialize chat
     if init_flag:
         history.clear()
         initialize(history)
 
-    # Update chat with user input
     update_history(history, "user", user_input)
 
-    # Select and access augmentation tools
     retrieved_info = None
     chat_message = call_api(history, functions)
+
     if chat_message.function_call:
-        retrieved_info = func_call(user_input, chat_message, history)
-    if retrieved_info == None:
-        print ("Calling Google Search API...")
+        try:
+            retrieved_info = func_call(user_input, chat_message, history)
+        except Exception as e:
+            logger.exception("func_call failed: %s", e)
+            retrieved_info = ""
+
+    if retrieved_info is None:
+        print("Calling Google Search API...")
         try:
             retrieved_info = search_google(user_input)
         except Exception as e:
             print(f"Google search failed: {e}")
-            retrieved_info = []
+            retrieved_info = ""
 
-    # Update session history and generate response
+    if retrieved_info is None:
+        retrieved_info = ""
+
+    if not isinstance(retrieved_info, str):
+        retrieved_info = str(retrieved_info)
+
     update_history(history, "system", retrieved_info)
     final_message = call_api(history).content
     update_history(history, "assistant", final_message)
     return final_message, history
+
