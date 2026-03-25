@@ -699,7 +699,7 @@ def chat(user_input, history):
     retrieved_info = retrieved_info[:4000]
 
     if retrieved_info:
-    update_history(history, "system", retrieved_info)
+        update_history(history, "system", retrieved_info)
 
     final_message = call_api(history).content
     update_history(history, "assistant", final_message)
