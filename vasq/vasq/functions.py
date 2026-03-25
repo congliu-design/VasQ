@@ -139,10 +139,9 @@ def func_call(user_input, chat_message, history):
 
 
 ### Gene Expression Functions ###
-
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-EXPR_PATH = os.path.join(DATA_DIR, "expression_markers.csv")   # rename if needed
-REGION_META_PATH = os.path.join(DATA_DIR, "region_metadata.csv")  # rename if needed
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+EXPR_PATH = os.path.join(DATA_DIR, "expression_markers.csv")
+REGION_META_PATH = os.path.join(DATA_DIR, "region_metadata.csv")
 
 
 def normalize_text(x):
