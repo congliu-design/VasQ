@@ -745,6 +745,8 @@ def chat(user_input, history):
         logger.info("Calling Google Search API...")
         try:
             retrieved_info = search_google(user_input)
+            if not retrieved_info:
+                logger.warning("Google search returned no usable results")
         except Exception as e:
             logger.exception("Google search failed")
             retrieved_info = ""
