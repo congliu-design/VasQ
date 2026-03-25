@@ -155,9 +155,19 @@ def normalize_text(x):
 
 
 def load_expression_data():
-    df = pd.read_csv(EXPR_PATH)
+    with open(EXPR_PATH, "r", encoding="utf-8", errors="ignore") as f:
+        first_line = f.readline().strip()
 
     print("EXPR_PATH:", EXPR_PATH)
+    print("FIRST LINE:", first_line)
+
+    if first_line.startswith("version https://git-lfs.github.com/spec/v1"):
+        raise ValueError(
+            f"{EXPR_PATH} is a Git LFS pointer, not the real CSV file."
+        )
+
+    df = pd.read_csv(EXPR_PATH)
+
     print("Expression columns:", df.columns.tolist())
     print(df.head(3).to_string())
 
