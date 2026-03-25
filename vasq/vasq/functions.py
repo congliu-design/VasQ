@@ -5,6 +5,10 @@ import os
 import pandas as pd
 import re
 import requests
+import difflib
+import ast
+import logging
+
 
 # Set gloabl variables
 global func_flag
@@ -12,10 +16,6 @@ global init_flag
 func_flag = False
 init_flag = True
 
-
-import logging
-import os
-import requests
 
 logger = logging.getLogger(__name__)
 
@@ -137,194 +137,447 @@ def func_call(user_input, chat_message, history):
     func_flag = False
     return content
 
+
 ### Gene Expression Functions ###
 
-# Extract cell types and regions
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+EXPR_PATH = os.path.join(DATA_DIR, "expression_markers.csv")   # rename if needed
+REGION_META_PATH = os.path.join(DATA_DIR, "region_metadata.csv")  # rename if needed
+
+
+def normalize_text(x):
+    if pd.isna(x):
+        return ""
+    x = str(x).strip().lower()
+    x = x.replace("_", " ")
+    x = x.replace("-", " ")
+    x = re.sub(r"\s+", " ", x)
+    return x
+
+
+def load_expression_data():
+    df = pd.read_csv(EXPR_PATH)
+
+    rename_map = {
+        "tissue": "region",
+        "Region": "region",
+        "CellType": "cell_type",
+        "Gene": "gene"
+    }
+    df = df.rename(columns=rename_map)
+
+    required = {"gene", "cell_type", "region", "rank"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Expression table missing required columns: {missing}")
+
+    df["gene"] = df["gene"].astype(str).str.upper().str.strip()
+    df["cell_type"] = df["cell_type"].astype(str).str.strip()
+    df["region"] = df["region"].astype(str).str.strip()
+    df["region"] = df["region"].str.replace(r"^\d+_", "", regex=True)
+
+    df["cell_type_norm"] = df["cell_type"].apply(normalize_text)
+    df["region_norm"] = df["region"].apply(normalize_text)
+
+    return df
+
+
+def load_region_metadata():
+    meta = pd.read_csv(REGION_META_PATH)
+
+    # standardize likely column names
+    rename_map = {
+        "Final_abb": "final_abb",
+        "region_abb": "region_abb",
+        "Region_layer_1": "region_layer_1",
+        "Region_layer_2": "region_layer_2",
+        "Region_layer_3": "region_layer_3",
+        "Region_layer_4": "region_layer_4",
+        "Region_layer_5": "region_layer_5",
+        "Origin": "origin",
+        "Other notes": "other_notes"
+    }
+    meta = meta.rename(columns=rename_map)
+
+    return meta
+
+
+def build_region_alias_map(meta):
+    alias_map = {}
+
+    for _, row in meta.iterrows():
+        aliases = set()
+
+        for col in [
+            "final_abb",
+            "region_abb",
+            "region_layer_1",
+            "region_layer_2",
+            "region_layer_3",
+            "region_layer_4",
+            "region_layer_5",
+            "origin",
+            "other_notes"
+        ]:
+            if col in meta.columns and pd.notna(row.get(col, None)):
+                value = str(row[col]).strip()
+                if value and value.lower() != "none" and value.upper() != "NA":
+                    aliases.add(value)
+
+        canonical = str(row.get("region_abb", "")).strip()
+        if canonical:
+            for alias in aliases:
+                alias_map[normalize_text(alias)] = canonical
+
+        # also allow final abbreviation itself to resolve to region_abb
+        final_abb = str(row.get("final_abb", "")).strip()
+        if final_abb and canonical:
+            alias_map[normalize_text(final_abb)] = canonical
+
+    # manual helpful aliases
+    manual = {
+        "hippocampus": "Hip-EC",
+        "hippocampal": "Hip-EC",
+        "hip": "Hip-EC",
+        "pons": "Pons",
+        "amygdala": "Amygdala",
+        "thalamus": "Thalamus",
+        "midbrain": "Midbrain",
+        "cerebellum": "CB",
+        "entorhinal cortex": "EC",
+        "entorhinal ctx": "EC",
+        "choroid plexus": "CP",
+        "leptomeninges": "Leptomeninges",
+        "olfactory bulb": "OB",
+        "spinal cord": "Spinal-cord",
+        "anterior cerebral artery": "ACA",
+        "middle cerebral artery": "MCA",
+        "basilar artery": "BA.CoW",
+        "circle of willis": "BA.CoW",
+        "basilar artery circle of willis": "BA.CoW",
+        "corpus callosum": "CC",
+        "fornix": "Fornix",
+        "cingulum": "Cingulum",
+        "periventricular white matter": "PVWM",
+    }
+
+    alias_map.update({normalize_text(k): v for k, v in manual.items()})
+    return alias_map
+
+
+def build_cell_type_alias_map(df):
+    canonical_cell_types = sorted(df["cell_type"].dropna().unique().tolist())
+    alias_map = {}
+
+    for ct in canonical_cell_types:
+        alias_map[normalize_text(ct)] = ct
+
+    manual = {
+        "arterial": "Arterial",
+        "arteriole": "Arteriole",
+        "artery": "Artery",
+        "capillary": "Capillary",
+        "endothelial": "Endothelial",
+        "fenestrated endothelial": "Fenestrated Endothelial",
+        "fenestrated endothelium": "Fenestrated Endothelial",
+        "pericyte": "Pericyte",
+        "smooth muscle": "Smooth Muscle",
+        "venous": "Vein",
+        "vein": "Vein",
+        "venule": "Venule",
+        "astrocyte": "Astrocyte",
+        "neuron": "Neuron",
+        "fibroblast": "Fibroblast",
+        "epithelial": "Epithelial",
+        "oligodendrocyte": "Oligodendrocyte",
+        "oligodendrocyte precursor": "Oligodendrocyte Precursor",
+        "opc": "Oligodendrocyte Precursor",
+        "microglia": "Microglia Macrophage or T Cell",
+        "macrophage": "Microglia Macrophage or T Cell",
+        "t cell": "Microglia Macrophage or T Cell",
+        "microglia macrophage or t cell": "Microglia Macrophage or T Cell",
+        "large artery": "Large Artery",
+    }
+
+    alias_map.update({normalize_text(k): v for k, v in manual.items()})
+    return alias_map
+
+
+# global cached objects
+EXPR_DF = load_expression_data()
+REGION_META_DF = load_region_metadata()
+REGION_ALIAS_MAP = build_region_alias_map(REGION_META_DF)
+CELL_TYPE_ALIAS_MAP = build_cell_type_alias_map(EXPR_DF)
+
+
+def resolve_entities_from_text(user_input, alias_map):
+    text = normalize_text(user_input)
+    found = []
+
+    # exact substring pass
+    for alias_norm, canonical in alias_map.items():
+        if alias_norm and re.search(rf"\b{re.escape(alias_norm)}\b", text):
+            found.append(canonical)
+
+    # fuzzy single-token fallback
+    if not found:
+        words = re.findall(r"\w+", text)
+        for word in words:
+            for alias_norm, canonical in alias_map.items():
+                if len(alias_norm.split()) == 1:
+                    if difflib.SequenceMatcher(None, alias_norm, word).ratio() > 0.86:
+                        found.append(canonical)
+
+    return sorted(set(found))
+
+
 def extract_entities(user_input):
-
-    cell_types = [
-        "Arteriole", "Artery", "Astrocyte", "Capillary", "Endothelial", 
-        "Epithelial", "Fenestrated Endothelial", "Fibroblast", "Large Artery", 
-        "Microglia Macrophage or T Cell", "Neuron", "Oligodendrocyte", 
-        "Oligodendrocyte Precursor", "Pericyte", "Smooth Muscle", "Vein", 
-        "Venule"
-    ]
-    regions = [
-        "Amygdala", "Anterior Cerebral Artery", 
-        "Basilar Artery / Circle of Willis", "Cerebellum", "Choroid Plexus", 
-        "Cingulum", "Corpus Callosum", "Cuneus", 
-        "Dorsolateral Prefrontal Cortex", "Entorhinal Cortex", "Fornix", 
-        "Fusiform Gyrus", "Hippocampus", "Inferior Frontal Gyrus",
-        "Inferior Parietal Lobule", "Inferior Temporal Gyrus", "Insula", 
-        "Lateral Occipital Cortex", "Lateral Temporal Gyrus", "Leptomeninges", 
-        "Lingual Gyrus", "Midbrain", "Middle Cerebral Artery",
-        "Middle Temporal Gyrus", "Midfrontal Anterior Watershed", 
-        "Olfactory Bulb", "Orbitofrontal Cortex", "Parahippocampal Gyrus", 
-        "Periventricular White Matter", "Pons", "Posterior Cingulate Cortex",
-        "Posterior Watershed", "Precuneus", "Spinal Cord", 
-        "Superior Frontal Gyrus and Rostromedial", "Superior Parietal Lobule", 
-        "Superior Temporal Gyrus", "Supramarginal Gyrus", "Thalamus",
-        "White Matter Anterior Watershed"
-    ]
-
-    def match_entities(user_input, entities):
-        found = []
-        words = re.findall(r"\w+", user_input.lower())
-
-        for entity in entities:
-            item = entity.lower()
-            pattern = rf"\b{re.escape(item)}(es|s)?\b"
-            if re.search(pattern, user_input.lower()):
-                found.append(entity)
-                continue
-            for word in words:
-                if difflib.SequenceMatcher(None, item, word).ratio() > 0.8:
-                    found.append(entity)
-                    break
-        return found
-
-    cell_matches = match_entities(user_input, cell_types)
-    region_matches = match_entities(user_input, regions)
+    cell_matches = resolve_entities_from_text(user_input, CELL_TYPE_ALIAS_MAP)
+    region_matches = resolve_entities_from_text(user_input, REGION_ALIAS_MAP)
     return cell_matches, region_matches
 
-# Extract genes
+
 def extract_genes(user_input):
-    system_prompt = "You are an expert molecular biologist. Extract *all* \
-        human gene symbols or gene names mentioned in the most recent user \
-        input. These may be short (e.g., APOE) or longer \
-        transporter/receptor-style names like SLC16A1 or SLC2A1. Return only a \
-        Python list (e.g. ['APOE', 'SLC16A1', 'INSR']). DO NOT return any \
-        genes if the user doesn't specify any by name."
+    system_prompt = (
+        "You are an expert molecular biologist. Extract all human gene symbols "
+        "or gene names explicitly mentioned in the user's message. "
+        "Return only a Python list, e.g. ['APOE', 'SLC2A1', 'CLDN5']. "
+        "If no genes are explicitly mentioned, return []."
+    )
 
     response = openai.chat.completions.create(
-        model="gpt-4-turbo",
+        model="gpt-4o",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input}
         ],
-        temperature=0.2, top_p=0.4
+        temperature=0
     )
 
     raw_text = response.choices[0].message.content.strip()
-    genes = eval(raw_text)
-    if isinstance(genes, list):
-        return genes
-    else:
-        return []
 
-# Clarify regions
+    try:
+        genes = ast.literal_eval(raw_text)
+        if isinstance(genes, list):
+            return [str(g).upper().strip() for g in genes if str(g).strip()]
+    except Exception:
+        pass
+
+    return []
+
 def all_regions(user_input):
-    system_prompt = "You are a helpful assistant. Determine if the user is \
-        asking about ALL brain regions, not just a subset. If the user \
-        mentions comparisons like 'other brain regions', 'any other regions', \
-        or 'higher/lower than elsewhere', assume they want to consider ALL \
-        regions for comparison. Examples that should return True: 'across all \
-        regions', 'in the whole brain', 'higher than other regions'. Examples \
-        that should return False: 'in the hippocampus and amygdala only'. \
-        Return ONLY the word True or False (as a Python boolean)."
+    text = user_input.lower()
+    triggers = [
+        "other regions",
+        "all regions",
+        "across regions",
+        "across all regions",
+        "rest of brain",
+        "rest of the brain",
+        "compared to other regions",
+        "versus other regions",
+        "than other regions",
+        "highest in the brain",
+        "unique to"
+    ]
+    return any(t in text for t in triggers)
+
+#def all_regions(user_input):
+#    system_prompt = (
+#        "Decide whether the user is asking for a comparison against all regions "
+#        "or across the whole dataset, rather than only filtering to explicitly "
+#        "named regions. Return only True or False.\n\n"
+#        "Return True for examples like:\n"
+#        "- 'higher than other regions'\n"
+#        "- 'specific to hippocampus compared to the rest of brain'\n"
+#        "- 'across all regions'\n"
+#        "- 'highest in the brain'\n"
+#        "- 'unique to pons versus other regions'\n\n"
+#        "Return False for examples like:\n"
+#        "- 'in hippocampus and amygdala'\n"
+#        "- 'show top genes in pons'\n"
+#        "- 'expression in thalamus'\n"
+#        "- 'compare hippocampus and amygdala only'"
+#    )
+#
+#    response = openai.chat.completions.create(
+#        model="gpt-4o",
+#        messages=[
+#            {"role": "system", "content": system_prompt},
+#            {"role": "user", "content": user_input}
+#        ],
+#        temperature=0
+#    )
+#
+#    raw_text = response.choices[0].message.content.strip().lower()
+#    return "true" in raw_text
+
+def is_cross_region_comparison(user_input):
+    system_prompt = (
+        "Determine whether the user is asking for comparison against other brain regions "
+        "or across the whole dataset. Return only True or False."
+    )
 
     response = openai.chat.completions.create(
-        model="gpt-4-turbo",
+        model="gpt-4o",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input}
         ],
-        temperature=0, top_p=0.4
+        temperature=0
     )
 
-    raw_text = response.choices[0].message.content.strip()
-    normalized = raw_text.lower()
-    if "true" in normalized:
-        return True
-    elif "false" in normalized:
-        return False
-    else:
-        return False
+    return "true" in response.choices[0].message.content.strip().lower()
 
-# Format data extraction properties
-def extract_format(cell_types=None, regions=None, entities=None, column=None):
-    if entities and column:
-        subset = lambda df: df[df[column].isin(entities)]
-        form = lambda row: f"{row[column]}, {row.gene}, rank {row.rank}"
-    else:
-        subset = (
-            lambda df: df[
-                 df["cell_type"].isin(cell_types) & df["tissue"].isin(regions)
-            ]
-        )
-        form = (
-            lambda row: f"{row.cell_type}, {row.tissue}, "
-            f"{row.gene}, rank {row.rank}"
-        )
-    return subset, form
 
-# Get gene expression data
+def is_region_filtered_query(user_input):
+    system_prompt = (
+        "Determine whether the user mainly wants results filtered to one or more explicitly "
+        "named brain regions, rather than compared to all other regions. Return only True or False."
+    )
+
+    response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_input}
+        ],
+        temperature=0
+    )
+
+    return "true" in response.choices[0].message.content.strip().lower()
+
+
+def wants_top_genes(user_input):
+    text = user_input.lower()
+    triggers = [
+        "top expressed", "highest expressed", "highest expression",
+        "top genes", "marker genes", "markers", "most expressed"
+    ]
+    return any(t in text for t in triggers)
+
+
+def wants_specific_gene(user_input, genes):
+    return len(genes) > 0
+
+
+def format_gene_rows(df, max_rows=20):
+    lines = []
+    for _, row in df.head(max_rows).iterrows():
+        line = f"{row['gene']} (rank {row['rank']}"
+        if "score" in df.columns and pd.notna(row.get("score")):
+            line += f", score {row['score']:.2f}"
+        if "logFC" in df.columns and pd.notna(row.get("logFC")):
+            line += f", logFC {row['logFC']:.2f}"
+        if "pct_expr" in df.columns and pd.notna(row.get("pct_expr")):
+            line += f", pct_expr {row['pct_expr']:.2f}"
+        line += ")"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def gene_expression(user_input):
-
-    # Extract entities
     all_regions_flag = all_regions(user_input)
     cell_types, regions = extract_entities(user_input)
     gene_names = extract_genes(user_input)
 
-    # Choose dataset to load
-    if cell_types and (regions or all_regions_flag):
-        path = "data/c2s_ct.csv"
-        subset, form = extract_format(
-            cell_types=cell_types, 
-            regions=([] if all_regions_flag else regions)
-        )
-    elif cell_types:
-        path = "data/c2s_c.csv"
-        subset, form = extract_format(
-            entities=cell_types, 
-            column="cell_type"
-        )
-    elif regions or all_regions_flag:
-        path = "data/c2s_t.csv"
-        subset, form = extract_format(
-            entities=([] if all_regions_flag else regions), 
-            column="tissue"
-        )
-    else:
-        return "No matching gene data for cell type and/or region"
+    df = EXPR_DF.copy()
 
-    # Load and filter dataset
-    df = pd.read_csv(path)
-    if not all_regions_flag:
-        df = subset(df)
+    if cell_types:
+        df = df[df["cell_type"].isin(cell_types)]
+
+    if regions and not all_regions_flag:
+        df = df[df["region"].isin(regions)]
+
     if gene_names:
-        df = df[df["gene"].str.upper().isin([g.upper() for g in gene_names])]
+        df = df[df["gene"].isin(gene_names)]
+
     if df.empty:
-        return "No matching gene data found for the specified query."
+        return "No matching gene expression data found for the specified query."
 
-    # Group data
-    group_keys = [col for col in ("cell_type", "tissue") if col in df.columns]
-    # grouped = df.groupby(group_keys)
-    grouped = df.groupby(
-        group_keys[0]) if len(group_keys) == 1 else df.groupby(group_keys
-    )
+    # case 1: user asked about specific gene(s)
+    if wants_specific_gene(user_input, gene_names):
+        group_cols = []
+        if cell_types:
+            group_cols.append("cell_type")
+        if regions and not all_regions_flag:
+            group_cols.append("region")
 
-    # Build headers
-    formatted_sections = []
-    for group_vals, group_df in grouped:
-        if not isinstance(group_vals, tuple):
-            group_vals = (group_vals,)
-        group_dict = dict(zip(group_keys, group_vals))
-        if "cell_type" in group_dict and "tissue" in group_dict:
-            header = f"Gene data for {group_dict['cell_type']} "
-            f"in {group_dict['tissue']}"
-        elif "cell_type" in group_dict:
-            header = f"Gene data for {group_dict['cell_type']}"
-        else:
-            header = f"Gene data for {group_dict['tissue']}"
-        formatted_sections.append(header)
+        if not group_cols:
+            group_cols = ["cell_type", "region"]
 
-        # Add gene data
-        for _, row in group_df.iterrows():
-            formatted_sections.append(f"{row['gene']} {row['rank']}")
-        formatted_sections.append("")
+        sections = []
+        grouped = df.sort_values("rank").groupby(group_cols)
 
-    return "\n".join(formatted_sections).strip()
+        for key, g in grouped:
+            if not isinstance(key, tuple):
+                key = (key,)
+            key_map = dict(zip(group_cols, key))
+
+            if "cell_type" in key_map and "region" in key_map:
+                header = f"Expression of {', '.join(gene_names)} in {key_map['cell_type']} of {key_map['region']}"
+            elif "cell_type" in key_map:
+                header = f"Expression of {', '.join(gene_names)} in {key_map['cell_type']}"
+            elif "region" in key_map:
+                header = f"Expression of {', '.join(gene_names)} in {key_map['region']}"
+            else:
+                header = f"Expression of {', '.join(gene_names)}"
+
+            sections.append(header)
+            sections.append(format_gene_rows(g, max_rows=20))
+            sections.append("")
+
+        return "\n".join(sections).strip()
+
+    # case 2: top genes / markers
+    if wants_top_genes(user_input) or not gene_names:
+        sort_cols = ["rank"]
+        if "score" in df.columns:
+            sort_cols = ["rank", "score"]
+
+        df = df.sort_values(sort_cols, ascending=[True, False] if len(sort_cols) == 2 else True)
+
+        group_cols = []
+        if cell_types:
+            group_cols.append("cell_type")
+        if regions and not all_regions_flag:
+            group_cols.append("region")
+
+        if not group_cols:
+            if cell_types:
+                group_cols = ["cell_type"]
+            elif regions and not all_regions_flag:
+                group_cols = ["region"]
+            else:
+                group_cols = ["cell_type", "region"]
+
+        sections = []
+        grouped = df.groupby(group_cols)
+
+        for key, g in grouped:
+            if not isinstance(key, tuple):
+                key = (key,)
+            key_map = dict(zip(group_cols, key))
+
+            if "cell_type" in key_map and "region" in key_map:
+                header = f"Top marker genes for {key_map['cell_type']} in {key_map['region']}"
+            elif "cell_type" in key_map:
+                header = f"Top marker genes for {key_map['cell_type']}"
+            elif "region" in key_map:
+                header = f"Top marker genes in {key_map['region']}"
+            else:
+                header = "Top marker genes"
+
+            sections.append(header)
+            sections.append(format_gene_rows(g, max_rows=15))
+            sections.append("")
+
+        return "\n".join(sections).strip()
+
+    return "No matching gene expression data found for the specified query."
+
+
+
 
 ### KG-RAG Functions ###
 
@@ -445,7 +698,9 @@ def chat(user_input, history):
 
     retrieved_info = retrieved_info[:4000]
 
+    if retrieved_info:
     update_history(history, "system", retrieved_info)
+
     final_message = call_api(history).content
     update_history(history, "assistant", final_message)
     return final_message, history

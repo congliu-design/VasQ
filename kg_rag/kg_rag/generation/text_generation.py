@@ -2,7 +2,7 @@ from kg_rag.utility import *
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-g', type=str, default='gpt-35-turbo', help='GPT model selection')
+parser.add_argument('-g', type=str, default='gpt-4o', help='GPT model selection')
 parser.add_argument('-e', type=bool, default=False, help='Flag for showing evidence of association from the graph')
 parser.add_argument('--query', type=str, help='User question (non-interactive)')
 

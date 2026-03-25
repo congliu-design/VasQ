@@ -15,7 +15,7 @@ def query_kg_rag():
 
     command = [
         "python", "-m", script_path,
-        "-g", "gpt-4",
+        "-g", "gpt-4o",
         "--query", user_input
     ]
 
