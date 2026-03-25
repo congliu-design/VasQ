@@ -139,9 +139,13 @@ def func_call(user_input, chat_message, history):
 
 
 ### Gene Expression Functions ###
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+DATA_DIR = "/data"
 EXPR_PATH = os.path.join(DATA_DIR, "expression_markers.csv")
 REGION_META_PATH = os.path.join(DATA_DIR, "region_metadata.csv")
+
+#DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+#EXPR_PATH = os.path.join(DATA_DIR, "expression_markers.csv")
+#REGION_META_PATH = os.path.join(DATA_DIR, "regioIn_metadata.csv")
 
 
 def normalize_text(x):
@@ -640,10 +644,24 @@ def query_kg_rag(user_input):
 
 # Search Google
 def search_google(query):
-    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-    SE_ID = os.getenv("SEARCH_ENGINE_ID")
+    google_api_key = os.getenv("GOOGLE_API_KEY")
+    search_engine_id = os.getenv("SEARCH_ENGINE_ID")
+
+    if not google_api_key:
+        print("Google search failed: GOOGLE_API_KEY is missing")
+        return ""
+
+    if not search_engine_id:
+        print("Google search failed: SEARCH_ENGINE_ID is missing")
+        return ""
+
     url = "https://www.googleapis.com/customsearch/v1"
-    params = {"key": GOOGLE_API_KEY, "cx": SE_ID, "q": query, "num": 5}
+    params = {
+        "key": google_api_key,
+        "cx": search_engine_id,
+        "q": query,
+        "num": 5,
+    }
 
     try:
         response = requests.get(url, params=params, timeout=30)
@@ -655,8 +673,13 @@ def search_google(query):
         print(f"Google search failed: {e}")
         return ""
 
+    items = data.get("items", [])
+    if not items:
+        print("Google search returned no items")
+        return ""
+
     formatted_results = ""
-    for idx, item in enumerate(data.get("items", []), start=1):
+    for idx, item in enumerate(items, start=1):
         title = item.get("title", "No Title")
         link = item.get("link", "No Link")
         snippet = item.get("snippet", "")
