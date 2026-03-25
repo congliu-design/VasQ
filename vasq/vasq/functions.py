@@ -157,6 +157,10 @@ def normalize_text(x):
 def load_expression_data():
     df = pd.read_csv(EXPR_PATH)
 
+    print("EXPR_PATH:", EXPR_PATH)
+    print("Expression columns:", df.columns.tolist())
+    print(df.head(3).to_string())
+
     rename_map = {
         "tissue": "region",
         "Region": "region",
