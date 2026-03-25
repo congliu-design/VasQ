@@ -317,10 +317,32 @@ def build_cell_type_alias_map(df):
 
 
 # global cached objects
-EXPR_DF = load_expression_data()
-REGION_META_DF = load_region_metadata()
-REGION_ALIAS_MAP = build_region_alias_map(REGION_META_DF)
-CELL_TYPE_ALIAS_MAP = build_cell_type_alias_map(EXPR_DF)
+#EXPR_DF = load_expression_data()
+#REGION_META_DF = load_region_metadata()
+#REGION_ALIAS_MAP = build_region_alias_map(REGION_META_DF)
+#CELL_TYPE_ALIAS_MAP = build_cell_type_alias_map(EXPR_DF)
+
+# global cached objects
+EXPR_DF = None
+REGION_META_DF = None
+REGION_ALIAS_MAP = None
+CELL_TYPE_ALIAS_MAP = None
+
+
+def ensure_expression_data_loaded():
+    global EXPR_DF, REGION_META_DF, REGION_ALIAS_MAP, CELL_TYPE_ALIAS_MAP
+
+    if EXPR_DF is None:
+        EXPR_DF = load_expression_data()
+
+    if REGION_META_DF is None:
+        REGION_META_DF = load_region_metadata()
+
+    if REGION_ALIAS_MAP is None:
+        REGION_ALIAS_MAP = build_region_alias_map(REGION_META_DF)
+
+    if CELL_TYPE_ALIAS_MAP is None:
+        CELL_TYPE_ALIAS_MAP = build_cell_type_alias_map(EXPR_DF)
 
 
 def resolve_entities_from_text(user_input, alias_map):
@@ -345,6 +367,7 @@ def resolve_entities_from_text(user_input, alias_map):
 
 
 def extract_entities(user_input):
+    ensure_expression_data_loaded()
     cell_matches = resolve_entities_from_text(user_input, CELL_TYPE_ALIAS_MAP)
     region_matches = resolve_entities_from_text(user_input, REGION_ALIAS_MAP)
     return cell_matches, region_matches
