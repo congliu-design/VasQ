@@ -146,9 +146,53 @@ def stream_out(output):
     print("\n")
 
 def get_gpt35():
-    chat_model_id = 'gpt-35-turbo' if openai.api_type == 'azure' else 'gpt-3.5-turbo'
+    chat_model_id = 'gpt-4o' if openai.api_type == 'azure' else 'gpt-4o'
     chat_deployment_id = chat_model_id if openai.api_type == 'azure' else None
     return chat_model_id, chat_deployment_id
+
+
+def biomedical_entity_extractor(text):
+    chat_model_id, chat_deployment_id = get_gpt35()
+
+    system_prompt = (
+        "You are an expert biomedical entity extractor. "
+        "Extract explicitly mentioned biomedical entities from the user's sentence. "
+        "Return valid JSON with exactly these keys:\n"
+        '{'
+        '"Diseases": [], '
+        '"Genes_Proteins": [], '
+        '"Drugs": [], '
+        '"Pathways": []'
+        '}\n'
+        "Rules:\n"
+        "- Include genes and proteins like PLVAP, CLDN5, APOE, VEGFA.\n"
+        "- Include diseases like Alzheimer's disease, glioblastoma, Parkinson's disease.\n"
+        "- Include drugs if explicitly mentioned.\n"
+        "- Do not invent entities.\n"
+        "- If nothing is found for a category, return an empty list.\n"
+        "- Return JSON only."
+    )
+
+    resp = get_GPT_response(
+        text,
+        system_prompt,
+        chat_model_id,
+        chat_deployment_id,
+        temperature=0
+    )
+
+    try:
+        entity_dict = json.loads(resp)
+        return entity_dict
+    except Exception:
+        return {
+            "Diseases": [],
+            "Genes_Proteins": [],
+            "Drugs": [],
+            "Pathways": []
+        }
+
+
     
 def disease_entity_extractor_v2(text):
     chat_model_id, chat_deployment_id = get_gpt35()
@@ -167,65 +211,183 @@ def load_chroma(vector_db_path, sentence_embedding_model):
     embedding_function = load_sentence_transformer(sentence_embedding_model)
     return Chroma(persist_directory=vector_db_path, embedding_function=embedding_function)
 
-def retrieve_context(question, vectorstore, embedding_function, node_context_df, context_volume, context_sim_threshold, context_sim_min_threshold, edge_evidence, api=True):
-    entities = disease_entity_extractor_v2(question)
+def retrieve_context(
+    question,
+    vectorstore,
+    embedding_function,
+    node_context_df,
+    context_volume,
+    context_sim_threshold,
+    context_sim_min_threshold,
+    edge_evidence,
+    api=True
+):
+    
+    entity_dict = biomedical_entity_extractor(question)
+
+    entities = []
+    for key in ["Genes_Proteins", "Diseases", "Drugs", "Pathways"]:
+        for item in entity_dict.get(key, []):
+            if item and item not in entities:
+                entities.append(item)
     node_hits = []
+
     if entities:
-        max_number_of_high_similarity_context_per_node = int(context_volume/len(entities))
+        max_number_of_high_similarity_context_per_node = int(context_volume / max(1, len(entities)))
+
         for entity in entities:
             node_search_result = vectorstore.similarity_search_with_score(entity, k=1)
-            node_hits.append(node_search_result[0][0].page_content)
+
+            if not node_search_result:
+                print(f"No vectorstore hit for entity: {entity}")
+                continue
+
+            top_doc = node_search_result[0][0]
+            if not getattr(top_doc, "page_content", None):
+                print(f"Top hit has no page_content for entity: {entity}")
+                continue
+
+            node_hits.append(top_doc.page_content)
+
+        if not node_hits:
+            print("No entity-level hits found, falling back to question-level search")
+            node_search_results = vectorstore.similarity_search_with_score(question, k=5)
+            node_hits = [
+                node[0].page_content
+                for node in node_search_results
+                if getattr(node[0], "page_content", None)
+            ]
+
+        if not node_hits:
+            return "No relevant knowledge graph context found."
+
         question_embedding = embedding_function.embed_query(question)
         node_context_extracted = ""
+
         for node_name in node_hits:
             if not api:
-                node_context = node_context_df[node_context_df.node_name == node_name].node_context.values[0]
+                matches = node_context_df[node_context_df.node_name == node_name]
+                if matches.empty:
+                    print(f"No node_context_df match for node: {node_name}")
+                    continue
+                node_context = matches.node_context.values[0]
             else:
-                node_context,context_table = get_context_using_spoke_api(node_name)
-            node_context_list = node_context.split(". ")        
+                node_context, context_table = get_context_using_spoke_api(node_name)
+
+            node_context_list = node_context.split(". ")
             node_context_embeddings = embedding_function.embed_documents(node_context_list)
-            similarities = [cosine_similarity(np.array(question_embedding).reshape(1, -1), np.array(node_context_embedding).reshape(1, -1)) for node_context_embedding in node_context_embeddings]
+
+            similarities = [
+                cosine_similarity(
+                    np.array(question_embedding).reshape(1, -1),
+                    np.array(node_context_embedding).reshape(1, -1)
+                )
+                for node_context_embedding in node_context_embeddings
+            ]
+
             similarities = sorted([(e, i) for i, e in enumerate(similarities)], reverse=True)
             percentile_threshold = np.percentile([s[0] for s in similarities], context_sim_threshold)
-            high_similarity_indices = [s[1] for s in similarities if s[0] > percentile_threshold and s[0] > context_sim_min_threshold]
+
+            high_similarity_indices = [
+                s[1]
+                for s in similarities
+                if s[0] > percentile_threshold and s[0] > context_sim_min_threshold
+            ]
+
             if len(high_similarity_indices) > max_number_of_high_similarity_context_per_node:
                 high_similarity_indices = high_similarity_indices[:max_number_of_high_similarity_context_per_node]
-            high_similarity_context = [node_context_list[index] for index in high_similarity_indices]            
+
+            high_similarity_context = [node_context_list[index] for index in high_similarity_indices]
+
             if edge_evidence:
-                high_similarity_context = list(map(lambda x:x+'.', high_similarity_context)) 
+                high_similarity_context = list(map(lambda x: x + '.', high_similarity_context))
                 context_table = context_table[context_table.context.isin(high_similarity_context)]
-                context_table.loc[:, "context"] =  context_table.source + " " + context_table.predicate.str.lower() + " " + context_table.target + " and Provenance of this association is " + context_table.provenance + " and attributes associated with this association is in the following JSON format:\n " + context_table.evidence.astype('str') + "\n\n"                
+                context_table.loc[:, "context"] = (
+                    context_table.source
+                    + " "
+                    + context_table.predicate.str.lower()
+                    + " "
+                    + context_table.target
+                    + " and Provenance of this association is "
+                    + context_table.provenance
+                    + " and attributes associated with this association is in the following JSON format:\n "
+                    + context_table.evidence.astype("str")
+                    + "\n\n"
+                )
                 node_context_extracted += context_table.context.str.cat(sep=' ')
             else:
                 node_context_extracted += ". ".join(high_similarity_context)
                 node_context_extracted += ". "
+
+        if not node_context_extracted.strip():
+            return "No relevant knowledge graph context found."
+
         return node_context_extracted
+
     else:
         node_hits = vectorstore.similarity_search_with_score(question, k=5)
-        max_number_of_high_similarity_context_per_node = int(context_volume/5)
+        max_number_of_high_similarity_context_per_node = int(context_volume / 5)
         question_embedding = embedding_function.embed_query(question)
         node_context_extracted = ""
+
         for node in node_hits:
             node_name = node[0].page_content
             if not api:
-                node_context = node_context_df[node_context_df.node_name == node_name].node_context.values[0]
+                matches = node_context_df[node_context_df.node_name == node_name]
+                if matches.empty:
+                    print(f"No node_context_df match for node: {node_name}")
+                    continue
+                node_context = matches.node_context.values[0]
             else:
                 node_context, context_table = get_context_using_spoke_api(node_name)
-            node_context_list = node_context.split(". ")        
+
+            node_context_list = node_context.split(". ")
             node_context_embeddings = embedding_function.embed_documents(node_context_list)
-            similarities = [cosine_similarity(np.array(question_embedding).reshape(1, -1), np.array(node_context_embedding).reshape(1, -1)) for node_context_embedding in node_context_embeddings]
+
+            similarities = [
+                cosine_similarity(
+                    np.array(question_embedding).reshape(1, -1),
+                    np.array(node_context_embedding).reshape(1, -1)
+                )
+                for node_context_embedding in node_context_embeddings
+            ]
+
             similarities = sorted([(e, i) for i, e in enumerate(similarities)], reverse=True)
             percentile_threshold = np.percentile([s[0] for s in similarities], context_sim_threshold)
-            high_similarity_indices = [s[1] for s in similarities if s[0] > percentile_threshold and s[0] > context_sim_min_threshold]
+
+            high_similarity_indices = [
+                s[1]
+                for s in similarities
+                if s[0] > percentile_threshold and s[0] > context_sim_min_threshold
+            ]
+
             if len(high_similarity_indices) > max_number_of_high_similarity_context_per_node:
                 high_similarity_indices = high_similarity_indices[:max_number_of_high_similarity_context_per_node]
+
             high_similarity_context = [node_context_list[index] for index in high_similarity_indices]
+
             if edge_evidence:
-                high_similarity_context = list(map(lambda x:x+'.', high_similarity_context))
+                high_similarity_context = list(map(lambda x: x + '.', high_similarity_context))
                 context_table = context_table[context_table.context.isin(high_similarity_context)]
-                context_table.loc[:, "context"] =  context_table.source + " " + context_table.predicate.str.lower() + " " + context_table.target + " and Provenance of this association is " + context_table.provenance + " and attributes associated with this association is in the following JSON format:\n " + context_table.evidence.astype('str') + "\n\n"                
+                context_table.loc[:, "context"] = (
+                    context_table.source
+                    + " "
+                    + context_table.predicate.str.lower()
+                    + " "
+                    + context_table.target
+                    + " and Provenance of this association is "
+                    + context_table.provenance
+                    + " and attributes associated with this association is in the following JSON format:\n "
+                    + context_table.evidence.astype("str")
+                    + "\n\n"
+                )
                 node_context_extracted += context_table.context.str.cat(sep=' ')
             else:
                 node_context_extracted += ". ".join(high_similarity_context)
                 node_context_extracted += ". "
+
+        if not node_context_extracted.strip():
+            return "No relevant knowledge graph context found."
+
         return node_context_extracted
+
