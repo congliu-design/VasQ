@@ -746,6 +746,7 @@ def looks_like_expression_query(user_input):
 ### Main Chat Function ###
 
 # Chat between user and chatbot
+
 def chat(user_input, history):
     global func_flag, init_flag
 
@@ -763,19 +764,19 @@ def chat(user_input, history):
             retrieved_info = func_call(user_input, chat_message, history)
         except Exception as e:
             logger.exception("func_call failed: %s", e)
-            retrieved_info = ""
+            retrieved_info = None
 
-    # If function calling missed it, try local gene-expression data first
-    if retrieved_info is None and looks_like_expression_query(user_input):
+    # If function calling missed it or returned nothing useful, try local gene-expression data first
+    if not retrieved_info and looks_like_expression_query(user_input):
         logger.info("Heuristic routing to gene_expression first")
         try:
             retrieved_info = gene_expression(user_input)
         except Exception as e:
             logger.exception("gene_expression heuristic failed: %s", e)
-            retrieved_info = ""
+            retrieved_info = None
 
-    # Optional: KG-RAG before Google for graph-style biomedical questions
-    if retrieved_info is None:
+    # KG-RAG before Google for graph-style biomedical questions
+    if not retrieved_info:
         lowered = user_input.lower()
         kg_terms = [
             "drug", "drugs", "target", "targets", "disease",
@@ -786,9 +787,9 @@ def chat(user_input, history):
                 retrieved_info = query_kg_rag(user_input)
             except Exception as e:
                 logger.exception("KG query failed: %s", e)
-                retrieved_info = ""
+                retrieved_info = None
 
-    if retrieved_info is None:
+    if not retrieved_info:
         logger.info("Calling Google Search API...")
         try:
             retrieved_info = search_google(user_input)
@@ -796,9 +797,9 @@ def chat(user_input, history):
                 logger.warning("Google search returned no usable results")
         except Exception as e:
             logger.exception("Google search failed")
-            retrieved_info = ""
+            retrieved_info = None
 
-    if retrieved_info is None:
+    if not retrieved_info:
         retrieved_info = ""
 
     if not isinstance(retrieved_info, str):
@@ -812,4 +813,5 @@ def chat(user_input, history):
     final_message = call_api(history).content
     update_history(history, "assistant", final_message)
     return final_message, history
+
 
