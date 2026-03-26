@@ -32,10 +32,16 @@ def api_chat(request):
         logger.info("Received message: %s", user_input)
 
         history = request.session.get('history', [])
-        content, history = chat(user_input, history)
+        
+        content, history, graph_json = chat(user_input, history)
 
         request.session['history'] = history
-        return JsonResponse({"response": content})
+
+        return JsonResponse({
+            "response": content,
+            "graph_json": graph_json
+        })
+
 
     except Exception:
         logger.exception("api_chat failed")

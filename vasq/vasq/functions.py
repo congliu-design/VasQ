@@ -320,6 +320,65 @@ def build_cell_type_alias_map(df):
     return alias_map
 
 
+def build_expression_plot(df, gene_name=None, max_rows=8, metric="score"):
+    plot_df = df.copy()
+
+    if plot_df.empty:
+        return None
+
+    if metric not in plot_df.columns:
+        metric = "rank"
+
+    if metric == "rank":
+        plot_df = plot_df.sort_values("rank", ascending=True).head(max_rows)
+        y_vals = plot_df["rank"].tolist()
+        y_title = "Rank"
+    else:
+        plot_df = plot_df.sort_values([metric, "rank"], ascending=[False, True]).head(max_rows)
+        y_vals = plot_df[metric].tolist()
+        y_title = metric
+
+    labels = [
+        f"{pretty_region_name(row['region'])} | {row['cell_type']}"
+        for _, row in plot_df.iterrows()
+    ]
+
+    hover_text = []
+    for _, row in plot_df.iterrows():
+        text = f"{row['gene']}<br>{pretty_region_name(row['region'])}<br>{row['cell_type']}"
+        text += f"<br>rank {row['rank']}"
+        if "score" in plot_df.columns and pd.notna(row.get("score")):
+            text += f"<br>score {row['score']:.2f}"
+        if "logFC" in plot_df.columns and pd.notna(row.get("logFC")):
+            text += f"<br>logFC {row['logFC']:.2f}"
+        if "pct_expr" in plot_df.columns and pd.notna(row.get("pct_expr")):
+            text += f"<br>pct_expr {row['pct_expr']:.2f}"
+        hover_text.append(text)
+
+    title = f"{gene_name} expression across matched regions/cell types" if gene_name else "Expression across matched regions/cell types"
+
+    fig = {
+        "data": [
+            {
+                "type": "bar",
+                "x": labels,
+                "y": y_vals,
+                "text": hover_text,
+                "hoverinfo": "text"
+            }
+        ],
+        "layout": {
+            "title": title,
+            "xaxis": {"title": "Region | Cell type"},
+            "yaxis": {"title": y_title},
+            "margin": {"l": 60, "r": 20, "t": 60, "b": 160}
+        }
+    }
+
+    return json.dumps(fig)
+
+
+
 # global cached objects
 #EXPR_DF = load_expression_data()
 #REGION_META_DF = load_region_metadata()
@@ -617,6 +676,15 @@ def format_gene_rows(df, max_rows=20):
     return "\n".join(lines)
 
 
+def pretty_region_name(region):
+    region_map = {
+        "CP": "choroid plexus",
+        "Hip-EC": "hippocampal-entorhinal vasculature",
+        "ACA": "anterior cerebral artery",
+        "BA.CoW": "basilar artery / circle of Willis",
+    }
+    return region_map.get(region, region)
+
 def gene_expression(user_input):
     ensure_expression_data_loaded()
     all_regions_flag = all_regions(user_input)
@@ -693,24 +761,22 @@ def gene_expression(user_input):
         prefix = f"Using {match_note} because no exact dataset match was found.\n\n"
 
     # case 1: user asked about specific gene(s)
-        if wants_specific_gene(user_input, gene_names):
+
+    if wants_specific_gene(user_input, gene_names):
         if "score" in df.columns:
             df = df.sort_values(["score", "rank"], ascending=[False, True])
         else:
             df = df.sort_values("rank", ascending=True)
 
-        header = f"Expression of {', '.join(gene_names)}"
-        if cell_types:
-            header += f" in cell types related to {', '.join(cell_types)}"
-        if regions and not all_regions_flag:
-            header += f" in regions {', '.join(regions)}"
+        gene_name = gene_names[0] if len(gene_names) == 1 else ", ".join(gene_names)
 
-        sections = [
-            header,
-            format_single_gene_expression_rows(df, max_rows=20)
-        ]
+        text = summarize_single_gene_expression(df, gene_name, max_rows=5)
+        graph_json = build_expression_plot(df, gene_name=gene_name, max_rows=8, metric="score")
 
-        return prefix + "\n".join(sections).strip()
+        return {
+           "text": prefix + text,
+           "graph_json": graph_json
+        }
 
 
     # case 2: top genes / markers
@@ -759,6 +825,57 @@ def gene_expression(user_input):
         return prefix + "\n".join(sections).strip()
 
     return "No matching gene expression data found for the specified query."
+
+
+def summarize_single_gene_expression(df, gene_name, max_rows=5):
+    if df.empty:
+        return f"No expression data found for {gene_name}."
+
+    work_df = df.copy()
+
+    if "score" in work_df.columns:
+        work_df = work_df.sort_values(["score", "rank"], ascending=[False, True])
+    else:
+        work_df = work_df.sort_values("rank", ascending=True)
+
+    top_rows = work_df.head(max_rows)
+
+    top = top_rows.iloc[0]
+    top_region = pretty_region_name(top.get("region", "unknown region"))
+    top_cell_type = top.get("cell_type", "unknown cell type")
+
+    summary = (
+        f"{gene_name} is highest in {top_cell_type.lower()} beds, especially in {top_region}. "
+    )
+
+    if len(top_rows) > 1:
+        second = top_rows.iloc[1]
+        second_region = pretty_region_name(second.get("region", "another region"))
+        second_cell_type = second.get("cell_type", "another vascular compartment")
+        summary += (
+            f"In this dataset, the strongest signal appears in {top_cell_type.lower()} of {top_region}, "
+            f"with another notable signal in {second_region} {second_cell_type.lower()} compartments"
+        )
+
+        if len(top_rows) > 2:
+            summary += ", while other vascular compartments are weaker."
+        else:
+            summary += "."
+    else:
+        summary += "in this dataset."
+
+    details = []
+    for _, row in top_rows.iterrows():
+        line = f"- {pretty_region_name(row['region'])}, {row['cell_type']}: rank {row['rank']}"
+        if "score" in work_df.columns and pd.notna(row.get("score")):
+            line += f", score {row['score']:.2f}"
+        if "logFC" in work_df.columns and pd.notna(row.get("logFC")):
+            line += f", logFC {row['logFC']:.2f}"
+        if "pct_expr" in work_df.columns and pd.notna(row.get("pct_expr")):
+            line += f", pct_expr {row['pct_expr']:.2f}"
+        details.append(line)
+
+    return summary + "\n\n" + "\n".join(details)
 
 
 
@@ -942,19 +1059,28 @@ def chat(user_input, history):
         except Exception as e:
             logger.exception("Google search failed")
             retrieved_info = None
+    
+    graph_json = None
 
     if not retrieved_info:
         retrieved_info = ""
 
-    if not isinstance(retrieved_info, str):
-        retrieved_info = str(retrieved_info)
+    if isinstance(retrieved_info, dict):
+        graph_json = retrieved_info.get("graph_json")
+        retrieved_text = retrieved_info.get("text", "")
+    else:
+        retrieved_text = retrieved_info
 
-    retrieved_info = retrieved_info[:4000]
+    if not isinstance(retrieved_text, str):
+        retrieved_text = str(retrieved_text)
 
-    if retrieved_info:
-        update_history(history, "system", retrieved_info)
+    retrieved_text = retrieved_text[:4000]
+
+    if retrieved_text:
+        update_history(history, "system", retrieved_text)
 
     final_message = call_api(history).content
     update_history(history, "assistant", final_message)
-    return final_message, history
+    return final_message, history, graph_json
+
 
