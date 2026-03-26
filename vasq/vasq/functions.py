@@ -948,6 +948,72 @@ def search_google(query):
 
     return formatted_results
 
+import os
+from google.api_core.client_options import ClientOptions
+from google.cloud import discoveryengine_v1 as discoveryengine
+
+
+def search_vertex_ai(query):
+    project_id = os.getenv("VERTEX_PROJECT_ID")
+    location = os.getenv("VERTEX_LOCATION", "global")
+    engine_id = os.getenv("VERTEX_ENGINE_ID")
+    serving_config_id = os.getenv("VERTEX_SERVING_CONFIG", "default_search")
+
+    if not project_id or not engine_id:
+        return ""
+
+    client_options = ClientOptions(
+        api_endpoint=(
+            "discoveryengine.googleapis.com"
+            if location == "global"
+            else f"{location}-discoveryengine.googleapis.com"
+        )
+    )
+
+    client = discoveryengine.SearchServiceClient(client_options=client_options)
+
+    serving_config = (
+        f"projects/{project_id}/locations/{location}/collections/default_collection/"
+        f"engines/{engine_id}/servingConfigs/{serving_config_id}"
+    )
+
+    request = discoveryengine.SearchRequest(
+        serving_config=serving_config,
+        query=query,
+        page_size=5,
+    )
+
+    try:
+        response = client.search(request=request)
+    except Exception as e:
+        logger.exception("Vertex AI Search failed: %s", e)
+        return ""
+
+    formatted_results = ""
+    for i, result in enumerate(response.results, start=1):
+        doc = result.document
+
+        title = ""
+        link = ""
+        snippet = ""
+
+        derived = getattr(doc, "derived_struct_data", None)
+        if derived:
+            title = derived.get("title", "") if isinstance(derived, dict) else ""
+            link = derived.get("link", "") if isinstance(derived, dict) else ""
+            snippets = derived.get("snippets", []) if isinstance(derived, dict) else []
+            if snippets:
+                first_snippet = snippets[0]
+                if isinstance(first_snippet, dict):
+                    snippet = first_snippet.get("snippet", "")
+
+        if not title:
+            title = getattr(doc, "id", "No Title")
+
+        formatted_results += f"{i}. {title}\n{link}\n{snippet}\n\n"
+
+    return formatted_results.strip()
+
 
 ### Function Descriptions ###
 
@@ -1054,9 +1120,9 @@ def chat(user_input, history):
                 retrieved_info = None
 
     if not retrieved_info:
-        logger.info("Calling Google Search API...")
+        logger.info("Calling Google Vertex AI API...")
         try:
-            retrieved_info = search_google(user_input)
+            retrieved_info = search_vertex_ai(user_input)
             if not retrieved_info:
                 logger.warning("Google search returned no usable results")
         except Exception as e:
