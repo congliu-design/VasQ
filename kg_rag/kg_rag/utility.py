@@ -193,7 +193,24 @@ def biomedical_entity_extractor(text):
         }
 
 
-    
+def find_exact_node_matches(entity, node_context_df):
+    if node_context_df is None or "node_name" not in node_context_df.columns:
+        return []
+
+    entity_norm = str(entity).strip().lower()
+
+    names = node_context_df["node_name"].astype(str)
+
+    exact = node_context_df[names.str.strip().str.lower() == entity_norm]
+    if not exact.empty:
+        return exact["node_name"].tolist()
+
+    contains = node_context_df[names.str.strip().str.lower().str.contains(entity_norm, regex=False)]
+    if not contains.empty:
+        return contains["node_name"].tolist()[:5]
+
+    return []
+
 def disease_entity_extractor_v2(text):
     chat_model_id, chat_deployment_id = get_gpt35()
     prompt_updated = system_prompts["DISEASE_ENTITY_EXTRACTION"] + "\n" + "Sentence : " + text
@@ -230,24 +247,30 @@ def retrieve_context(
         for item in entity_dict.get(key, []):
             if item and item not in entities:
                 entities.append(item)
+
+    print(f"Biomedical entities extracted: {entities}")
     node_hits = []
 
     if entities:
         max_number_of_high_similarity_context_per_node = int(context_volume / max(1, len(entities)))
-
+       
         for entity in entities:
-            node_search_result = vectorstore.similarity_search_with_score(entity, k=1)
+            exact_matches = find_exact_node_matches(entity, node_context_df)
+
+            if exact_matches:
+                print(f"Exact node match for entity {entity}: {exact_matches[:3]}")
+                node_hits.extend(exact_matches[:3])
+                continue
+
+            node_search_result = vectorstore.similarity_search_with_score(entity, k=3)
 
             if not node_search_result:
                 print(f"No vectorstore hit for entity: {entity}")
                 continue
 
-            top_doc = node_search_result[0][0]
-            if not getattr(top_doc, "page_content", None):
-                print(f"Top hit has no page_content for entity: {entity}")
-                continue
-
-            node_hits.append(top_doc.page_content)
+            for doc, score in node_search_result:
+                if getattr(doc, "page_content", None):
+                     node_hits.append(doc.page_content)
 
         if not node_hits:
             print("No entity-level hits found, falling back to question-level search")
@@ -258,6 +281,7 @@ def retrieve_context(
                 if getattr(node[0], "page_content", None)
             ]
 
+        node_hits = list(dict.fromkeys(node_hits))
         if not node_hits:
             return "No relevant knowledge graph context found."
 
@@ -274,7 +298,10 @@ def retrieve_context(
             else:
                 node_context, context_table = get_context_using_spoke_api(node_name)
 
-            node_context_list = node_context.split(". ")
+
+            node_context_list = [x.strip() for x in node_context.split(". ") if x.strip()]
+            if not node_context_list:
+                continue
             node_context_embeddings = embedding_function.embed_documents(node_context_list)
 
             similarities = [
@@ -341,13 +368,18 @@ def retrieve_context(
             else:
                 node_context, context_table = get_context_using_spoke_api(node_name)
 
-            node_context_list = node_context.split(". ")
+            node_context_list = [x.strip() for x in node_context.split(". ") if x.strip()]
+            if not node_context_list:
+                continue
             node_context_embeddings = embedding_function.embed_documents(node_context_list)
+            
 
             similarities = [
-                cosine_similarity(
-                    np.array(question_embedding).reshape(1, -1),
-                    np.array(node_context_embedding).reshape(1, -1)
+                float(
+                    cosine_similarity(
+                        np.array(question_embedding).reshape(1, -1),
+                        np.array(node_context_embedding).reshape(1, -1)
+                    )[0][0]
                 )
                 for node_context_embedding in node_context_embeddings
             ]
