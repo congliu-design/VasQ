@@ -333,8 +333,10 @@ REGION_ALIAS_MAP = None
 CELL_TYPE_ALIAS_MAP = None
 
 
+
 def ensure_expression_data_loaded():
     global EXPR_DF, REGION_META_DF, REGION_ALIAS_MAP, CELL_TYPE_ALIAS_MAP
+    global AVAILABLE_CELL_TYPES, AVAILABLE_REGIONS
 
     if EXPR_DF is None:
         EXPR_DF = load_expression_data()
@@ -347,6 +349,59 @@ def ensure_expression_data_loaded():
 
     if CELL_TYPE_ALIAS_MAP is None:
         CELL_TYPE_ALIAS_MAP = build_cell_type_alias_map(EXPR_DF)
+
+    if AVAILABLE_CELL_TYPES is None:
+        AVAILABLE_CELL_TYPES = sorted(EXPR_DF["cell_type"].dropna().unique().tolist())
+
+    if AVAILABLE_REGIONS is None:
+        AVAILABLE_REGIONS = sorted(EXPR_DF["region"].dropna().unique().tolist())
+
+
+def resolve_dataset_entities_with_gpt(user_input, available_cell_types, available_regions):
+    system_prompt = (
+        "You are helping map a biology question onto a fixed dataset schema. "
+        "Choose the closest matching dataset labels from the provided lists. "
+        "Return JSON only with keys: "
+        '{"cell_types": [], "regions": []}. '
+        "Rules: "
+        "Only use labels that appear in the provided lists. "
+        "Do not invent labels. "
+        "Prefer biologically closest vascular matches. "
+        "For example, if the user asks about endothelial cells in choroid plexus "
+        "and the dataset contains a fenestrated vascular label, choose that if it is the best fit."
+    )
+
+    user_prompt = (
+        f"User query: {user_input}\n\n"
+        f"Available cell types: {available_cell_types}\n\n"
+        f"Available regions: {available_regions}"
+    )
+
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0
+        )
+
+        raw = response.choices[0].message.content.strip()
+        parsed = json.loads(raw)
+
+        cell_types = parsed.get("cell_types", [])
+        regions = parsed.get("regions", [])
+
+        cell_types = [x for x in cell_types if x in available_cell_types]
+        regions = [x for x in regions if x in available_regions]
+
+        return cell_types, regions
+
+    except Exception as e:
+        logger.exception("GPT dataset entity resolution failed: %s", e)
+        return [], []
+
 
 
 def resolve_entities_from_text(user_input, alias_map):
@@ -372,9 +427,30 @@ def resolve_entities_from_text(user_input, alias_map):
 
 def extract_entities(user_input):
     ensure_expression_data_loaded()
+
+    # first try deterministic alias matching
     cell_matches = resolve_entities_from_text(user_input, CELL_TYPE_ALIAS_MAP)
     region_matches = resolve_entities_from_text(user_input, REGION_ALIAS_MAP)
-    return cell_matches, region_matches
+
+    # then let GPT broaden or refine using actual dataset labels
+    gpt_cell_matches, gpt_region_matches = resolve_dataset_entities_with_gpt(
+        user_input,
+        AVAILABLE_CELL_TYPES,
+        AVAILABLE_REGIONS
+    )
+
+    combined_cell_matches = list(dict.fromkeys(cell_matches + gpt_cell_matches))
+    combined_region_matches = list(dict.fromkeys(region_matches + gpt_region_matches))
+
+    logger.info(
+        "extract_entities user_input=%s cell_matches=%s region_matches=%s",
+        user_input,
+        combined_cell_matches,
+        combined_region_matches
+    )
+
+    return combined_cell_matches, combined_region_matches
+
 
 
 def extract_genes(user_input):
@@ -517,6 +593,7 @@ def format_gene_rows(df, max_rows=20):
 
 
 def gene_expression(user_input):
+    ensure_expression_data_loaded()
     all_regions_flag = all_regions(user_input)
     cell_types, regions = extract_entities(user_input)
     gene_names = extract_genes(user_input)
@@ -813,5 +890,4 @@ def chat(user_input, history):
     final_message = call_api(history).content
     update_history(history, "assistant", final_message)
     return final_message, history
-
 
