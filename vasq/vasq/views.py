@@ -26,6 +26,8 @@ def parse_input(request):
     return json.loads(request.body).get('message', '')
 
 # API endpoint for chat
+
+
 def api_chat(request):
     try:
         user_input = parse_input(request)

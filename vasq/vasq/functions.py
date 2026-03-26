@@ -1019,7 +1019,9 @@ def chat(user_input, history):
 
     retrieved_info = None
     chat_message = call_api(history, functions)
-
+    logger.info("First model content: %s", getattr(chat_message, "content", None))
+    logger.info("Function call present: %s", bool(chat_message.function_call))
+    
     if chat_message.function_call:
         try:
             retrieved_info = func_call(user_input, chat_message, history)
@@ -1075,12 +1077,19 @@ def chat(user_input, history):
         retrieved_text = str(retrieved_text)
 
     retrieved_text = retrieved_text[:4000]
+    
+
+    logger.info("About to call final synthesis with retrieved_text: %s", retrieved_text[:1000])
 
     if retrieved_text:
         update_history(history, "system", retrieved_text)
 
     final_message = call_api(history).content
+    logger.info("Final message returned to UI: %r", final_message)
     update_history(history, "assistant", final_message)
+    
+    logger.info("Retrieved text going into history: %s", retrieved_text if 'retrieved_text' in locals() else retrieved_info)
+    logger.info("Final message returned to UI: %s", final_message)
     return final_message, history, graph_json
 
 
