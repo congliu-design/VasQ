@@ -357,19 +357,14 @@ def ensure_expression_data_loaded():
     if AVAILABLE_REGIONS is None:
         AVAILABLE_REGIONS = sorted(EXPR_DF["region"].dropna().unique().tolist())
 
-
 def resolve_dataset_entities_with_gpt(user_input, available_cell_types, available_regions):
     system_prompt = (
         "You are helping map a biology question onto a fixed dataset schema. "
         "Choose the closest matching dataset labels from the provided lists. "
         "Return JSON only with keys: "
         '{"cell_types": [], "regions": []}. '
-        "Rules: "
         "Only use labels that appear in the provided lists. "
-        "Do not invent labels. "
-        "Prefer biologically closest vascular matches. "
-        "For example, if the user asks about endothelial cells in choroid plexus "
-        "and the dataset contains a fenestrated vascular label, choose that if it is the best fit."
+        "Do not invent labels."
     )
 
     user_prompt = (
@@ -389,6 +384,13 @@ def resolve_dataset_entities_with_gpt(user_input, available_cell_types, availabl
         )
 
         raw = response.choices[0].message.content.strip()
+        logger.info("GPT dataset entity raw response: %s", raw)
+
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:].strip()
+
         parsed = json.loads(raw)
 
         cell_types = parsed.get("cell_types", [])
@@ -599,19 +601,74 @@ def gene_expression(user_input):
     cell_types, regions = extract_entities(user_input)
     gene_names = extract_genes(user_input)
 
-    df = EXPR_DF.copy()
+    base_df = EXPR_DF.copy()
 
-    if cell_types:
-        df = df[df["cell_type"].isin(cell_types)]
+    requested_cell_types = list(cell_types) if cell_types else []
+    requested_regions = regions if (regions and not all_regions_flag) else None
 
-    if regions and not all_regions_flag:
-        df = df[df["region"].isin(regions)]
+    # 1. exact match first
+    df = base_df.copy()
+
+    if requested_cell_types:
+        df = df[df["cell_type"].isin(requested_cell_types)]
+
+    if requested_regions:
+        df = df[df["region"].isin(requested_regions)]
 
     if gene_names:
         df = df[df["gene"].isin(gene_names)]
 
+    match_note = "exact match"
+
+    # 2. broaden vascular/endothelial labels if exact match is empty
+    if df.empty and requested_cell_types:
+        expanded_cell_types = list(requested_cell_types)
+
+        if "Endothelial" in requested_cell_types:
+            for extra in [
+                "Fenestrated Endothelial",
+                "Fenestrated Capillary",
+                "Fenestrated Capillaries",
+                "Capillary",
+                "Capillaries",
+            ]:
+                if extra in AVAILABLE_CELL_TYPES and extra not in expanded_cell_types:
+                    expanded_cell_types.append(extra)
+
+        if any(x in requested_cell_types for x in ["Capillary", "Capillaries"]):
+            for extra in [
+                "Fenestrated Capillary",
+                "Fenestrated Capillaries",
+                "Fenestrated Endothelial",
+                "Endothelial",
+                "Pericyte",
+            ]:
+                if extra in AVAILABLE_CELL_TYPES and extra not in expanded_cell_types:
+                    expanded_cell_types.append(extra)
+
+        df = base_df.copy()
+        df = df[df["cell_type"].isin(expanded_cell_types)]
+
+        if requested_regions:
+            df = df[df["region"].isin(requested_regions)]
+
+        if gene_names:
+            df = df[df["gene"].isin(gene_names)]
+
+        if not df.empty:
+            match_note = f"expanded cell type match: {expanded_cell_types}"
+
+    logger.info(
+        "gene_expression cell_types=%s regions=%s genes=%s rows=%s match_note=%s",
+        cell_types, regions, gene_names, len(df), match_note
+    )
+
     if df.empty:
         return "No matching gene expression data found for the specified query."
+
+    prefix = ""
+    if match_note != "exact match":
+        prefix = f"Using {match_note} because no exact dataset match was found.\n\n"
 
     # case 1: user asked about specific gene(s)
     if wants_specific_gene(user_input, gene_names):
@@ -645,7 +702,7 @@ def gene_expression(user_input):
             sections.append(format_gene_rows(g, max_rows=20))
             sections.append("")
 
-        return "\n".join(sections).strip()
+        return prefix + "\n".join(sections).strip()
 
     # case 2: top genes / markers
     if wants_top_genes(user_input) or not gene_names:
@@ -690,7 +747,7 @@ def gene_expression(user_input):
             sections.append(format_gene_rows(g, max_rows=15))
             sections.append("")
 
-        return "\n".join(sections).strip()
+        return prefix + "\n".join(sections).strip()
 
     return "No matching gene expression data found for the specified query."
 
