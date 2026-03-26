@@ -648,11 +648,11 @@ def search_google(query):
     search_engine_id = os.getenv("SEARCH_ENGINE_ID")
 
     if not google_api_key:
-        print("Google search failed: GOOGLE_API_KEY is missing")
+        logger.error("Google search failed: GOOGLE_API_KEY is missing")
         return ""
 
     if not search_engine_id:
-        print("Google search failed: SEARCH_ENGINE_ID is missing")
+        logger.error("Google search failed: SEARCH_ENGINE_ID is missing")
         return ""
 
     url = "https://www.googleapis.com/customsearch/v1"
@@ -665,17 +665,17 @@ def search_google(query):
 
     try:
         response = requests.get(url, params=params, timeout=30)
-        print("Google status:", response.status_code)
-        print("Google body:", response.text[:1000])
+        logger.info("Google status: %s", response.status_code)
+        logger.info("Google body: %s", response.text[:1000])
         response.raise_for_status()
         data = response.json()
-    except Exception as e:
-        print(f"Google search failed: {e}")
+    except Exception:
+        logger.exception("Google search request failed")
         return ""
 
     items = data.get("items", [])
     if not items:
-        print("Google search returned no items")
+        logger.warning("Google search returned no items")
         return ""
 
     formatted_results = ""
@@ -719,6 +719,30 @@ functions = [
     }
 ]
 
+def looks_like_expression_query(user_input):
+    text = user_input.lower()
+
+    expression_terms = [
+        "expression", "expressed", "marker", "markers",
+        "top genes", "highest expressed", "most expressed",
+        "enriched", "upregulated", "gene expression"
+    ]
+
+    anatomy_terms = [
+        "endothelial", "arterial", "arteriole", "artery", "capillary",
+        "fenestrated endothelial", "pericyte", "smooth muscle", "venule",
+        "vein", "astrocyte", "neuron", "fibroblast", "epithelial",
+        "oligodendrocyte", "microglia", "macrophage", "t cell",
+        "choroid plexus", "hippocampus", "pons", "amygdala",
+        "thalamus", "midbrain", "cerebellum", "insula"
+    ]
+
+    return (
+        any(term in text for term in expression_terms) or
+        any(term in text for term in anatomy_terms)
+    )
+
+
 ### Main Chat Function ###
 
 # Chat between user and chatbot
@@ -740,6 +764,29 @@ def chat(user_input, history):
         except Exception as e:
             logger.exception("func_call failed: %s", e)
             retrieved_info = ""
+
+    # If function calling missed it, try local gene-expression data first
+    if retrieved_info is None and looks_like_expression_query(user_input):
+        logger.info("Heuristic routing to gene_expression first")
+        try:
+            retrieved_info = gene_expression(user_input)
+        except Exception as e:
+            logger.exception("gene_expression heuristic failed: %s", e)
+            retrieved_info = ""
+
+    # Optional: KG-RAG before Google for graph-style biomedical questions
+    if retrieved_info is None:
+        lowered = user_input.lower()
+        kg_terms = [
+            "drug", "drugs", "target", "targets", "disease",
+            "association", "associated", "pathway", "pathways"
+        ]
+        if any(term in lowered for term in kg_terms):
+            try:
+                retrieved_info = query_kg_rag(user_input)
+            except Exception as e:
+                logger.exception("KG query failed: %s", e)
+                retrieved_info = ""
 
     if retrieved_info is None:
         logger.info("Calling Google Search API...")
