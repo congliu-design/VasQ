@@ -1043,7 +1043,8 @@ def chat(user_input, history):
         lowered = user_input.lower()
         kg_terms = [
             "drug", "drugs", "target", "targets", "disease",
-            "association", "associated", "pathway", "pathways"
+            "association", "associated", "pathway", "pathways",
+            "implicated", "implication"
         ]
         if any(term in lowered for term in kg_terms):
             try:
@@ -1084,12 +1085,22 @@ def chat(user_input, history):
     if retrieved_text:
         update_history(history, "system", retrieved_text)
 
+    update_history(
+        history,
+        "system",
+        "Answer the user's question directly using the retrieved information above. "
+        "Do not say you will look something up, query a graph, search Google, or ask the user to wait. "
+        "Do not describe your process. Just provide the answer."
+    )
+
     final_message = call_api(history).content
     logger.info("Final message returned to UI: %r", final_message)
     update_history(history, "assistant", final_message)
-    
-    logger.info("Retrieved text going into history: %s", retrieved_text if 'retrieved_text' in locals() else retrieved_info)
+
+    logger.info("Retrieved text going into history: %s", retrieved_text)
     logger.info("Final message returned to UI: %s", final_message)
     return final_message, history, graph_json
+
+
 
 
