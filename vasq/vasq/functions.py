@@ -331,7 +331,8 @@ EXPR_DF = None
 REGION_META_DF = None
 REGION_ALIAS_MAP = None
 CELL_TYPE_ALIAS_MAP = None
-
+AVAILABLE_CELL_TYPES = None
+AVAILABLE_REGIONS = None
 
 
 def ensure_expression_data_loaded():
