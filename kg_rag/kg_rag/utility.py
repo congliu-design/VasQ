@@ -192,24 +192,26 @@ def biomedical_entity_extractor(text):
             "Pathways": []
         }
 
-
 def find_exact_node_matches(entity, node_context_df):
     if node_context_df is None or "node_name" not in node_context_df.columns:
         return []
 
     entity_norm = str(entity).strip().lower()
-
     names = node_context_df["node_name"].astype(str)
 
     exact = node_context_df[names.str.strip().str.lower() == entity_norm]
     if not exact.empty:
+        print(f"Exact matches for {entity}: {exact['node_name'].tolist()[:10]}")
         return exact["node_name"].tolist()
 
     contains = node_context_df[names.str.strip().str.lower().str.contains(entity_norm, regex=False)]
     if not contains.empty:
+        print(f"Substring matches for {entity}: {contains['node_name'].tolist()[:10]}")
         return contains["node_name"].tolist()[:5]
 
+    print(f"No exact or substring node_name matches for {entity}")
     return []
+
 
 def disease_entity_extractor_v2(text):
     chat_model_id, chat_deployment_id = get_gpt35()

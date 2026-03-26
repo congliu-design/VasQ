@@ -566,6 +566,28 @@ def is_region_filtered_query(user_input):
 
     return "true" in response.choices[0].message.content.strip().lower()
 
+def format_single_gene_expression_rows(df, max_rows=20):
+    lines = []
+
+    for _, row in df.head(max_rows).iterrows():
+        cell_type = row.get("cell_type", "Unknown cell type")
+        region = row.get("region", "Unknown region")
+        gene = row.get("gene", "Unknown gene")
+
+        line = f"{cell_type} in {region}: {gene} (rank {row['rank']}"
+
+        if "score" in df.columns and pd.notna(row.get("score")):
+            line += f", score {row['score']:.2f}"
+        if "logFC" in df.columns and pd.notna(row.get("logFC")):
+            line += f", logFC {row['logFC']:.2f}"
+        if "pct_expr" in df.columns and pd.notna(row.get("pct_expr")):
+            line += f", pct_expr {row['pct_expr']:.2f}"
+
+        line += ")"
+        lines.append(line)
+
+    return "\n".join(lines)
+
 
 def wants_top_genes(user_input):
     text = user_input.lower()
@@ -671,38 +693,25 @@ def gene_expression(user_input):
         prefix = f"Using {match_note} because no exact dataset match was found.\n\n"
 
     # case 1: user asked about specific gene(s)
-    if wants_specific_gene(user_input, gene_names):
-        group_cols = []
+        if wants_specific_gene(user_input, gene_names):
+        if "score" in df.columns:
+            df = df.sort_values(["score", "rank"], ascending=[False, True])
+        else:
+            df = df.sort_values("rank", ascending=True)
+
+        header = f"Expression of {', '.join(gene_names)}"
         if cell_types:
-            group_cols.append("cell_type")
+            header += f" in cell types related to {', '.join(cell_types)}"
         if regions and not all_regions_flag:
-            group_cols.append("region")
+            header += f" in regions {', '.join(regions)}"
 
-        if not group_cols:
-            group_cols = ["cell_type", "region"]
-
-        sections = []
-        grouped = df.sort_values("rank").groupby(group_cols)
-
-        for key, g in grouped:
-            if not isinstance(key, tuple):
-                key = (key,)
-            key_map = dict(zip(group_cols, key))
-
-            if "cell_type" in key_map and "region" in key_map:
-                header = f"Expression of {', '.join(gene_names)} in {key_map['cell_type']} of {key_map['region']}"
-            elif "cell_type" in key_map:
-                header = f"Expression of {', '.join(gene_names)} in {key_map['cell_type']}"
-            elif "region" in key_map:
-                header = f"Expression of {', '.join(gene_names)} in {key_map['region']}"
-            else:
-                header = f"Expression of {', '.join(gene_names)}"
-
-            sections.append(header)
-            sections.append(format_gene_rows(g, max_rows=20))
-            sections.append("")
+        sections = [
+            header,
+            format_single_gene_expression_rows(df, max_rows=20)
+        ]
 
         return prefix + "\n".join(sections).strip()
+
 
     # case 2: top genes / markers
     if wants_top_genes(user_input) or not gene_names:
@@ -765,7 +774,7 @@ def query_kg_rag(user_input):
         response = requests.post(
             url,
             json={"query": user_input},
-            timeout=60,
+            timeout=180,
         )
         logger.info("kg-rag status=%s body=%s", response.status_code, response.text[:1000])
         response.raise_for_status()
