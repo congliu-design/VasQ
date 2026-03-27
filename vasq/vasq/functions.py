@@ -125,6 +125,10 @@ def initialize(history):
 
 # Call function from chat
 def func_call(user_input, chat_message, history):
+    if wants_web_search(user_input):
+        logger.info("func_call override: explicit web/literature intent -> Google")
+        return search_vertex_ai(user_input)
+
     global func_flag
     func_flag = True
     content = None
@@ -1014,6 +1018,25 @@ def search_vertex_ai(query):
 
     return formatted_results.strip()
 
+def wants_web_search(user_input: str) -> bool:
+    lowered = user_input.lower()
+    web_terms = [
+        "search google",
+        "google it",
+        "find papers",
+        "find paper",
+        "find papers on",
+        "search pubmed",
+        "pubmed",
+        "google scholar",
+        "scholar",
+        "look up papers",
+        "find studies",
+        "search the web",
+        "web search",
+    ]
+    return any(term in lowered for term in web_terms)
+
 
 ### Function Descriptions ###
 
@@ -1074,6 +1097,7 @@ def looks_like_expression_query(user_input):
 
 # Chat between user and chatbot
 
+
 def chat(user_input, history):
     global func_flag, init_flag
 
@@ -1084,50 +1108,118 @@ def chat(user_input, history):
     update_history(history, "user", user_input)
 
     retrieved_info = None
-    chat_message = call_api(history, functions)
-    logger.info("First model content: %s", getattr(chat_message, "content", None))
-    logger.info("Function call present: %s", bool(chat_message.function_call))
-    
-    if chat_message.function_call:
-        try:
-            retrieved_info = func_call(user_input, chat_message, history)
-        except Exception as e:
-            logger.exception("func_call failed: %s", e)
-            retrieved_info = None
+    graph_json = None
 
-    # If function calling missed it or returned nothing useful, try local gene-expression data first
-    if not retrieved_info and looks_like_expression_query(user_input):
-        logger.info("Heuristic routing to gene_expression first")
-        try:
-            retrieved_info = gene_expression(user_input)
-        except Exception as e:
-            logger.exception("gene_expression heuristic failed: %s", e)
-            retrieved_info = None
-
-    # KG-RAG before Google for graph-style biomedical questions
-    if not retrieved_info:
-        lowered = user_input.lower()
-        kg_terms = [
-            "drug", "drugs", "target", "targets", "disease",
-            "association", "associated", "pathway", "pathways",
-            "implicated", "implication"
-        ]
-        if any(term in lowered for term in kg_terms):
-            try:
-                retrieved_info = query_kg_rag(user_input)
-            except Exception as e:
-                logger.exception("KG query failed: %s", e)
-                retrieved_info = None
-
-    if not retrieved_info:
-        logger.info("Calling Google Vertex AI API...")
+    # Hard override: explicit literature/web search requests should bypass KG-RAG
+    if wants_web_search(user_input):
+        logger.info("Explicit web/literature intent detected; routing directly to Google")
         try:
             retrieved_info = search_vertex_ai(user_input)
-            if not retrieved_info:
-                logger.warning("Google search returned no usable results")
-        except Exception as e:
+        except Exception:
             logger.exception("Google search failed")
             retrieved_info = None
+    else:
+        chat_message = call_api(history, functions)
+        logger.info("First model content: %s", getattr(chat_message, "content", None))
+        logger.info("Function call present: %s", bool(chat_message.function_call))
+
+        if chat_message.function_call:
+            try:
+                retrieved_info = func_call(user_input, chat_message, history)
+            except Exception as e:
+                logger.exception("func_call failed: %s", e)
+                retrieved_info = None
+
+        if not retrieved_info and looks_like_expression_query(user_input):
+            logger.info("Heuristic routing to gene_expression first")
+            try:
+                retrieved_info = gene_expression(user_input)
+            except Exception:
+                logger.exception("gene_expression heuristic failed")
+                retrieved_info = None
+
+        if not retrieved_info:
+            lowered = user_input.lower()
+            kg_terms = [
+                "drug", "drugs", "target", "targets", "disease",
+                "association", "associated", "pathway", "pathways",
+                "implicated", "implication"
+            ]
+            if any(term in lowered for term in kg_terms):
+                try:
+                    retrieved_info = query_kg_rag(user_input)
+                except Exception:
+                    logger.exception("KG query failed")
+                    retrieved_info = None
+
+        if not retrieved_info:
+            logger.info("Calling Google Vertex AI API...")
+            try:
+                retrieved_info = search_vertex_ai(user_input)
+                if not retrieved_info:
+                    logger.warning("Google search returned no usable results")
+            except Exception:
+                logger.exception("Google search failed")
+                retrieved_info = None
+
+
+
+
+#def chat(user_input, history):
+#    global func_flag, init_flag
+#
+#    if init_flag:
+#        history.clear()
+#        initialize(history)
+#
+#    update_history(history, "user", user_input)
+#
+#    retrieved_info = None
+#    chat_message = call_api(history, functions)
+#    logger.info("First model content: %s", getattr(chat_message, "content", None))
+#    logger.info("Function call present: %s", bool(chat_message.function_call))
+#    
+#    if chat_message.function_call:
+#        try:
+#            retrieved_info = func_call(user_input, chat_message, history)
+#        except Exception as e:
+#            logger.exception("func_call failed: %s", e)
+#            retrieved_info = None
+
+#    # If function calling missed it or returned nothing useful, try local gene-expression data first
+#    if not retrieved_info and looks_like_expression_query(user_input):
+
+#        logger.info("Heuristic routing to gene_expression first")
+#        try:
+#            retrieved_info = gene_expression(user_input)
+#        except Exception as e:
+#            logger.exception("gene_expression heuristic failed: %s", e)
+#            retrieved_info = None
+#
+#    # KG-RAG before Google for graph-style biomedical questions
+#    if not retrieved_info:
+#        lowered = user_input.lower()
+#        kg_terms = [
+#            "drug", "drugs", "target", "targets", "disease",
+#            "association", "associated", "pathway", "pathways",
+#            "implicated", "implication"
+#        ]
+#        if any(term in lowered for term in kg_terms):
+#            try:
+#                retrieved_info = query_kg_rag(user_input)
+#            except Exception as e:
+#                logger.exception("KG query failed: %s", e)
+#                retrieved_info = None
+#
+#    if not retrieved_info:
+#        logger.info("Calling Google Vertex AI API...")
+#        try:
+#            retrieved_info = search_vertex_ai(user_input)
+#            if not retrieved_info:
+#                logger.warning("Google search returned no usable results")
+#        except Exception as e:
+#            logger.exception("Google search failed")
+#            retrieved_info = None
     
     graph_json = None
 
@@ -1144,20 +1236,22 @@ def chat(user_input, history):
         retrieved_text = str(retrieved_text)
 
     retrieved_text = retrieved_text[:4000]
-    
 
-    logger.info("About to call final synthesis with retrieved_text: %s", retrieved_text[:1000])
+    synthesis_messages = history[:] + [
+        {
+            "role": "system",
+            "content": (
+                "Answer the user's question directly using the retrieved information below. "
+                "Do not mention search tools or internal routing."
+            )
+        },
+        {
+            "role": "user",
+            "content": f"Retrieved information:\n{retrieved_text}"
+        }
+    ]
 
-    if retrieved_text:
-        update_history(history, "system", retrieved_text)
 
-    update_history(
-        history,
-        "system",
-        "Answer the user's question directly using the retrieved information above. "
-        "Do not say you will look something up, query a graph, search Google, or ask the user to wait. "
-        "Do not describe your process. Just provide the answer."
-    )
 
     final_message = call_api(history).content
     logger.info("Final message returned to UI: %r", final_message)
