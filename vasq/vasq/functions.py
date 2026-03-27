@@ -1017,7 +1017,15 @@ def search_vertex_ai(query):
     )
 
     try:
+        # 1. prove the API is actually returning results
         response = client.search(request=request)
+        logger.info("Vertex result count=%d", len(response.results))
+        for i, result in enumerate(response.results, 1):
+            doc = result.document
+            logger.info("doc[%d].id=%r", i, getattr(doc, "id", None))
+            logger.info("doc[%d].derived_struct_data type=%s value=%r",
+                        i, type(getattr(doc, "derived_struct_data", None)),
+                        getattr(doc, "derived_struct_data", None))
     except Exception as e:
         logger.exception("Vertex AI Search failed: %s", e)
         return ""
