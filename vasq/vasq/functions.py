@@ -1049,7 +1049,9 @@ def wants_web_search(user_input: str) -> bool:
     lowered = user_input.lower()
     web_terms = [
         "search google",
+        "google",
         "google it",
+        "find articles",
         "find papers",
         "find paper",
         "find papers on",
