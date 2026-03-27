@@ -1253,7 +1253,7 @@ def chat(user_input, history):
 
 
 
-    final_message = call_api(history).content
+    final_message = call_api(synthesis_messages).content
     logger.info("Final message returned to UI: %r", final_message)
     update_history(history, "assistant", final_message)
 
