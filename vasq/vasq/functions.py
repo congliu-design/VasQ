@@ -957,13 +957,35 @@ from google.api_core.client_options import ClientOptions
 from google.cloud import discoveryengine_v1 as discoveryengine
 
 
+import json
+import os
+from google.api_core.client_options import ClientOptions
+from google.cloud import discoveryengine_v1 as discoveryengine
+from google.oauth2 import service_account
+
 def search_vertex_ai(query):
     project_id = os.getenv("VERTEX_PROJECT_ID")
     location = os.getenv("VERTEX_LOCATION", "global")
     engine_id = os.getenv("VERTEX_ENGINE_ID")
     serving_config_id = os.getenv("VERTEX_SERVING_CONFIG", "default_search")
+    sa_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
+    
+    logger.info("Vertex config present? project=%s engine=%s sa_json_present=%s",
+            bool(project_id), bool(engine_id), bool(sa_json))
 
     if not project_id or not engine_id:
+        logger.error("Missing Vertex config: VERTEX_PROJECT_ID or VERTEX_ENGINE_ID")
+        return ""
+
+    if not sa_json:
+        logger.error("Missing GCP_SERVICE_ACCOUNT_JSON")
+        return ""
+
+    try:
+        sa_info = json.loads(sa_json)
+        credentials = service_account.Credentials.from_service_account_info(sa_info)
+    except Exception as e:
+        logger.exception("Failed to parse GCP_SERVICE_ACCOUNT_JSON: %s", e)
         return ""
 
     client_options = ClientOptions(
@@ -974,7 +996,14 @@ def search_vertex_ai(query):
         )
     )
 
-    client = discoveryengine.SearchServiceClient(client_options=client_options)
+    try:
+        client = discoveryengine.SearchServiceClient(
+            credentials=credentials,
+            client_options=client_options,
+        )
+    except Exception as e:
+        logger.exception("Failed to create Vertex client: %s", e)
+        return ""
 
     serving_config = (
         f"projects/{project_id}/locations/{location}/collections/default_collection/"
@@ -993,30 +1022,28 @@ def search_vertex_ai(query):
         logger.exception("Vertex AI Search failed: %s", e)
         return ""
 
-    formatted_results = ""
+    formatted_results = []
     for i, result in enumerate(response.results, start=1):
         doc = result.document
-
         title = ""
         link = ""
         snippet = ""
 
         derived = getattr(doc, "derived_struct_data", None)
-        if derived:
-            title = derived.get("title", "") if isinstance(derived, dict) else ""
-            link = derived.get("link", "") if isinstance(derived, dict) else ""
-            snippets = derived.get("snippets", []) if isinstance(derived, dict) else []
-            if snippets:
-                first_snippet = snippets[0]
-                if isinstance(first_snippet, dict):
-                    snippet = first_snippet.get("snippet", "")
+        if isinstance(derived, dict):
+            title = derived.get("title", "") or ""
+            link = derived.get("link", "") or ""
+            snippets = derived.get("snippets", []) or []
+            if snippets and isinstance(snippets[0], dict):
+                snippet = snippets[0].get("snippet", "") or ""
 
         if not title:
             title = getattr(doc, "id", "No Title")
 
-        formatted_results += f"{i}. {title}\n{link}\n{snippet}\n\n"
+        formatted_results.append(f"{i}. {title}\n{link}\n{snippet}")
 
-    return formatted_results.strip()
+    return "\n\n".join(formatted_results)
+
 
 def wants_web_search(user_input: str) -> bool:
     lowered = user_input.lower()
