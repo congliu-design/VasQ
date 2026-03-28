@@ -1399,24 +1399,8 @@ def search_vertex_ai(query):
     location = os.getenv("VERTEX_LOCATION", "global")
     engine_id = os.getenv("VERTEX_ENGINE_ID")
     serving_config_id = os.getenv("VERTEX_SERVING_CONFIG", "default_search")
-    sa_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
-    
-    logger.info("Vertex config present? project=%s engine=%s sa_json_present=%s",
-            bool(project_id), bool(engine_id), bool(sa_json))
 
     if not project_id or not engine_id:
-        logger.error("Missing Vertex config: VERTEX_PROJECT_ID or VERTEX_ENGINE_ID")
-        return ""
-
-    if not sa_json:
-        logger.error("Missing GCP_SERVICE_ACCOUNT_JSON")
-        return ""
-
-    try:
-        sa_info = json.loads(sa_json)
-        credentials = service_account.Credentials.from_service_account_info(sa_info)
-    except Exception as e:
-        logger.exception("Failed to parse GCP_SERVICE_ACCOUNT_JSON: %s", e)
         return ""
 
     client_options = ClientOptions(
@@ -1427,14 +1411,7 @@ def search_vertex_ai(query):
         )
     )
 
-    try:
-        client = discoveryengine.SearchServiceClient(
-            credentials=credentials,
-            client_options=client_options,
-        )
-    except Exception as e:
-        logger.exception("Failed to create Vertex client: %s", e)
-        return ""
+    client = discoveryengine.SearchServiceClient(client_options=client_options)
 
     serving_config = (
         f"projects/{project_id}/locations/{location}/collections/default_collection/"
@@ -1448,15 +1425,8 @@ def search_vertex_ai(query):
     )
 
     try:
-        # 1. prove the API is actually returning results
         response = client.search(request=request)
         logger.info("Vertex result count=%d", len(response.results))
-        for i, result in enumerate(response.results, 1):
-            doc = result.document
-            logger.info("doc[%d].id=%r", i, getattr(doc, "id", None))
-            logger.info("doc[%d].derived_struct_data type=%s value=%r",
-                        i, type(getattr(doc, "derived_struct_data", None)),
-                        getattr(doc, "derived_struct_data", None))
     except Exception as e:
         logger.exception("Vertex AI Search failed: %s", e)
         return ""
@@ -1464,24 +1434,38 @@ def search_vertex_ai(query):
     formatted_results = []
     for i, result in enumerate(response.results, start=1):
         doc = result.document
+        derived = getattr(doc, "derived_struct_data", None)
+
         title = ""
         link = ""
         snippet = ""
 
-        derived = getattr(doc, "derived_struct_data", None)
+        if derived:
+            try:
+                derived = dict(derived)
+            except Exception:
+                pass
+
         if isinstance(derived, dict):
             title = derived.get("title", "") or ""
             link = derived.get("link", "") or ""
+
             snippets = derived.get("snippets", []) or []
-            if snippets and isinstance(snippets[0], dict):
-                snippet = snippets[0].get("snippet", "") or ""
+            if snippets:
+                first_snippet = snippets[0]
+                try:
+                    first_snippet = dict(first_snippet)
+                except Exception:
+                    pass
+                if isinstance(first_snippet, dict):
+                    snippet = first_snippet.get("snippet", "") or ""
 
         if not title:
             title = getattr(doc, "id", "No Title")
 
         formatted_results.append(f"{i}. {title}\n{link}\n{snippet}")
 
-    return "\n\n".join(formatted_results)
+    return "\n\n".join(formatted_results).strip()
 
 
 def wants_web_search(user_input: str) -> bool:
@@ -1686,6 +1670,7 @@ def looks_like_expression_query(user_input):
 
 ### new chat
 
+
 def chat(user_input, history):
     global func_flag, init_flag
 
@@ -1706,16 +1691,25 @@ def chat(user_input, history):
             logger.exception("Google search failed")
             retrieved_info = None
     else:
-        chat_message = call_api(history, functions)
-        logger.info("First model content: %s", getattr(chat_message, "content", None))
-        logger.info("Function call present: %s", bool(chat_message.function_call))
+        if looks_like_expression_query(user_input):
+            if wants_matrix_expression_query(user_input) and not wants_marker_query(user_input):
+                try:
+                    retrieved_info = matrix_expression(user_input)
+                except Exception:
+                    logger.exception("matrix pre-routing failed")
+                    retrieved_info = None
 
-        if chat_message.function_call:
-            try:
-                retrieved_info = func_call(user_input, chat_message, history)
-            except Exception:
-                logger.exception("func_call failed")
-                retrieved_info = None
+        if not retrieved_info:
+            chat_message = call_api(history, functions)
+            logger.info("First model content: %s", getattr(chat_message, "content", None))
+            logger.info("Function call present: %s", bool(chat_message.function_call))
+
+            if chat_message.function_call:
+                try:
+                    retrieved_info = func_call(user_input, chat_message, history)
+                except Exception:
+                    logger.exception("func_call failed")
+                    retrieved_info = None
 
         # Heuristic routing fallback
         if not retrieved_info and looks_like_expression_query(user_input):
@@ -1805,3 +1799,5 @@ def chat(user_input, history):
     update_history(history, "assistant", final_message)
 
     return final_message, history, graph_json
+
+
