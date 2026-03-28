@@ -8,7 +8,8 @@ import requests
 import difflib
 import ast
 import logging
-
+import numpy as np
+from scipy import sparse
 
 # Set gloabl variables
 global func_flag
@@ -146,11 +147,381 @@ def func_call(user_input, chat_message, history):
 DATA_DIR = "/data"
 EXPR_PATH = os.path.join(DATA_DIR, "expression_markers.csv")
 REGION_META_PATH = os.path.join(DATA_DIR, "region_metadata.csv")
+MATRIX_NPZ_PATH = os.path.join(DATA_DIR, "VasQ_adata_X_sparse.npz")
+CELL_META_PATH = os.path.join(DATA_DIR, "VasQ_cell_meta_table.csv")
 
-#DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
-#EXPR_PATH = os.path.join(DATA_DIR, "expression_markers.csv")
-#REGION_META_PATH = os.path.join(DATA_DIR, "regioIn_metadata.csv")
 
+MATRIX_EXPR = None
+MATRIX_META = None
+MATRIX_GENES = None
+MATRIX_GENE_TO_IDX = None
+
+MATRIX_AVAILABLE_CELL_TYPES = None
+MATRIX_AVAILABLE_CELL_CLASSES = None
+MATRIX_AVAILABLE_REGIONS = None
+MATRIX_AVAILABLE_REGION_LAYERS = None
+
+MATRIX_CELL_TYPE_ALIAS_MAP = None
+MATRIX_CELL_CLASS_ALIAS_MAP = None
+MATRIX_REGION_ALIAS_MAP = None
+MATRIX_REGION_LAYER_ALIAS_MAP = None
+
+
+def build_simple_alias_map(values):
+    alias_map = {}
+    for v in pd.Series(values).dropna().astype(str).unique():
+        alias_map[normalize_text(v)] = str(v)
+    return alias_map
+
+
+def load_matrix_expression_data():
+    npz = np.load(MATRIX_NPZ_PATH, allow_pickle=True)
+
+    if {"data", "indices", "indptr", "shape"}.issubset(npz.files):
+        X = sparse.csr_matrix(
+            (npz["data"], npz["indices"], npz["indptr"]),
+            shape=tuple(npz["shape"])
+        )
+    elif "X" in npz.files:
+        X = sparse.csr_matrix(npz["X"])
+    else:
+        raise ValueError(
+            f"{MATRIX_NPZ_PATH} must contain either CSR arrays "
+            f"(data, indices, indptr, shape) or a dense X array."
+        )
+
+    if "genes" not in npz.files:
+        raise ValueError(f"{MATRIX_NPZ_PATH} is missing a 'genes' array.")
+
+    genes = np.array([str(g).upper().strip() for g in npz["genes"]], dtype=object)
+
+    # first column appears to be the cell barcode / obs index
+    meta = pd.read_csv(CELL_META_PATH, index_col=0)
+    meta.index = meta.index.astype(str)
+    meta.index.name = "cell_id"
+
+    rename_map = {
+        "region_name": "brain_region",
+        "region_layer": "region_layer",
+        "Cell_class": "cell_class",
+        "Cell_type": "cell_type",
+        "ageatdeath": "age_at_death",
+        "sex": "sex",
+    }
+    meta = meta.rename(columns=rename_map)
+
+    required_meta = [
+        "brain_region",
+        "region_layer",
+        "cell_class",
+        "cell_type",
+        "age_at_death",
+        "sex",
+    ]
+    missing_meta = [c for c in required_meta if c not in meta.columns]
+    if missing_meta:
+        raise ValueError(f"{CELL_META_PATH} missing required columns: {missing_meta}")
+
+    meta["brain_region"] = meta["brain_region"].astype(str).str.strip()
+    meta["region_layer"] = meta["region_layer"].astype(str).str.strip()
+    meta["cell_class"] = meta["cell_class"].astype(str).str.strip()
+    meta["cell_type"] = meta["cell_type"].astype(str).str.strip()
+    meta["age_at_death"] = pd.to_numeric(meta["age_at_death"], errors="coerce")
+    meta["sex"] = meta["sex"].astype(str).str.strip()
+
+    meta["brain_region_norm"] = meta["brain_region"].apply(normalize_text)
+    meta["region_layer_norm"] = meta["region_layer"].apply(normalize_text)
+    meta["cell_class_norm"] = meta["cell_class"].apply(normalize_text)
+    meta["cell_type_norm"] = meta["cell_type"].apply(normalize_text)
+    meta["sex_norm"] = meta["sex"].apply(normalize_text)
+
+    if X.shape[0] != len(meta):
+        raise ValueError(
+            f"Matrix rows ({X.shape[0]}) do not match metadata rows ({len(meta)})"
+        )
+
+    if X.shape[1] != len(genes):
+        raise ValueError(
+            f"Matrix columns ({X.shape[1]}) do not match genes ({len(genes)})"
+        )
+
+    return X, meta, genes
+
+
+def ensure_matrix_expression_data_loaded():
+    global MATRIX_EXPR, MATRIX_META, MATRIX_GENES, MATRIX_GENE_TO_IDX
+    global MATRIX_AVAILABLE_CELL_TYPES, MATRIX_AVAILABLE_CELL_CLASSES
+    global MATRIX_AVAILABLE_REGIONS, MATRIX_AVAILABLE_REGION_LAYERS
+    global MATRIX_CELL_TYPE_ALIAS_MAP, MATRIX_CELL_CLASS_ALIAS_MAP
+    global MATRIX_REGION_ALIAS_MAP, MATRIX_REGION_LAYER_ALIAS_MAP
+
+    if MATRIX_EXPR is None or MATRIX_META is None or MATRIX_GENES is None:
+        MATRIX_EXPR, MATRIX_META, MATRIX_GENES = load_matrix_expression_data()
+        MATRIX_GENE_TO_IDX = {g: i for i, g in enumerate(MATRIX_GENES)}
+
+    if MATRIX_AVAILABLE_CELL_TYPES is None:
+        MATRIX_AVAILABLE_CELL_TYPES = sorted(
+            MATRIX_META["cell_type"].dropna().astype(str).unique().tolist()
+        )
+
+    if MATRIX_AVAILABLE_CELL_CLASSES is None:
+        MATRIX_AVAILABLE_CELL_CLASSES = sorted(
+            MATRIX_META["cell_class"].dropna().astype(str).unique().tolist()
+        )
+
+    if MATRIX_AVAILABLE_REGIONS is None:
+        MATRIX_AVAILABLE_REGIONS = sorted(
+            MATRIX_META["brain_region"].dropna().astype(str).unique().tolist()
+        )
+
+    if MATRIX_AVAILABLE_REGION_LAYERS is None:
+        MATRIX_AVAILABLE_REGION_LAYERS = sorted(
+            MATRIX_META["region_layer"].dropna().astype(str).unique().tolist()
+        )
+
+    if MATRIX_CELL_TYPE_ALIAS_MAP is None:
+        MATRIX_CELL_TYPE_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_CELL_TYPES)
+        MATRIX_CELL_TYPE_ALIAS_MAP.update({
+            "capillary": "Capillary",
+            "capillaries": "Capillary",
+            "arterial": "Arterial",
+            "arteriole": "Arterial",
+            "arterioles": "Arterial",
+            "venous": "Venous" if "Venous" in MATRIX_AVAILABLE_CELL_TYPES else "Vein",
+            "opc": "OPC",
+            "astrocyte": "Astrocyte",
+            "astrocytes": "Astrocyte",
+        })
+
+    if MATRIX_CELL_CLASS_ALIAS_MAP is None:
+        MATRIX_CELL_CLASS_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_CELL_CLASSES)
+        MATRIX_CELL_CLASS_ALIAS_MAP.update({
+            "endothelial": "Endothelial",
+            "endothelial cells": "Endothelial",
+            "astrocyte": "Astrocyte",
+            "astrocytes": "Astrocyte",
+            "fibroblast": "Fibroblast",
+            "fibroblasts": "Fibroblast",
+            "opc": "OPC",
+        })
+
+    if MATRIX_REGION_ALIAS_MAP is None:
+        MATRIX_REGION_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_REGIONS)
+
+    if MATRIX_REGION_LAYER_ALIAS_MAP is None:
+        MATRIX_REGION_LAYER_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_REGION_LAYERS)
+
+
+def resolve_matrix_entities(user_input):
+    ensure_matrix_expression_data_loaded()
+
+    cell_type_matches = resolve_entities_from_text(user_input, MATRIX_CELL_TYPE_ALIAS_MAP)
+    cell_class_matches = resolve_entities_from_text(user_input, MATRIX_CELL_CLASS_ALIAS_MAP)
+    region_matches = resolve_entities_from_text(user_input, MATRIX_REGION_ALIAS_MAP)
+    region_layer_matches = resolve_entities_from_text(user_input, MATRIX_REGION_LAYER_ALIAS_MAP)
+
+    gpt_cell_type_matches, gpt_region_matches = resolve_dataset_entities_with_gpt(
+        user_input,
+        MATRIX_AVAILABLE_CELL_TYPES,
+        MATRIX_AVAILABLE_REGIONS
+    )
+
+    cell_type_matches = list(dict.fromkeys(cell_type_matches + gpt_cell_type_matches))
+    region_matches = list(dict.fromkeys(region_matches + gpt_region_matches))
+
+    return cell_type_matches, cell_class_matches, region_matches, region_layer_matches
+
+def extract_sex_filters(user_input):
+    text = normalize_text(user_input)
+    out = []
+
+    if re.search(r"\bfemale\b|\bfemales\b|\bwoman\b|\bwomen\b", text):
+        out.append("f")
+    if re.search(r"\bmale\b|\bmales\b|\bman\b|\bmen\b", text):
+        out.append("m")
+
+    return out
+
+
+def get_matrix_cell_indices(
+    user_input,
+    cell_types=None,
+    cell_classes=None,
+    regions=None,
+    region_layers=None,
+):
+    ensure_matrix_expression_data_loaded()
+
+    mask = pd.Series(True, index=MATRIX_META.index)
+
+    if cell_types:
+        mask &= MATRIX_META["cell_type"].isin(cell_types)
+
+    if cell_classes:
+        mask &= MATRIX_META["cell_class"].isin(cell_classes)
+
+    if regions:
+        mask &= MATRIX_META["brain_region"].isin(regions)
+
+    if region_layers:
+        mask &= MATRIX_META["region_layer"].isin(region_layers)
+
+    sex_filters = extract_sex_filters(user_input)
+    if sex_filters:
+        mask &= MATRIX_META["sex_norm"].isin(sex_filters)
+
+    return MATRIX_META.index[mask].to_numpy()
+
+
+def matrix_expression(user_input):
+    ensure_matrix_expression_data_loaded()
+
+    genes = extract_genes(user_input)
+    if not genes:
+        return "Please specify a gene for matrix-based expression queries."
+
+    cell_types, cell_classes, regions, region_layers = resolve_matrix_entities(user_input)
+
+    present_genes = [g for g in genes if g in MATRIX_GENE_TO_IDX]
+    missing_genes = [g for g in genes if g not in MATRIX_GENE_TO_IDX]
+
+    notes = [
+        "This answer uses log-normalized values from the HVG-filtered expression matrix."
+    ]
+
+    if missing_genes:
+        notes.append(
+            "These genes are not present in the supplied HVG-filtered matrix and may have been filtered out during HVG selection: "
+            + ", ".join(missing_genes)
+        )
+
+    cell_indices = get_matrix_cell_indices(
+        user_input,
+        cell_types=cell_types,
+        cell_classes=cell_classes,
+        regions=regions,
+        region_layers=region_layers,
+    )
+
+    if len(cell_indices) == 0 and present_genes:
+        return "No matching cells found for the requested filters."
+
+    all_sections = []
+    plot_json = None
+
+    for i, gene in enumerate(present_genes):
+        if len(cell_indices) > 0:
+            stats = summarize_group_expression(
+                gene,
+                cell_indices,
+                ["brain_region", "cell_class", "cell_type"]
+            )
+        else:
+            stats = summarize_group_expression(
+                gene,
+                MATRIX_META.index.to_numpy(),
+                ["brain_region", "cell_class", "cell_type"]
+            )
+
+        all_sections.append(format_matrix_expression_summary(stats, gene, max_rows=5))
+
+        if i == 0:
+            plot_json = build_matrix_expression_plot(stats, gene_name=gene, max_rows=8)
+
+    return {
+        "text": "\n\n".join(notes + [""] + all_sections),
+        "graph_json": plot_json
+    }
+
+
+
+def get_gene_vector(cell_indices, gene):
+    gene_idx = MATRIX_GENE_TO_IDX[gene]
+    values = MATRIX_EXPR[cell_indices, gene_idx]
+
+    if sparse.issparse(values):
+        values = values.toarray().ravel()
+    else:
+        values = np.asarray(values).ravel()
+
+    return values
+
+
+def summarize_group_expression(gene, cell_indices, group_cols):
+    if len(cell_indices) == 0:
+        return pd.DataFrame()
+
+    obs = MATRIX_META.loc[cell_indices, group_cols].copy()
+    rows = []
+
+    for key, g in obs.groupby(group_cols):
+        idx = g.index.to_numpy()
+        vals = get_gene_vector(idx, gene)
+
+        row = {
+            "gene": gene,
+            "n_cells": int(len(idx)),
+            "mean_expr": float(vals.mean()) if len(vals) else 0.0,
+            "pct_expr": float((vals > 0).mean()) if len(vals) else 0.0,
+        }
+
+        if not isinstance(key, tuple):
+            key = (key,)
+
+        row.update(dict(zip(group_cols, key)))
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def format_matrix_expression_summary(stats_df, gene, max_rows=5):
+    if stats_df.empty:
+        return f"No matching cells found for {gene} after applying the requested filters."
+
+    work = stats_df.sort_values(
+        ["mean_expr", "pct_expr", "n_cells"],
+        ascending=[False, False, False]
+    ).head(max_rows)
+
+    lines = [f"Top expression contexts for {gene} (log-normalized mean expression):"]
+
+    for _, row in work.iterrows():
+        parts = []
+        for col in ["brain_region", "region_layer", "cell_class", "cell_type"]:
+            if col in work.columns and pd.notna(row.get(col)):
+                parts.append(str(row[col]))
+
+        label = " | ".join(parts) if parts else "all matched cells"
+        lines.append(
+            f"- {label}: mean_expr {row['mean_expr']:.3f}, "
+            f"pct_expr {row['pct_expr']:.3f}, n {int(row['n_cells'])}"
+        )
+
+    return "\n".join(lines)
+
+
+def wants_marker_query(user_input):
+    text = user_input.lower()
+    triggers = [
+        "marker", "markers", "top marker", "top markers",
+        "rank", "ranked", "top genes", "enriched"
+    ]
+    return any(t in text for t in triggers)
+
+
+def wants_matrix_expression_query(user_input):
+    text = user_input.lower()
+    triggers = [
+        "expression", "expressed", "mean expression", "average expression",
+        "most highly expressed", "highest expressed", "how much expression",
+        "percent expressing", "pct expr", "lowly expressed", "absent"
+    ]
+    return any(t in text for t in triggers)
+
+
+
+
+### ranked expression
 
 def normalize_text(x):
     if pd.isna(x):
@@ -905,6 +1276,66 @@ def query_kg_rag(user_input):
         return None
 
 
+
+def build_matrix_expression_plot(stats_df, gene_name=None, max_rows=8):
+    plot_df = stats_df.copy()
+
+    if plot_df.empty:
+        return None
+
+    plot_df = plot_df.sort_values(
+        ["mean_expr", "pct_expr", "n_cells"],
+        ascending=[False, False, False]
+    ).head(max_rows)
+
+    def make_label(row):
+        parts = []
+        if "brain_region" in plot_df.columns and pd.notna(row.get("brain_region")):
+            parts.append(str(row["brain_region"]))
+        if "cell_class" in plot_df.columns and pd.notna(row.get("cell_class")):
+            parts.append(str(row["cell_class"]))
+        if "cell_type" in plot_df.columns and pd.notna(row.get("cell_type")):
+            parts.append(str(row["cell_type"]))
+        return " | ".join(parts)
+
+    labels = [make_label(row) for _, row in plot_df.iterrows()]
+    y_vals = plot_df["mean_expr"].tolist()
+
+    hover_text = []
+    for _, row in plot_df.iterrows():
+        text = f"{gene_name or row.get('gene', 'gene')}"
+        if "brain_region" in plot_df.columns:
+            text += f"<br>region: {row.get('brain_region', '')}"
+        if "cell_class" in plot_df.columns:
+            text += f"<br>cell class: {row.get('cell_class', '')}"
+        if "cell_type" in plot_df.columns:
+            text += f"<br>cell type: {row.get('cell_type', '')}"
+        text += f"<br>mean_expr {row['mean_expr']:.3f}"
+        text += f"<br>pct_expr {row['pct_expr']:.3f}"
+        text += f"<br>n_cells {int(row['n_cells'])}"
+        hover_text.append(text)
+
+    fig = {
+        "data": [
+            {
+                "type": "bar",
+                "x": labels,
+                "y": y_vals,
+                "text": hover_text,
+                "hoverinfo": "text"
+            }
+        ],
+        "layout": {
+            "title": f"{gene_name} expression across matched groups" if gene_name else "Expression across matched groups",
+            "xaxis": {"title": "Region | Cell class | Cell type"},
+            "yaxis": {"title": "Mean log-normalized expression"},
+            "margin": {"l": 70, "r": 20, "t": 60, "b": 180}
+        }
+    }
+
+    return json.dumps(fig)
+
+
 ### Search Functions ###
 
 # Search Google
@@ -1103,7 +1534,25 @@ functions = [
                 },
             "required": ["user_input"],
         }
-    }
+    },
+    {
+        "name": "matrix_expression",
+        "description": (
+            "Returns log-normalized gene expression summaries from the sparse "
+            "HVG matrix, with optional filters for brain region, region layer, "
+            "cell class, cell type, age at death, and sex."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "user_input": {
+                     "type": "string",
+                     "description": "Full text of user input."
+                }
+            },
+            "required": ["user_input"]
+        }
+     }
 ]
 
 def looks_like_expression_query(user_input):
@@ -1133,71 +1582,6 @@ def looks_like_expression_query(user_input):
 ### Main Chat Function ###
 
 # Chat between user and chatbot
-
-
-def chat(user_input, history):
-    global func_flag, init_flag
-
-    if init_flag:
-        history.clear()
-        initialize(history)
-
-    update_history(history, "user", user_input)
-
-    retrieved_info = None
-    graph_json = None
-
-    # Hard override: explicit literature/web search requests should bypass KG-RAG
-    if wants_web_search(user_input):
-        logger.info("Explicit web/literature intent detected; routing directly to Google")
-        try:
-            retrieved_info = search_vertex_ai(user_input)
-        except Exception:
-            logger.exception("Google search failed")
-            retrieved_info = None
-    else:
-        chat_message = call_api(history, functions)
-        logger.info("First model content: %s", getattr(chat_message, "content", None))
-        logger.info("Function call present: %s", bool(chat_message.function_call))
-
-        if chat_message.function_call:
-            try:
-                retrieved_info = func_call(user_input, chat_message, history)
-            except Exception as e:
-                logger.exception("func_call failed: %s", e)
-                retrieved_info = None
-
-        if not retrieved_info and looks_like_expression_query(user_input):
-            logger.info("Heuristic routing to gene_expression first")
-            try:
-                retrieved_info = gene_expression(user_input)
-            except Exception:
-                logger.exception("gene_expression heuristic failed")
-                retrieved_info = None
-
-        if not retrieved_info:
-            lowered = user_input.lower()
-            kg_terms = [
-                "drug", "drugs", "target", "targets", "disease",
-                "association", "associated", "pathway", "pathways",
-                "implicated", "implication"
-            ]
-            if any(term in lowered for term in kg_terms):
-                try:
-                    retrieved_info = query_kg_rag(user_input)
-                except Exception:
-                    logger.exception("KG query failed")
-                    retrieved_info = None
-
-        if not retrieved_info:
-            logger.info("Calling Google Vertex AI API...")
-            try:
-                retrieved_info = search_vertex_ai(user_input)
-                if not retrieved_info:
-                    logger.warning("Google search returned no usable results")
-            except Exception:
-                logger.exception("Google search failed")
-                retrieved_info = None
 
 
 
@@ -1258,7 +1642,135 @@ def chat(user_input, history):
 #            logger.exception("Google search failed")
 #            retrieved_info = None
     
+#    graph_json = None
+
+#    if not retrieved_info:
+#        retrieved_info = ""
+
+#    if isinstance(retrieved_info, dict):
+#        graph_json = retrieved_info.get("graph_json")
+#        retrieved_text = retrieved_info.get("text", "")
+#    else:
+#        retrieved_text = retrieved_info
+
+#    if not isinstance(retrieved_text, str):
+#        retrieved_text = str(retrieved_text)
+
+#    retrieved_text = retrieved_text[:4000]
+
+
+#    synthesis_messages = history[:] + [
+#        {
+#            "role": "system",
+#            "content": (
+#                "Answer the user's question directly using the retrieved information below. "
+#                "Do not mention search tools or internal routing."
+#
+#            )
+#        },
+#        {
+#            "role": "user",
+#            "content": f"Retrieved information:\n{retrieved_text}"
+#        }
+#    ]
+
+
+
+#    final_message = call_api(synthesis_messages).content
+#    logger.info("Final message returned to UI: %r", final_message)
+#    update_history(history, "assistant", final_message)
+
+#    logger.info("Retrieved text going into history: %s", retrieved_text)
+#    logger.info("Final message returned to UI: %s", final_message)
+#    return final_message, history, graph_json
+
+### new chat
+
+def chat(user_input, history):
+    global func_flag, init_flag
+
+    if init_flag:
+        history.clear()
+        initialize(history)
+
+    update_history(history, "user", user_input)
+
+    retrieved_info = None
     graph_json = None
+
+    if wants_web_search(user_input):
+        logger.info("Explicit web/literature intent detected; routing directly to Google")
+        try:
+            retrieved_info = search_vertex_ai(user_input)
+        except Exception:
+            logger.exception("Google search failed")
+            retrieved_info = None
+    else:
+        chat_message = call_api(history, functions)
+        logger.info("First model content: %s", getattr(chat_message, "content", None))
+        logger.info("Function call present: %s", bool(chat_message.function_call))
+
+        if chat_message.function_call:
+            try:
+                retrieved_info = func_call(user_input, chat_message, history)
+            except Exception:
+                logger.exception("func_call failed")
+                retrieved_info = None
+
+        # Heuristic routing fallback
+        if not retrieved_info and looks_like_expression_query(user_input):
+            if wants_marker_query(user_input):
+                logger.info("Routing to marker backend")
+                try:
+                    retrieved_info = gene_expression(user_input)
+                except Exception:
+                    logger.exception("marker backend failed")
+                    retrieved_info = None
+
+            if not retrieved_info and wants_matrix_expression_query(user_input):
+                logger.info("Routing to matrix expression backend")
+                try:
+                    retrieved_info = matrix_expression(user_input)
+                except Exception:
+                    logger.exception("matrix backend failed")
+                    retrieved_info = None
+
+            if not retrieved_info:
+                logger.info("Expression fallback: matrix first, then marker")
+                try:
+                    retrieved_info = matrix_expression(user_input)
+                except Exception:
+                    logger.exception("matrix fallback failed")
+                    retrieved_info = None
+
+                if not retrieved_info:
+                    try:
+                        retrieved_info = gene_expression(user_input)
+                    except Exception:
+                        logger.exception("marker fallback failed")
+                        retrieved_info = None
+
+        if not retrieved_info:
+            lowered = user_input.lower()
+            kg_terms = [
+                "drug", "drugs", "target", "targets", "disease",
+                "association", "associated", "pathway", "pathways",
+                "implicated", "implication"
+            ]
+            if any(term in lowered for term in kg_terms):
+                try:
+                    retrieved_info = query_kg_rag(user_input)
+                except Exception:
+                    logger.exception("KG query failed")
+                    retrieved_info = None
+
+        if not retrieved_info:
+            logger.info("Calling Google Vertex AI API...")
+            try:
+                retrieved_info = search_vertex_ai(user_input)
+            except Exception:
+                logger.exception("Google search failed")
+                retrieved_info = None
 
     if not retrieved_info:
         retrieved_info = ""
@@ -1288,16 +1800,8 @@ def chat(user_input, history):
         }
     ]
 
-
-
     final_message = call_api(synthesis_messages).content
     logger.info("Final message returned to UI: %r", final_message)
     update_history(history, "assistant", final_message)
 
-    logger.info("Retrieved text going into history: %s", retrieved_text)
-    logger.info("Final message returned to UI: %s", final_message)
     return final_message, history, graph_json
-
-
-
-
