@@ -159,7 +159,7 @@ EXPR_PATH = os.path.join(DATA_DIR, "expression_markers.csv")
 REGION_META_PATH = os.path.join(DATA_DIR, "region_metadata.csv")
 MATRIX_NPZ_PATH = os.path.join(DATA_DIR, "VasQ_adata_X_sparse.npz")
 CELL_META_PATH = os.path.join(DATA_DIR, "VasQ_cell_meta_table.csv")
-
+GENE_NAMES_PATH = os.path.join(DATA_DIR, "VasQ_gene_names.csv")
 
 MATRIX_EXPR = None
 MATRIX_META = None
@@ -183,6 +183,14 @@ def build_simple_alias_map(values):
         alias_map[normalize_text(v)] = str(v)
     return alias_map
 
+def load_gene_names():
+    genes_df = pd.read_csv(GENE_NAMES_PATH)
+    if genes_df.shape[1] == 1:
+        genes = genes_df.iloc[:, 0].astype(str).str.upper().str.strip().to_numpy()
+    else:
+        col = "gene" if "gene" in genes_df.columns else genes_df.columns[0]
+        genes = genes_df[col].astype(str).str.upper().str.strip().to_numpy()
+    return genes
 
 def load_matrix_expression_data():
     npz = np.load(MATRIX_NPZ_PATH, allow_pickle=True)
@@ -199,9 +207,11 @@ def load_matrix_expression_data():
             f"{MATRIX_NPZ_PATH} must contain either CSR arrays "
             f"(data, indices, indptr, shape) or a dense X array."
         )
-
-    if "genes" not in npz.files:
-        raise ValueError(f"{MATRIX_NPZ_PATH} is missing a 'genes' array.")
+   
+    if "genes" in npz.files:
+        genes = np.array([str(g).upper().strip() for g in npz["genes"]], dtype=object)
+    else:
+        genes = load_gene_names()
 
     genes = np.array([str(g).upper().strip() for g in npz["genes"]], dtype=object)
 
