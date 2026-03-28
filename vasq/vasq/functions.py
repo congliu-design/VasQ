@@ -125,6 +125,7 @@ def initialize(history):
     init_flag = False
 
 # Call function from chat
+
 def func_call(user_input, chat_message, history):
     if wants_web_search(user_input):
         logger.info("func_call override: explicit web/literature intent -> Google")
@@ -135,10 +136,19 @@ def func_call(user_input, chat_message, history):
     content = None
 
     func_name = chat_message.function_call.name
+
+    if (
+        func_name == "gene_expression"
+        and wants_matrix_expression_query(user_input)
+        and not wants_marker_query(user_input)
+    ):
+        logger.info("Overriding model-selected gene_expression -> matrix_expression")
+        func_name = "matrix_expression"
+
     print("Calling", func_name, "...")
-    args = {"user_input":user_input}
+    args = {"user_input": user_input}
     content = globals()[func_name](**args)
-        
+
     func_flag = False
     return content
 
@@ -512,9 +522,9 @@ def wants_marker_query(user_input):
 def wants_matrix_expression_query(user_input):
     text = user_input.lower()
     triggers = [
-        "expression", "expressed", "mean expression", "average expression",
+        "expression","express", "expressed", "mean expression", "average expression",
         "most highly expressed", "highest expressed", "how much expression",
-        "percent expressing", "pct expr", "lowly expressed", "absent"
+        "percent expressing", "pct expr", "lowly expressed", "absent", "not expressed"
     ]
     return any(t in text for t in triggers)
 
@@ -1394,13 +1404,35 @@ from google.api_core.client_options import ClientOptions
 from google.cloud import discoveryengine_v1 as discoveryengine
 from google.oauth2 import service_account
 
+
+
+from google.oauth2 import service_account
+
 def search_vertex_ai(query):
     project_id = os.getenv("VERTEX_PROJECT_ID")
     location = os.getenv("VERTEX_LOCATION", "global")
     engine_id = os.getenv("VERTEX_ENGINE_ID")
     serving_config_id = os.getenv("VERTEX_SERVING_CONFIG", "default_search")
+    sa_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
+
+    logger.info(
+        "Vertex config present? project=%s engine=%s sa_json_present=%s",
+        bool(project_id), bool(engine_id), bool(sa_json)
+    )
 
     if not project_id or not engine_id:
+        logger.error("Missing Vertex config: VERTEX_PROJECT_ID or VERTEX_ENGINE_ID")
+        return ""
+
+    if not sa_json:
+        logger.error("Missing GCP_SERVICE_ACCOUNT_JSON")
+        return ""
+
+    try:
+        sa_info = json.loads(sa_json)
+        credentials = service_account.Credentials.from_service_account_info(sa_info)
+    except Exception as e:
+        logger.exception("Failed to parse GCP_SERVICE_ACCOUNT_JSON: %s", e)
         return ""
 
     client_options = ClientOptions(
@@ -1411,7 +1443,14 @@ def search_vertex_ai(query):
         )
     )
 
-    client = discoveryengine.SearchServiceClient(client_options=client_options)
+    try:
+        client = discoveryengine.SearchServiceClient(
+            credentials=credentials,
+            client_options=client_options,
+        )
+    except Exception as e:
+        logger.exception("Failed to create Vertex client: %s", e)
+        return ""
 
     serving_config = (
         f"projects/{project_id}/locations/{location}/collections/default_collection/"
@@ -1427,6 +1466,15 @@ def search_vertex_ai(query):
     try:
         response = client.search(request=request)
         logger.info("Vertex result count=%d", len(response.results))
+        for i, result in enumerate(response.results, 1):
+            doc = result.document
+            logger.info("doc[%d].id=%r", i, getattr(doc, "id", None))
+            logger.info(
+                "doc[%d].derived_struct_data type=%s value=%r",
+                i,
+                type(getattr(doc, "derived_struct_data", None)),
+                getattr(doc, "derived_struct_data", None),
+            )
     except Exception as e:
         logger.exception("Vertex AI Search failed: %s", e)
         return ""
@@ -1444,7 +1492,7 @@ def search_vertex_ai(query):
             try:
                 derived = dict(derived)
             except Exception:
-                pass
+                derived = {}
 
         if isinstance(derived, dict):
             title = derived.get("title", "") or ""
