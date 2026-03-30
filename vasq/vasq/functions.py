@@ -1055,6 +1055,10 @@ def format_single_gene_expression_rows(df, max_rows=20):
 def wants_top_genes(user_input):
     text = user_input.lower()
     triggers = [
+        "top 5 genes",
+        "top 10 genes",
+        "top 20 genes",
+        "top markers",
         "top expressed", "highest expressed", "highest expression",
         "top genes", "marker genes", "markers", "most expressed"
     ]
@@ -1760,7 +1764,22 @@ def chat(user_input, history):
             logger.exception("Google search failed")
             retrieved_info = None
     else:
-        if looks_like_expression_query(user_input):
+        # 1. hard-route top-gene / marker questions to ranked backend
+        top_gene_query = (
+            wants_top_genes(user_input)
+            or ("top" in user_input.lower() and "gene" in user_input.lower())
+            or ("highly expressed" in user_input.lower() and "gene" in user_input.lower())
+        )
+
+        if looks_like_expression_query(user_input) and top_gene_query:
+            try:
+                retrieved_info = gene_expression(user_input)
+            except Exception:
+                logger.exception("top-gene pre-routing failed")
+                retrieved_info = None
+
+        # 2. hard-route true expression-value questions to matrix backend
+        if not retrieved_info and looks_like_expression_query(user_input):
             if wants_matrix_expression_query(user_input) and not wants_marker_query(user_input):
                 try:
                     retrieved_info = matrix_expression(user_input)
@@ -1768,6 +1787,7 @@ def chat(user_input, history):
                     logger.exception("matrix pre-routing failed")
                     retrieved_info = None
 
+        # 3. only ask the model to choose a function if nothing already succeeded
         if not retrieved_info:
             chat_message = call_api(history, functions)
             logger.info("First model content: %s", getattr(chat_message, "content", None))
@@ -1779,8 +1799,14 @@ def chat(user_input, history):
                 except Exception:
                     logger.exception("func_call failed")
                     retrieved_info = None
+            else:
+                direct_reply = getattr(chat_message, "content", None)
+                if direct_reply and direct_reply.strip():
+                    logger.info("Returning direct model reply without tool call")
+                    update_history(history, "assistant", direct_reply)
+                    return direct_reply, history, None
 
-        # Heuristic routing fallback
+        # 4. heuristic routing fallback
         if not retrieved_info and looks_like_expression_query(user_input):
             if wants_marker_query(user_input):
                 logger.info("Routing to marker backend")
@@ -1813,6 +1839,7 @@ def chat(user_input, history):
                         logger.exception("marker fallback failed")
                         retrieved_info = None
 
+        # 5. KG fallback
         if not retrieved_info:
             lowered = user_input.lower()
             kg_terms = [
@@ -1827,6 +1854,7 @@ def chat(user_input, history):
                     logger.exception("KG query failed")
                     retrieved_info = None
 
+        # 6. Google fallback
         if not retrieved_info:
             logger.info("Calling Google Vertex AI API...")
             try:
@@ -1868,5 +1896,3 @@ def chat(user_input, history):
     update_history(history, "assistant", final_message)
 
     return final_message, history, graph_json
-
-
