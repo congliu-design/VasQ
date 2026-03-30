@@ -192,7 +192,16 @@ def load_gene_names():
         genes = genes_df[col].astype(str).str.upper().str.strip().to_numpy()
     return genes
 
+
 def load_matrix_expression_data():
+    logger.info("MATRIX_NPZ_PATH=%s", MATRIX_NPZ_PATH)
+    logger.info("CELL_META_PATH=%s", CELL_META_PATH)
+    logger.info("GENE_NAMES_PATH=%s", GENE_NAMES_PATH)
+
+    logger.info("matrix exists? %s", os.path.exists(MATRIX_NPZ_PATH))
+    logger.info("cell meta exists? %s", os.path.exists(CELL_META_PATH))
+    logger.info("gene names exists? %s", os.path.exists(GENE_NAMES_PATH))
+
     npz = np.load(MATRIX_NPZ_PATH, allow_pickle=True)
 
     if {"data", "indices", "indptr", "shape"}.issubset(npz.files):
@@ -207,15 +216,12 @@ def load_matrix_expression_data():
             f"{MATRIX_NPZ_PATH} must contain either CSR arrays "
             f"(data, indices, indptr, shape) or a dense X array."
         )
-   
+
     if "genes" in npz.files:
         genes = np.array([str(g).upper().strip() for g in npz["genes"]], dtype=object)
     else:
-        genes = load_gene_names()
+        genes = np.array([str(g).upper().strip() for g in load_gene_names()], dtype=object)
 
-    genes = np.array([str(g).upper().strip() for g in npz["genes"]], dtype=object)
-
-    # first column appears to be the cell barcode / obs index
     meta = pd.read_csv(CELL_META_PATH, index_col=0)
     meta.index = meta.index.astype(str)
     meta.index.name = "cell_id"
@@ -266,6 +272,7 @@ def load_matrix_expression_data():
         )
 
     return X, meta, genes
+
 
 
 def ensure_matrix_expression_data_loaded():
