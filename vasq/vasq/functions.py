@@ -1542,6 +1542,8 @@ def wants_web_search(user_input: str) -> bool:
         "google",
         "google it",
         "find articles",
+        "articles",
+        "for papers",
         "find papers",
         "find paper",
         "find papers on",
