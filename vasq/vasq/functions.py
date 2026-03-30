@@ -183,25 +183,30 @@ def build_simple_alias_map(values):
         alias_map[normalize_text(v)] = str(v)
     return alias_map
 
+
 def load_gene_names():
     genes_df = pd.read_csv(GENE_NAMES_PATH)
+
+    candidate_cols = ["gene", "genes", "gene_name", "gene_symbol", "symbol"]
+
     if genes_df.shape[1] == 1:
-        genes = genes_df.iloc[:, 0].astype(str).str.upper().str.strip().to_numpy()
+        col = genes_df.columns[0]
     else:
-        col = "gene" if "gene" in genes_df.columns else genes_df.columns[0]
-        genes = genes_df[col].astype(str).str.upper().str.strip().to_numpy()
+        col = next((c for c in candidate_cols if c in genes_df.columns), genes_df.columns[0])
+
+    genes = (
+        genes_df[col]
+        .dropna()
+        .astype(str)
+        .str.upper()
+        .str.strip()
+        .to_numpy()
+    )
     return genes
 
 
+
 def load_matrix_expression_data():
-    logger.info("MATRIX_NPZ_PATH=%s", MATRIX_NPZ_PATH)
-    logger.info("CELL_META_PATH=%s", CELL_META_PATH)
-    logger.info("GENE_NAMES_PATH=%s", GENE_NAMES_PATH)
-
-    logger.info("matrix exists? %s", os.path.exists(MATRIX_NPZ_PATH))
-    logger.info("cell meta exists? %s", os.path.exists(CELL_META_PATH))
-    logger.info("gene names exists? %s", os.path.exists(GENE_NAMES_PATH))
-
     npz = np.load(MATRIX_NPZ_PATH, allow_pickle=True)
 
     if {"data", "indices", "indptr", "shape"}.issubset(npz.files):
@@ -217,14 +222,13 @@ def load_matrix_expression_data():
             f"(data, indices, indptr, shape) or a dense X array."
         )
 
-    if "genes" in npz.files:
-        genes = np.array([str(g).upper().strip() for g in npz["genes"]], dtype=object)
-    else:
-        genes = np.array([str(g).upper().strip() for g in load_gene_names()], dtype=object)
+    genes = np.array([str(g).upper().strip() for g in load_gene_names()], dtype=object)
 
     meta = pd.read_csv(CELL_META_PATH, index_col=0)
     meta.index = meta.index.astype(str)
     meta.index.name = "cell_id"
+    meta["cell_id"] = meta.index
+    meta = meta.reset_index(drop=True)
 
     rename_map = {
         "region_name": "brain_region",
@@ -273,6 +277,34 @@ def load_matrix_expression_data():
 
     return X, meta, genes
 
+def get_matrix_cell_indices(
+    user_input,
+    cell_types=None,
+    cell_classes=None,
+    regions=None,
+    region_layers=None,
+):
+    ensure_matrix_expression_data_loaded()
+
+    mask = pd.Series(True, index=MATRIX_META.index)
+
+    if cell_types:
+        mask &= MATRIX_META["cell_type"].isin(cell_types)
+
+    if cell_classes:
+        mask &= MATRIX_META["cell_class"].isin(cell_classes)
+
+    if regions:
+        mask &= MATRIX_META["brain_region"].isin(regions)
+
+    if region_layers:
+        mask &= MATRIX_META["region_layer"].isin(region_layers)
+
+    sex_filters = extract_sex_filters(user_input)
+    if sex_filters:
+        mask &= MATRIX_META["sex_norm"].isin(sex_filters)
+
+    return np.flatnonzero(mask.to_numpy())
 
 
 def ensure_matrix_expression_data_loaded():
@@ -370,36 +402,6 @@ def extract_sex_filters(user_input):
     return out
 
 
-def get_matrix_cell_indices(
-    user_input,
-    cell_types=None,
-    cell_classes=None,
-    regions=None,
-    region_layers=None,
-):
-    ensure_matrix_expression_data_loaded()
-
-    mask = pd.Series(True, index=MATRIX_META.index)
-
-    if cell_types:
-        mask &= MATRIX_META["cell_type"].isin(cell_types)
-
-    if cell_classes:
-        mask &= MATRIX_META["cell_class"].isin(cell_classes)
-
-    if regions:
-        mask &= MATRIX_META["brain_region"].isin(regions)
-
-    if region_layers:
-        mask &= MATRIX_META["region_layer"].isin(region_layers)
-
-    sex_filters = extract_sex_filters(user_input)
-    if sex_filters:
-        mask &= MATRIX_META["sex_norm"].isin(sex_filters)
-
-    return MATRIX_META.index[mask].to_numpy()
-
-
 def matrix_expression(user_input):
     ensure_matrix_expression_data_loaded()
 
@@ -478,7 +480,7 @@ def summarize_group_expression(gene, cell_indices, group_cols):
     if len(cell_indices) == 0:
         return pd.DataFrame()
 
-    obs = MATRIX_META.loc[cell_indices, group_cols].copy()
+    obs = MATRIX_META.iloc[cell_indices][group_cols].copy()
     rows = []
 
     for key, g in obs.groupby(group_cols):
