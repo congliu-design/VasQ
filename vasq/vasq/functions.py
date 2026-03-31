@@ -1744,6 +1744,7 @@ def looks_like_expression_query(user_input):
 ### new chat
 
 
+
 def chat(user_input, history):
     global func_flag, init_flag
 
@@ -1756,6 +1757,14 @@ def chat(user_input, history):
     retrieved_info = None
     graph_json = None
 
+    expression_query = looks_like_expression_query(user_input)
+    top_gene_query = (
+        wants_top_genes(user_input)
+        or ("top" in user_input.lower() and "gene" in user_input.lower())
+        or ("highly expressed" in user_input.lower() and "gene" in user_input.lower())
+        or ("what are the top" in user_input.lower() and "genes" in user_input.lower())
+    )
+
     if wants_web_search(user_input):
         logger.info("Explicit web/literature intent detected; routing directly to Google")
         try:
@@ -1764,14 +1773,8 @@ def chat(user_input, history):
             logger.exception("Google search failed")
             retrieved_info = None
     else:
-        # 1. hard-route top-gene / marker questions to ranked backend
-        top_gene_query = (
-            wants_top_genes(user_input)
-            or ("top" in user_input.lower() and "gene" in user_input.lower())
-            or ("highly expressed" in user_input.lower() and "gene" in user_input.lower())
-        )
-
-        if looks_like_expression_query(user_input) and top_gene_query:
+        # 1. hard-route top-gene / marker questions to ranked backend first
+        if expression_query and top_gene_query:
             try:
                 retrieved_info = gene_expression(user_input)
             except Exception:
@@ -1779,7 +1782,7 @@ def chat(user_input, history):
                 retrieved_info = None
 
         # 2. hard-route true expression-value questions to matrix backend
-        if not retrieved_info and looks_like_expression_query(user_input):
+        if not retrieved_info and expression_query:
             if wants_matrix_expression_query(user_input) and not wants_marker_query(user_input):
                 try:
                     retrieved_info = matrix_expression(user_input)
@@ -1801,14 +1804,17 @@ def chat(user_input, history):
                     retrieved_info = None
             else:
                 direct_reply = getattr(chat_message, "content", None)
-                if direct_reply and direct_reply.strip():
+
+                # For non-expression conversational follow-ups, allow direct reply.
+                # For expression/top-gene questions, prefer dataset/tool routing.
+                if direct_reply and direct_reply.strip() and not expression_query:
                     logger.info("Returning direct model reply without tool call")
                     update_history(history, "assistant", direct_reply)
                     return direct_reply, history, None
 
         # 4. heuristic routing fallback
-        if not retrieved_info and looks_like_expression_query(user_input):
-            if wants_marker_query(user_input):
+        if not retrieved_info and expression_query:
+            if top_gene_query or wants_marker_query(user_input):
                 logger.info("Routing to marker backend")
                 try:
                     retrieved_info = gene_expression(user_input)
