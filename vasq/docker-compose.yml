@@ -7,10 +7,14 @@ services:
     command: python manage.py runserver 0.0.0.0:8000
     volumes:
       - .:/app
+      # expression backends read from an absolute /data path (see functions.py)
+      - ./data:/data
     ports:
       - "8000:8000"
     env_file:
       - ../.env-shared
+    depends_on:
+      - kg_rag
 
   kg_rag:
     build:

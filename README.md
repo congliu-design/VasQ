@@ -44,11 +44,11 @@ VasQ runs as **two services**:
 5. **Disease mentions** → `query_kg_rag` (SPOKE via the Flask service).
 6. **Fallback** → Vertex AI Search.
 
-The Django app reaches the KG-RAG service via the `KG_RAG_URL` environment variable (defaults to the internal Railway service URL; use `http://localhost:5005/query` for local Docker Compose).
+The Django app reaches the KG-RAG service via the `KG_RAG_URL` environment variable. It defaults to the internal Railway service URL in code; for local Docker Compose it is preset to `http://kg_rag:5005/query` in `.env-shared`.
 
 ## Data files
 
-The expression backends read from `vasq/data/`:
+The expression backends read from an absolute `/data` path inside the container (`DATA_DIR = "/data"` in [`functions.py`](vasq/vasq/functions.py)). The source files live in `vasq/data/`, which is mounted to `/data` by Docker Compose (and copied into the image for Railway):
 
 | File | Used by | Notes |
 |------|---------|-------|
@@ -200,7 +200,9 @@ SEARCH_ENGINE_ID=your_search_engine_id
 
 ---
 
-## 🛠️ Launch the Application (Local)
+> **Deployment paths.** The **primary, public-facing deployment is Railway** (see below) — that's how VasQ is served to users. **Local Docker Compose is a supported development option** for running the full stack on your own machine.
+
+## 🛠️ Run Locally (development)
 
 1. Build and run both services with Docker Compose:
 
@@ -212,16 +214,20 @@ SEARCH_ENGINE_ID=your_search_engine_id
 
    This starts the Django web app on port **8000** and the KG-RAG Flask service on port **5005**. If a pop-up window appears, click `Allow`.
 
-   > When running locally, point the app at the local KG-RAG service by setting `KG_RAG_URL=http://kg_rag:5005/query` (the compose service name) in `.env-shared`.
+   Local wiring is handled for you:
+   - `docker-compose.yml` mounts `vasq/data` to the `/data` path the expression backends read from.
+   - `.env-shared` presets `KG_RAG_URL=http://kg_rag:5005/query` so the app reaches the local KG-RAG service.
+
+   > Tip: set `DEBUG=True` in `.env-shared` for verbose local development output.
 
 2. Open your browser and visit:
    [http://127.0.0.1:8000/vasq/](http://127.0.0.1:8000/vasq/)
 
 ---
 
-## ☁️ Deployment (Railway)
+## ☁️ Deployment (Railway) — primary / public
 
-VasQ is deployed on [Railway](https://railway.app) as two services, each built from its own `Dockerfile.railway` and served with **gunicorn**:
+VasQ is deployed on [Railway](https://railway.app) as two services, each built from its own `Dockerfile.railway` and served with **gunicorn**. This is the supported path for making VasQ public:
 
 - **`vasq/Dockerfile.railway`** → Django app (`gunicorn newui.wsgi:application`), served publicly (e.g. `https://vasq.up.railway.app`).
 - **`kg_rag/Dockerfile.railway`** → KG-RAG Flask app (`gunicorn api:app`), reached by the Django service over Railway's private network.
