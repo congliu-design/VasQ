@@ -11,6 +11,7 @@ RUN pip install --upgrade pip && pip install -r /app/requirements.txt gunicorn
 RUN which gunicorn && gunicorn --version
 
 COPY vasq/ /app/
+COPY vasq/data/ /data/
 
 RUN python manage.py collectstatic --noinput
 
