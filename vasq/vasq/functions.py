@@ -838,7 +838,7 @@ def resolve_dataset_entities_with_gpt(user_input, available_cell_types, availabl
 
     try:
         response = openai.chat.completions.create(
-            model="gpt-4o",
+            model=os.getenv("OPENAI_HELPER_MODEL", "gpt-4o"),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -928,7 +928,7 @@ def extract_genes(user_input):
     )
 
     response = openai.chat.completions.create(
-        model="gpt-4o",
+        model=os.getenv("OPENAI_HELPER_MODEL", "gpt-4o"),
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input}
@@ -983,7 +983,7 @@ def all_regions(user_input):
 #    )
 #
 #    response = openai.chat.completions.create(
-#        model="gpt-4o",
+#        model=os.getenv("OPENAI_HELPER_MODEL", "gpt-4o"),
 #        messages=[
 #            {"role": "system", "content": system_prompt},
 #            {"role": "user", "content": user_input}
@@ -1001,7 +1001,7 @@ def is_cross_region_comparison(user_input):
     )
 
     response = openai.chat.completions.create(
-        model="gpt-4o",
+        model=os.getenv("OPENAI_HELPER_MODEL", "gpt-4o"),
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input}
@@ -1019,7 +1019,7 @@ def is_region_filtered_query(user_input):
     )
 
     response = openai.chat.completions.create(
-        model="gpt-4o",
+        model=os.getenv("OPENAI_HELPER_MODEL", "gpt-4o"),
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input}
