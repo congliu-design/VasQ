@@ -187,15 +187,8 @@ def build_simple_alias_map(values):
 def load_gene_names():
     genes_df = pd.read_csv(GENE_NAMES_PATH)
 
-    candidate_cols = ["gene", "genes", "gene_name", "gene_symbol", "symbol"]
-
-    if genes_df.shape[1] == 1:
-        col = genes_df.columns[0]
-    else:
-        col = next((c for c in candidate_cols if c in genes_df.columns), genes_df.columns[0])
-
     genes = (
-        genes_df[col]
+        genes_df.iloc[:, 0]
         .dropna()
         .astype(str)
         .str.upper()
@@ -203,7 +196,6 @@ def load_gene_names():
         .to_numpy()
     )
     return genes
-
 
 
 def load_matrix_expression_data():
