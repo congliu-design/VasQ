@@ -1471,7 +1471,7 @@ from google.oauth2 import service_account
 
 from google.oauth2 import service_account
 
-def search_openai_web(query):
+def search_vertex_ai(query):
     project_id = os.getenv("VERTEX_PROJECT_ID")
     location = os.getenv("VERTEX_LOCATION", "global")
     engine_id = os.getenv("VERTEX_ENGINE_ID")
