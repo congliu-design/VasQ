@@ -19,6 +19,7 @@ init_flag = True
 
 
 logger = logging.getLogger(__name__)
+logger.info("OpenAI SDK version: %s", openai.__version__)
 
 #def query_kg_rag(user_input):
 #    url = os.getenv("KG_RAG_URL", "http://kg-rag.railway.internal:8080/query")
