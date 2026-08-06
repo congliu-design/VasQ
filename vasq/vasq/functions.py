@@ -47,7 +47,10 @@ def call_api(history, functions=None):
 
     if functions:
         request_args["functions"] = functions
-
+        
+        if model.startswith("gpt-5.6"):
+            request_args["reasoning_effort"] = "none"
+            
     chat_co = openai.chat.completions.create(**request_args)
 
     return chat_co.choices[0].message
