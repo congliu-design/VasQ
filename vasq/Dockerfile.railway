@@ -15,4 +15,5 @@ COPY vasq/data/ /data/
 
 RUN python manage.py collectstatic --noinput
 
-CMD ["bash", "-lc", "gunicorn newui.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 2 --timeout 120"]
+CMD ["bash", "-lc", "gunicorn newui.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 1 --timeout 300"]
+#CMD ["bash", "-lc", "gunicorn newui.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 2 --timeout 120"]
