@@ -16,6 +16,7 @@ global func_flag
 global init_flag
 func_flag = False
 init_flag = True
+from openai import OpenAI
 
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,55 @@ def call_helper_api(system_prompt, user_prompt):
         request_args["temperature"] = 0
 
     return openai.chat.completions.create(**request_args)
+
+
+logger = logging.getLogger(__name__)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+def search_openai_web(user_input):
+    try:
+        logger.info("Calling OpenAI Web Search...")
+
+        response = client.responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-5.6-terra"),
+            tools=[
+                {
+                    "type": "web_search",
+                    "search_context_size": "high",
+                    "external_web_access": True,
+                }
+            ],
+
+            # 因为只有 web_search 一个工具，所以 required 保证一定搜索
+            tool_choice="required",
+
+            include=["web_search_call.action.sources"],
+
+            input=(
+                "Search the live web before answering the following biomedical "
+                "question. Prioritize peer-reviewed literature, PubMed, FDA, "
+                "ClinicalTrials.gov, and authoritative medical sources. "
+                "Provide source citations.\n\n"
+                f"Question: {user_input}"
+            ),
+        )
+
+        result = response.output_text.strip()
+
+        if not result:
+            logger.warning("OpenAI Web Search returned no text")
+            return None
+
+        logger.info(
+            "OpenAI Web Search succeeded, result length=%s",
+            len(result),
+        )
+        return result
+
+    except Exception:
+        logger.exception("OpenAI Web Search failed")
+        return None
 
 
 # Update chat history
@@ -154,7 +204,7 @@ def initialize(history):
 def func_call(user_input, chat_message, history):
     if wants_web_search(user_input):
         logger.info("func_call override: explicit web/literature intent -> Google")
-        return search_vertex_ai(user_input)
+        return search_openai_web(user_input)
 
     global func_flag
     func_flag = True
@@ -1421,7 +1471,7 @@ from google.oauth2 import service_account
 
 from google.oauth2 import service_account
 
-def search_vertex_ai(query):
+def search_openai_web(query):
     project_id = os.getenv("VERTEX_PROJECT_ID")
     location = os.getenv("VERTEX_LOCATION", "global")
     engine_id = os.getenv("VERTEX_ENGINE_ID")
@@ -1682,7 +1732,7 @@ def looks_like_expression_query(user_input):
 #    if not retrieved_info:
 #        logger.info("Calling Google Vertex AI API...")
 #        try:
-#            retrieved_info = search_vertex_ai(user_input)
+#            retrieved_info = search_openai_web(user_input)
 #            if not retrieved_info:
 #                logger.warning("Google search returned no usable results")
 #        except Exception as e:
@@ -1758,7 +1808,7 @@ def chat(user_input, history):
     if wants_web_search(user_input):
         logger.info("Explicit web/literature intent detected; routing directly to Google")
         try:
-            retrieved_info = search_vertex_ai(user_input)
+            retrieved_info = search_openai_web(user_input)
         except Exception:
             logger.exception("Google search failed")
             retrieved_info = None
@@ -1854,7 +1904,7 @@ def chat(user_input, history):
         if not retrieved_info:
             logger.info("Calling Google Vertex AI API...")
             try:
-                retrieved_info = search_vertex_ai(user_input)
+                retrieved_info = search_openai_web(user_input)
             except Exception:
                 logger.exception("Google search failed")
                 retrieved_info = None
