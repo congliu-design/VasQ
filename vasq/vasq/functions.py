@@ -130,9 +130,9 @@ def initialize(history):
         for queries unrelated to gene expression levels in specific cell types \
         or brain regions, even if they mention particular genes. \n- Instead, \
         use the knowledge graph, Google web search, or your own pretrained \
-        knowledge to answer. \nWHEN TO CALL query_kg_rag: \n- If the user \
+        knowledge to answer. \nWHEN TO CALL : \n- If the user \
         mentions any disease by name in their query you MUST call \
-        query_kg_rag. \nResponse strategy: \n- Prioritize information from \
+        . \nResponse strategy: \n- Prioritize information from \
         tools in the following order: \n1. gene_expression \n2. Biomedical \
         knowledge graph \n3. Web results (Google Search API) \n4. Parametric \
         (pretrained) knowledge \n- Always include information from each tool \
@@ -1260,21 +1260,44 @@ def summarize_single_gene_expression(df, gene_name, max_rows=5):
 # Invoke KG_RAG
 
 def query_kg_rag(user_input):
-    url = os.getenv("KG_RAG_URL", "http://kg-rag.railway.internal:8080/query")
-    logger.info("Calling KG_RAG_URL=%s", url)
+    url = os.getenv(
+        "KG_RAG_URL",
+        "http://kg-rag.railway.internal:8080/query"
+    )
+
     try:
         response = requests.post(
             url,
             json={"query": user_input},
             timeout=180,
         )
-        logger.info("kg-rag status=%s body=%s", response.status_code, response.text[:1000])
         response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        logger.exception("KG query failed: %s", e)
-        return None
 
+        payload = response.json()
+        result = str(payload.get("result", "")).strip()
+
+        failure_markers = [
+            "no vectorstore hit",
+            "no entity-level hits found",
+            "no specific information",
+            "i don't have specific information",
+        ]
+
+        if not result or any(
+            marker in result.lower()
+            for marker in failure_markers
+        ):
+            logger.warning(
+                "KG-RAG returned no useful information: %s",
+                result[:500]
+            )
+            return None
+
+        return result
+
+    except Exception:
+        logger.exception("KG-RAG request failed")
+        return None
 
 
 def build_matrix_expression_plot(stats_df, gene_name=None, max_rows=8):
