@@ -216,7 +216,7 @@ def load_matrix_expression_data():
 
     genes = np.array([str(g).upper().strip() for g in load_gene_names()], dtype=object)
 
-    meta = pd.read_csv(CELL_META_PATH, index_col=0)
+    meta = pd.read_csv(CELL_META_PATH)
     meta.index = meta.index.astype(str)
     meta.index.name = "cell_id"
     meta["cell_id"] = meta.index
