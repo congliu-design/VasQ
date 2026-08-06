@@ -38,18 +38,39 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Call OpenAI API
 def call_api(history, functions=None):
-    MAX_MESSAGES = 12
+    model = os.getenv("OPENAI_MODEL", "gpt-5.6-terra")
 
-    trimmed_history = history[-MAX_MESSAGES:]
+    request_args = {
+        "model": model,
+        "messages": history,
+    }
 
-    chat_co = openai.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
-        messages=trimmed_history,
-        functions=functions,
-        temperature=0.2,
-        top_p=0.4,
-    )
+    if functions:
+        request_args["functions"] = functions
+
+    chat_co = openai.chat.completions.create(**request_args)
+
     return chat_co.choices[0].message
+
+
+def call_helper_api(system_prompt, user_prompt):
+    """Call the helper model with parameters compatible with GPT-4o and GPT-5.6."""
+    model = os.getenv("OPENAI_HELPER_MODEL", "gpt-4o")
+
+    request_args = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    # GPT-5.6 only accepts its default sampling settings. Older models such as
+    # GPT-4o can still use temperature=0 for deterministic helper tasks.
+    if not model.startswith("gpt-5.6"):
+        request_args["temperature"] = 0
+
+    return openai.chat.completions.create(**request_args)
 
 
 # Update chat history
@@ -837,14 +858,7 @@ def resolve_dataset_entities_with_gpt(user_input, available_cell_types, availabl
     )
 
     try:
-        response = openai.chat.completions.create(
-            model=os.getenv("OPENAI_HELPER_MODEL", "gpt-4o"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0
-        )
+        response = call_helper_api(system_prompt, user_prompt)
 
         raw = response.choices[0].message.content.strip()
         logger.info("GPT dataset entity raw response: %s", raw)
@@ -927,14 +941,7 @@ def extract_genes(user_input):
         "If no genes are explicitly mentioned, return []."
     )
 
-    response = openai.chat.completions.create(
-        model=os.getenv("OPENAI_HELPER_MODEL", "gpt-4o"),
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_input}
-        ],
-        temperature=0
-    )
+    response = call_helper_api(system_prompt, user_input)
 
     raw_text = response.choices[0].message.content.strip()
 
@@ -964,50 +971,13 @@ def all_regions(user_input):
     ]
     return any(t in text for t in triggers)
 
-#def all_regions(user_input):
-#    system_prompt = (
-#        "Decide whether the user is asking for a comparison against all regions "
-#        "or across the whole dataset, rather than only filtering to explicitly "
-#        "named regions. Return only True or False.\n\n"
-#        "Return True for examples like:\n"
-#        "- 'higher than other regions'\n"
-#        "- 'specific to hippocampus compared to the rest of brain'\n"
-#        "- 'across all regions'\n"
-#        "- 'highest in the brain'\n"
-#        "- 'unique to pons versus other regions'\n\n"
-#        "Return False for examples like:\n"
-#        "- 'in hippocampus and amygdala'\n"
-#        "- 'show top genes in pons'\n"
-#        "- 'expression in thalamus'\n"
-#        "- 'compare hippocampus and amygdala only'"
-#    )
-#
-#    response = openai.chat.completions.create(
-#        model=os.getenv("OPENAI_HELPER_MODEL", "gpt-4o"),
-#        messages=[
-#            {"role": "system", "content": system_prompt},
-#            {"role": "user", "content": user_input}
-#        ],
-#        temperature=0
-#    )
-#
-#    raw_text = response.choices[0].message.content.strip().lower()
-#    return "true" in raw_text
-
 def is_cross_region_comparison(user_input):
     system_prompt = (
         "Determine whether the user is asking for comparison against other brain regions "
         "or across the whole dataset. Return only True or False."
     )
 
-    response = openai.chat.completions.create(
-        model=os.getenv("OPENAI_HELPER_MODEL", "gpt-4o"),
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_input}
-        ],
-        temperature=0
-    )
+    response = call_helper_api(system_prompt, user_input)
 
     return "true" in response.choices[0].message.content.strip().lower()
 
@@ -1018,14 +988,7 @@ def is_region_filtered_query(user_input):
         "named brain regions, rather than compared to all other regions. Return only True or False."
     )
 
-    response = openai.chat.completions.create(
-        model=os.getenv("OPENAI_HELPER_MODEL", "gpt-4o"),
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_input}
-        ],
-        temperature=0
-    )
+    response = call_helper_api(system_prompt, user_input)
 
     return "true" in response.choices[0].message.content.strip().lower()
 
