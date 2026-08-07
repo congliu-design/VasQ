@@ -96,7 +96,7 @@ def run_openai_web_search(search_prompt):
                 }
             ],
 
-            # 因为只有 web_search 一个工具，所以 required 保证一定搜索
+            # å› ä¸ºåªæœ‰ web_search ä¸€ä¸ªå·¥å…·ï¼Œæ‰€ä»¥ required ä¿è¯ä¸€å®šæœç´¢
             tool_choice="required",
 
             include=["web_search_call.action.sources"],
@@ -133,7 +133,7 @@ def search_openai_web(user_input):
 
 
 def search_scientific_web(user_input, kg_context=None, kg_assessment=None):
-    """Search for scientific function/pathway evidence, guided by KG-RAG."""
+    """First search: establish scientific knowledge and candidate genes."""
     kg_context = (kg_context or "").strip()
     kg_assessment = kg_assessment or {}
 
@@ -152,8 +152,12 @@ def search_scientific_web(user_input, kg_context=None, kg_assessment=None):
 
     pathway_instruction = (
         "Pay particular attention to molecular function, biological pathways, "
-        "mechanism, and disease relevance. If pathway or function evidence is "
-        "not available, say so instead of inferring it. "
+        "mechanism, disease relevance, and human genes supported by the "
+        "evidence. When the question concerns a disease or asks which genes "
+        "are involved, provide a prioritized list of official human gene "
+        "symbols and distinguish causal genes from risk-associated or "
+        "mechanistic genes. If pathway, function, or gene-association evidence "
+        "is not available, say so instead of inferring it. "
     )
 
     return run_openai_web_search(
@@ -507,10 +511,19 @@ def extract_sex_filters(user_input):
     return out
 
 
-def matrix_expression(user_input):
+def matrix_expression(user_input, genes_override=None):
     ensure_matrix_expression_data_loaded()
 
-    genes = extract_genes(user_input)
+    if genes_override:
+        genes = [
+            str(g).upper().strip()
+            for g in genes_override
+            if str(g).strip()
+        ]
+        genes = list(dict.fromkeys(genes))
+    else:
+        genes = extract_genes(user_input)
+
     if not genes:
         return "Please specify a gene for matrix-based expression queries."
 
@@ -1037,6 +1050,81 @@ def extract_genes(user_input):
         pass
 
     return []
+
+
+def derive_genes_from_first_search(
+    user_input,
+    scientific_web_result,
+    kg_result=None,
+    existing_genes=None,
+):
+    """Build the gene list that drives VasQ and the second drug search.
+
+    The first Web Search identifies disease biology and candidate genes. This
+    helper converts that evidence into a short, ordered list of human gene
+    symbols. It does not perform another Web Search.
+    """
+    existing_genes = [
+        str(g).upper().strip()
+        for g in (existing_genes or [])
+        if str(g).strip()
+    ]
+
+    try:
+        max_genes = int(os.getenv("MAX_DERIVED_GENES", "10"))
+    except ValueError:
+        max_genes = 10
+    max_genes = max(1, min(max_genes, 20))
+
+    evidence_parts = []
+    if scientific_web_result:
+        evidence_parts.append(
+            "Web/literature evidence:\n"
+            + cap_source_text(scientific_web_result, 9000)
+        )
+    if kg_result:
+        evidence_parts.append(
+            "Knowledge-graph evidence:\n"
+            + cap_source_text(kg_result, 3000)
+        )
+
+    if not evidence_parts:
+        return existing_genes[:max_genes]
+
+    system_prompt = (
+        "Extract and prioritize human gene symbols for a downstream gene-"
+        "expression analysis. Return JSON only in the form "
+        "{\"genes\":[\"APOE\",\"APP\"]}. Include genes explicitly supported "
+        "by the supplied evidence as causal genes, risk genes, associated "
+        "genes, or central mechanistic genes for the user's question. Do not "
+        "include genes that are merely mentioned incidentally. Use official "
+        "HGNC-style uppercase symbols, remove duplicates, rank the strongest "
+        "evidence first, and return no more than the requested maximum. Keep "
+        "any explicitly supplied user genes when relevant."
+    )
+    user_prompt = (
+        f"User question:\n{user_input}\n\n"
+        f"Explicitly supplied genes:\n{existing_genes}\n\n"
+        f"Maximum genes:\n{max_genes}\n\n"
+        + "\n\n".join(evidence_parts)
+    )
+
+    try:
+        response = call_helper_api(system_prompt, user_prompt)
+        parsed = parse_json_object(response.choices[0].message.content)
+        if not parsed:
+            raise ValueError("Gene derivation helper returned invalid JSON")
+
+        derived_genes = [
+            str(g).upper().strip()
+            for g in parsed.get("genes", [])
+            if re.fullmatch(r"[A-Z][A-Z0-9.-]{1,19}", str(g).upper().strip())
+        ]
+        combined = list(dict.fromkeys(existing_genes + derived_genes))
+        return combined[:max_genes]
+    except Exception:
+        logger.exception("Could not derive genes from first-search evidence")
+        return existing_genes[:max_genes]
 
 def all_regions(user_input):
     text = user_input.lower()
@@ -1675,7 +1763,7 @@ def is_simple_conversational_message(user_input):
     phrases = {
         "hi", "hello", "hey", "good morning", "good afternoon",
         "good evening", "thanks", "thank you", "ok", "okay",
-        "你好", "您好", "嗨", "谢谢", "好的", "收到", "再见",
+        "ä½ å¥½", "æ‚¨å¥½", "å—¨", "è°¢è°¢", "å¥½çš„", "æ”¶åˆ°", "å†è§",
     }
     return text in phrases
 
@@ -2081,6 +2169,7 @@ def chat(user_input, history):
     kg_assessment = assess_kg_relevance(resolved_question, kg_result)
 
     try:
+        logger.info("Web Search stage 1/2: scientific knowledge and genes")
         scientific_web_result = search_scientific_web(
             resolved_question,
             kg_context=kg_result,
@@ -2090,8 +2179,20 @@ def chat(user_input, history):
         logger.exception("Scientific Web Search branch failed")
         scientific_web_result = None
 
-    # Branch B: VasQ is conditional on expression intent. Marker/rank questions
-    # use the ranked marker table; measured expression questions use the matrix.
+    # The first search can discover genes that were not explicitly written in
+    # the user's question (for example, an Alzheimer's disease question). Use
+    # that evidence-derived list for both VasQ and the second drug search.
+    genes = derive_genes_from_first_search(
+        resolved_question,
+        scientific_web_result,
+        kg_result=kg_result if kg_assessment.get("relevant") else None,
+        existing_genes=genes,
+    )
+    logger.info("Gene list after first search: %s", genes)
+
+    # Branch B: calculate expression for the explicit or first-search-derived
+    # gene list. Marker/rank questions use the ranked marker table; measured
+    # expression questions use the VasQ matrix.
     vasq_result = None
     vasq_note = ""
     graph_json = None
@@ -2106,7 +2207,11 @@ def chat(user_input, history):
                 if intent.get("asks_markers"):
                     vasq_result = gene_expression(vasq_query)
                 else:
-                    vasq_result = matrix_expression(vasq_query)
+                    vasq_result = matrix_expression(
+                        vasq_query,
+                        genes_override=genes,
+                    )
+                logger.info("VasQ analysis completed for genes: %s", genes)
             except Exception:
                 logger.exception("VasQ branch failed")
                 vasq_result = None
@@ -2120,11 +2225,17 @@ def chat(user_input, history):
 
     vasq_text, graph_json = retrieved_text_and_graph(vasq_result)
 
-    # Branch C: any resolved gene or disease triggers a separate current search
-    # for direct modulators, pathway compounds, and disease treatments.
+    # Branch C: second and final Web Search. It uses the gene list produced by
+    # the first search to find direct modulators, pathway compounds, and
+    # disease-directed treatments.
     drug_result = None
     if genes or diseases:
         try:
+            logger.info(
+                "Web Search stage 2/2: drugs for genes=%s diseases=%s",
+                genes,
+                diseases,
+            )
             drug_result = search_drugs_and_small_molecules(
                 resolved_question,
                 genes=genes,
@@ -2137,10 +2248,16 @@ def chat(user_input, history):
     # Cap each source independently so a long Web result cannot erase VasQ data.
     evidence_parts = []
 
+    if genes:
+        evidence_parts.append(
+            "GENE LIST DERIVED FROM THE FIRST SEARCH:\n"
+            + ", ".join(genes)
+        )
+
     if vasq_text:
         evidence_parts.append(
             "VASQ EXPRESSION OR MARKER DATA:\n"
-            + cap_source_text(vasq_text, 4500)
+            + cap_source_text(vasq_text, 15000)
         )
     elif vasq_note:
         evidence_parts.append("VASQ STATUS:\n" + vasq_note)
@@ -2159,7 +2276,7 @@ def chat(user_input, history):
     if scientific_web_result:
         evidence_parts.append(
             "SCIENTIFIC WEB/LITERATURE EVIDENCE:\n"
-            + cap_source_text(scientific_web_result, 5000)
+            + cap_source_text(scientific_web_result, 7000)
         )
     else:
         evidence_parts.append(
@@ -2170,7 +2287,7 @@ def chat(user_input, history):
         if drug_result:
             evidence_parts.append(
                 "DRUG AND SMALL-MOLECULE EVIDENCE:\n"
-                + cap_source_text(drug_result, 5000)
+                + cap_source_text(drug_result, 7000)
             )
         else:
             evidence_parts.append(
@@ -2195,9 +2312,15 @@ def chat(user_input, history):
             "compounds, and disease-directed treatments, and distinguish "
             "approved, clinical, preclinical, and research-tool status. Never "
             "claim that a disease drug directly targets a gene without direct "
-            "support. If a source reports no result, state the limitation "
-            "briefly rather than inventing content. Do not mention internal "
-            "routing or implementation details."
+            "support. For disease questions that ask about genes and their "
+            "expression, organize the answer into three explicit sections: "
+            "(1) associated genes and supporting knowledge, (2) VasQ matrix "
+            "expression by brain region/cell type with the supplied measured "
+            "values, and (3) drugs or therapeutic compounds related to those "
+            "genes. Cover every analyzed gene when evidence is available. If "
+            "a source reports no result, state the limitation briefly rather "
+            "than inventing content. Do not mention internal routing or "
+            "implementation details."
         ),
     }
 
