@@ -82,7 +82,7 @@ logger = logging.getLogger(__name__)
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
-def search_openai_web(user_input):
+def run_openai_web_search(search_prompt):
     try:
         logger.info("Calling OpenAI Web Search...")
 
@@ -101,13 +101,7 @@ def search_openai_web(user_input):
 
             include=["web_search_call.action.sources"],
 
-            input=(
-                "Search the live web before answering the following biomedical "
-                "question. Prioritize peer-reviewed literature, PubMed, FDA, "
-                "ClinicalTrials.gov, and authoritative medical sources. "
-                "Provide source citations.\n\n"
-                f"Question: {user_input}"
-            ),
+            input=search_prompt,
         )
 
         result = response.output_text.strip()
@@ -127,6 +121,86 @@ def search_openai_web(user_input):
         return None
 
 
+def search_openai_web(user_input):
+    """Generic biomedical Web Search kept for backwards compatibility."""
+    return run_openai_web_search(
+        "Search the live web before answering the following biomedical "
+        "question. Prioritize peer-reviewed literature, PubMed, FDA, "
+        "ClinicalTrials.gov, and authoritative medical sources. "
+        "Provide source citations.\n\n"
+        f"Question: {user_input}"
+    )
+
+
+def search_scientific_web(user_input, kg_context=None, kg_assessment=None):
+    """Search for scientific function/pathway evidence, guided by KG-RAG."""
+    kg_context = (kg_context or "").strip()
+    kg_assessment = kg_assessment or {}
+
+    if kg_context and kg_assessment.get("relevant"):
+        context_block = (
+            "A biomedical knowledge graph returned the following potentially "
+            "relevant context. Use it only to guide the search; independently "
+            "verify every scientific claim:\n"
+            f"{kg_context[:4000]}\n\n"
+        )
+    else:
+        context_block = (
+            "The biomedical knowledge graph did not return sufficiently "
+            "relevant context. Search from the original question directly.\n\n"
+        )
+
+    pathway_instruction = (
+        "Pay particular attention to molecular function, biological pathways, "
+        "mechanism, and disease relevance. If pathway or function evidence is "
+        "not available, say so instead of inferring it. "
+    )
+
+    return run_openai_web_search(
+        "Search the live web to answer this biomedical question. "
+        + pathway_instruction
+        + "Prioritize peer-reviewed literature, PubMed, FDA, "
+        "ClinicalTrials.gov, and authoritative scientific sources. "
+        "Provide source citations and distinguish established evidence from "
+        "hypotheses.\n\n"
+        + context_block
+        + f"Question: {user_input}"
+    )
+
+
+def search_drugs_and_small_molecules(user_input, genes=None, diseases=None):
+    """Search current drug/small-molecule evidence for genes or diseases."""
+    genes = [str(x).upper().strip() for x in (genes or []) if str(x).strip()]
+    diseases = [str(x).strip() for x in (diseases or []) if str(x).strip()]
+
+    if not genes and not diseases:
+        return None
+
+    entity_lines = []
+    if genes:
+        entity_lines.append("Genes/targets: " + ", ".join(genes))
+    if diseases:
+        entity_lines.append("Diseases/conditions: " + ", ".join(diseases))
+
+    return run_openai_web_search(
+        "Search the live web for drugs and small molecules related to the "
+        "entities below. Search for direct gene/protein modulators, "
+        "pathway-related compounds, and disease-directed treatments. Clearly "
+        "separate these relationship types. For each credible candidate, "
+        "report mechanism, indication, modality, and development stage "
+        "(approved, clinical, preclinical, or research tool). Do not describe "
+        "a disease treatment as directly targeting a gene unless the evidence "
+        "supports that relationship. Distinguish small molecules from "
+        "antibodies, nucleic-acid therapies, and other modalities. Prioritize "
+        "FDA/EMA labels, ClinicalTrials.gov, PubMed, peer-reviewed literature, "
+        "and authoritative company trial records. Use current information, "
+        "provide source citations, and explicitly state when no reliable "
+        "direct small-molecule match is found.\n\n"
+        + "\n".join(entity_lines)
+        + f"\n\nOriginal scientific question: {user_input}"
+    )
+
+
 # Update chat history
 def update_history(history, role, content):
     message = {"role": role, "content": content}
@@ -135,66 +209,22 @@ def update_history(history, role, content):
 # Initialize chat
 def initialize(history):
     global init_flag
-    
-    system_prompt = "You are a neuroscience research assistant. You answer \
-        scientific questions using multiple resources and should draw on prior \
-        conversation history to maintain coherence. When details are \
-        unspecified, infer them based on recent context (e.g., assume the same \
-        cell type if the user referenced it most recently). You have access to \
-        the following tools to support scientific inquiry: \n1. \
-        gene_expression Function: Returns gene expression and protein \
-        prevalence data for specific cell types and brain vasculature regions, \
-        based on single-nucleus RNA sequencing (snRNA-seq) from the Brain \
-        Resilience Laboratory at Stanford University. \n2. Biomedical \
-        Knowledge Graph: A curated knowledge graph based on SPOKE (from UCSF), \
-        containing molecular and disease biology relationships. \n3. OpenAI \
-        Web Search: Provides current biomedical information from the web. \
-        \n4. Pretrained Scientific Knowledge: You may also draw on your own \
-        scientific knowledge acquired during pre-training. \nWHEN TO CALL \
-        gene_expression: \n- If the user asks about gene expression or \
-        protein prevalence in a cell type and/or brain region, and does NOT \
-        specify a tissue type, ASSUME they mean brain vasculature and call the \
-        function. \n- If the user asks: `Is gene X among the top Y expressed \
-        genes in brain region Z?`, check all listed genes for each of the \
-        specified brain regions using the function. \n- If the user explicitly \
-        mentions vasculature (e.g., `in vasculature`, `vascular tissue`, \
-        `blood vessels`), call the function. \nResponse Notes: The numbers \
-        next to genes are their expression rank. Always include data numbers \
-        in your response. \n- If the data returned includes some genes \
-        mentioned in the user query, but not all, ASSUME the missing genes do \
-        not appear in the top 1000 expressed genes for the given region and/or \
-        cell type and state that in your answer. \n- If the data returned only \
-        relates to a brain region, you MUST state in your response: `This \
-        answer reflects all cell types across the specified brain region. \n- \
-        If the data returned only relates to a cell type, you MUST state: \
-        `This answer reflects the specified cell type across all brain \
-        regions.` \n- If tissue type is unspecified but both cell type and \
-        brain region are given, add: `Since you specified a cell type and \
-        brain region but did not mention tissue type, I’ve assumed brain \
-        vasculature.` \n- In all cases, include: `This answer is based on \
-        single-nucleus data from the Brain Resilience Lab at Stanford \
-        University.` \nWHEN NOT TO CALL gene_expression: \n- If the user \
-        explicitly says `not in vasculature`, `non-vascular`, or specifies a \
-        different tissue (e.g., `nervous tissue`, `gray matter`, \
-        `parenchyma`), DO NOT call the function. \n- DO NOT call the function \
-        for queries unrelated to gene expression levels in specific cell types \
-        or brain regions, even if they mention particular genes. \n- Instead, \
-        use the knowledge graph, Google web search, or your own pretrained \
-        knowledge to answer. \nWHEN TO CALL : \n- If the user \
-        mentions any disease by name in their query you MUST call \
-        . \nResponse strategy: \n- Prioritize information from \
-        tools in the following order: \n1. gene_expression \n2. Biomedical \
-        knowledge graph \n3. Web results (Google Search API) \n4. Parametric \
-        (pretrained) knowledge \n- Always include information from each tool \
-        used in the response. \n- Summarize the findings from each tool so the \
-        user can ask follow-up questions if needed. \n- Cite all sources when \
-        using the knowledge graph or web search. (e.g., `This data is from \
-        NCBI and ChEMBL` or `Visit this website for more info...`) \n- Format \
-        all responses clearly and professionally for a scientific audience. \
-        \nAdditional Expectations: \n- Reason through ambiguous queries. \n- \
-        Clarify assumptions explicitly in your replies. \n- Clearly state the \
-        origin of any scientific data used. \n- Keep your answers as concise \
-        as possible."
+    system_prompt = (
+        "You are a neuroscience and biomedical research assistant. Maintain "
+        "context across follow-up questions and answer at a professional "
+        "scientific level. For ordinary conversation such as greetings, "
+        "respond naturally without claiming that external research was used. "
+        "For scientific answers, distinguish four evidence types: biomedical "
+        "knowledge-graph relationships, current web/literature evidence, "
+        "VasQ single-nucleus brain-vasculature expression measurements, and "
+        "drug/small-molecule evidence. Never present marker rank as absolute "
+        "expression. Never describe a disease treatment as directly targeting "
+        "a gene unless the supplied evidence supports that relationship. "
+        "Distinguish approved drugs, clinical candidates, preclinical "
+        "compounds, and research tools. Preserve citations from retrieved web "
+        "evidence, state important limitations, and do not mention internal "
+        "routing or tool implementation."
+    )
 
     update_history(history, "system", system_prompt)
     init_flag = False
@@ -1603,6 +1633,237 @@ def wants_web_search(user_input: str) -> bool:
     return any(term in lowered for term in web_terms)
 
 
+def parse_json_object(raw_text):
+    """Parse a helper-model JSON object without trusting markdown fences."""
+    if not raw_text:
+        return None
+
+    text = str(raw_text).strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            return None
+        try:
+            parsed = json.loads(match.group(0))
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+
+
+def recent_conversation_context(history, max_messages=8, max_chars=5000):
+    messages = []
+    for message in (history or [])[-max_messages:]:
+        if message.get("role") not in {"user", "assistant"}:
+            continue
+        content = str(message.get("content", "")).strip()
+        if content:
+            messages.append(f"{message['role']}: {content}")
+    return "\n".join(messages)[-max_chars:]
+
+
+def is_simple_conversational_message(user_input):
+    """Fast path that guarantees greetings/thanks do not trigger retrieval."""
+    text = normalize_text(user_input)
+    text = re.sub(r"[^\w\s]", "", text).strip()
+    phrases = {
+        "hi", "hello", "hey", "good morning", "good afternoon",
+        "good evening", "thanks", "thank you", "ok", "okay",
+        "你好", "您好", "嗨", "谢谢", "好的", "收到", "再见",
+    }
+    return text in phrases
+
+
+def fallback_query_intent(user_input):
+    """Conservative rule-based intent used only when helper parsing fails."""
+    text = user_input or ""
+    lowered = text.lower()
+    excluded_symbols = {
+        "THE", "AND", "FOR", "WITH", "WHAT", "HOW", "WHY", "CAN",
+        "DO", "IS", "ARE", "WEB", "DNA", "RNA", "KG", "RAG",
+    }
+    genes = [
+        token for token in re.findall(r"\b[A-Z][A-Z0-9-]{1,11}\b", text)
+        if token not in excluded_symbols
+    ]
+    genes = list(dict.fromkeys(genes))
+
+    biomedical_terms = [
+        "gene", "protein", "cell", "brain", "vascular", "disease",
+        "drug", "molecule", "pathway", "expression", "expressed",
+        "mutation", "receptor", "enzyme", "neuron", "astrocyte",
+        "endothelial", "cancer", "syndrome", "alzheimer", "parkinson",
+    ]
+    asks_markers = wants_marker_query(text) or wants_top_genes(text)
+    asks_expression = asks_markers or wants_matrix_expression_query(text)
+
+    return {
+        "is_scientific": bool(
+            genes
+            or any(term in lowered for term in biomedical_terms)
+            or looks_like_expression_query(text)
+        ),
+        "asks_expression": asks_expression,
+        "asks_markers": asks_markers,
+        "use_vasq": asks_expression and not any(
+            term in lowered
+            for term in [
+                "not in vasculature", "non-vascular", "nonvascular",
+                "liver", "kidney", "lung", "heart", "blood plasma",
+                "gray matter", "grey matter", "parenchyma",
+            ]
+        ),
+        "genes": genes,
+        "diseases": [],
+        "resolved_question": text.strip(),
+    }
+
+
+def analyze_query_intent(user_input, history=None):
+    """Resolve scientific intent and entities once for all retrieval branches."""
+    if is_simple_conversational_message(user_input):
+        return {
+            "is_scientific": False,
+            "asks_expression": False,
+            "asks_markers": False,
+            "use_vasq": False,
+            "genes": [],
+            "diseases": [],
+            "resolved_question": user_input.strip(),
+        }
+
+    system_prompt = (
+        "Classify a conversation turn for a biomedical/neuroscience research "
+        "assistant. Return JSON only with keys: is_scientific (boolean), "
+        "asks_expression (boolean), asks_markers (boolean), genes (array of "
+        "human gene symbols), diseases (array of disease/condition names), "
+        "use_vasq (boolean), and resolved_question (string). A greeting, "
+        "thanks, casual chat, or "
+        "app/meta question is not scientific. Set asks_expression only when "
+        "the user is asking about measured gene expression, expression "
+        "differences, expressing-cell percentage, regional/cell-type "
+        "distribution, or marker genes. Set asks_markers for marker/rank/top-"
+        "gene questions. Set use_vasq when asks_expression is true and the "
+        "question concerns brain vasculature, vascular cell types/regions, or "
+        "does not specify a different tissue; set it false when the user "
+        "explicitly asks about a non-vascular or other-organ tissue. Resolve "
+        "short follow-ups from recent context, but do "
+        "not invent a gene, disease, cell type, or brain region. Include genes "
+        "or diseases inherited from context only when the reference is "
+        "unambiguous. Normalize gene symbols to uppercase."
+    )
+    user_prompt = (
+        f"Recent conversation:\n{recent_conversation_context(history)}\n\n"
+        f"Current user message:\n{user_input}"
+    )
+
+    try:
+        response = call_helper_api(system_prompt, user_prompt)
+        raw = response.choices[0].message.content
+        parsed = parse_json_object(raw)
+        if not parsed:
+            raise ValueError("Intent helper did not return a JSON object")
+
+        genes = [
+            str(x).upper().strip()
+            for x in parsed.get("genes", [])
+            if str(x).strip()
+        ]
+        diseases = [
+            str(x).strip()
+            for x in parsed.get("diseases", [])
+            if str(x).strip()
+        ]
+        return {
+            "is_scientific": bool(parsed.get("is_scientific", False)),
+            "asks_expression": bool(parsed.get("asks_expression", False)),
+            "asks_markers": bool(parsed.get("asks_markers", False)),
+            "use_vasq": bool(parsed.get("use_vasq", False)),
+            "genes": list(dict.fromkeys(genes)),
+            "diseases": list(dict.fromkeys(diseases)),
+            "resolved_question": str(
+                parsed.get("resolved_question") or user_input
+            ).strip(),
+        }
+    except Exception:
+        logger.exception("Scientific intent analysis failed; using rules")
+        return fallback_query_intent(user_input)
+
+
+def assess_kg_relevance(user_input, kg_result):
+    """Separate a useful KG hit from a non-empty but irrelevant response."""
+    if not kg_result or not str(kg_result).strip():
+        return {
+            "relevant": False,
+            "has_function_or_pathway": False,
+            "reason": "no KG result",
+        }
+
+    system_prompt = (
+        "Assess whether biomedical knowledge-graph content is relevant to a "
+        "question. Return JSON only with keys: relevant (boolean), "
+        "has_function_or_pathway (boolean), and reason (short string). Content "
+        "is relevant only if it addresses the question's entities or their "
+        "biological relationships. Do not treat generic biomedical text as a "
+        "relevant hit."
+    )
+    prompt = (
+        f"Question:\n{user_input}\n\n"
+        f"Knowledge-graph result:\n{str(kg_result)[:5000]}"
+    )
+
+    try:
+        response = call_helper_api(system_prompt, prompt)
+        parsed = parse_json_object(response.choices[0].message.content)
+        if not parsed:
+            raise ValueError("KG assessment helper returned invalid JSON")
+        return {
+            "relevant": bool(parsed.get("relevant", False)),
+            "has_function_or_pathway": bool(
+                parsed.get("has_function_or_pathway", False)
+            ),
+            "reason": str(parsed.get("reason", "")).strip(),
+        }
+    except Exception:
+        logger.exception("KG relevance assessment failed")
+        lowered = str(kg_result).lower()
+        return {
+            "relevant": True,
+            "has_function_or_pathway": any(
+                term in lowered
+                for term in ["pathway", "function", "participates", "process"]
+            ),
+            "reason": "fallback assessment",
+        }
+
+
+def ensure_chat_initialized(history):
+    """Initialize each conversation independently; avoid process-global routing."""
+    if not any(message.get("role") == "system" for message in history):
+        initialize(history)
+
+
+def retrieved_text_and_graph(result):
+    if isinstance(result, dict):
+        return str(result.get("text", "") or ""), result.get("graph_json")
+    if result is None:
+        return "", None
+    return str(result), None
+
+
+def cap_source_text(text, limit):
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n[Source text truncated]"
+
+
 ### Function Descriptions ###
 
 functions = [
@@ -1786,175 +2047,180 @@ def looks_like_expression_query(user_input):
 
 
 def chat(user_input, history):
-    global func_flag, init_flag
+    if history is None:
+        history = []
 
-    if init_flag:
-        history.clear()
-        initialize(history)
+    ensure_chat_initialized(history)
 
+    # Resolve the current turn against prior context before adding it to history.
+    intent = analyze_query_intent(user_input, history)
     update_history(history, "user", user_input)
 
-    retrieved_info = None
+    # Greetings, thanks, casual conversation, and meta questions do not search.
+    if not intent.get("is_scientific"):
+        direct_message = call_api(history)
+        final_message = getattr(direct_message, "content", None) or (
+            "I'm sorry, but I couldn't generate a response."
+        )
+        update_history(history, "assistant", final_message)
+        return final_message, history, None
+
+    resolved_question = intent.get("resolved_question") or user_input
+    genes = intent.get("genes") or []
+    diseases = intent.get("diseases") or []
+
+    # Branch A: every scientific question goes through KG-RAG, followed by a
+    # function/pathway-oriented Web Search. If KG-RAG is empty or irrelevant,
+    # the Web Search uses the resolved original question instead.
+    try:
+        kg_result = query_kg_rag(resolved_question)
+    except Exception:
+        logger.exception("KG-RAG branch failed")
+        kg_result = None
+
+    kg_assessment = assess_kg_relevance(resolved_question, kg_result)
+
+    try:
+        scientific_web_result = search_scientific_web(
+            resolved_question,
+            kg_context=kg_result,
+            kg_assessment=kg_assessment,
+        )
+    except Exception:
+        logger.exception("Scientific Web Search branch failed")
+        scientific_web_result = None
+
+    # Branch B: VasQ is conditional on expression intent. Marker/rank questions
+    # use the ranked marker table; measured expression questions use the matrix.
+    vasq_result = None
+    vasq_note = ""
     graph_json = None
 
-    # Always run OpenAI Web Search exactly once for every user question.
-    try:
-        logger.info("Calling OpenAI Web Search at start of chat...")
-        web_result = search_openai_web(user_input)
-    except Exception:
-        logger.exception("OpenAI Web Search failed")
-        web_result = None
+    if intent.get("asks_expression") and intent.get("use_vasq"):
+        if genes or intent.get("asks_markers"):
+            vasq_query = resolved_question
+            if genes:
+                vasq_query += "\nExplicit genes for the VasQ query: " + ", ".join(genes)
 
-    expression_query = looks_like_expression_query(user_input)
-    top_gene_query = (
-        wants_top_genes(user_input)
-        or ("top" in user_input.lower() and "gene" in user_input.lower())
-        or ("highly expressed" in user_input.lower() and "gene" in user_input.lower())
-        or ("what are the top" in user_input.lower() and "genes" in user_input.lower())
-    )
-
-    if wants_web_search(user_input):
-        logger.info(
-            "Explicit web/literature intent detected; "
-            "OpenAI Web Search already completed"
-        )
-        retrieved_info = web_result
-    else:
-        # 1. hard-route top-gene / marker questions to ranked backend first
-        if expression_query and top_gene_query:
             try:
-                retrieved_info = gene_expression(user_input)
+                if intent.get("asks_markers"):
+                    vasq_result = gene_expression(vasq_query)
+                else:
+                    vasq_result = matrix_expression(vasq_query)
             except Exception:
-                logger.exception("top-gene pre-routing failed")
-                retrieved_info = None
+                logger.exception("VasQ branch failed")
+                vasq_result = None
+                vasq_note = "The VasQ query failed and returned no usable data."
+        else:
+            vasq_note = (
+                "The question concerns expression, but no gene was resolved "
+                "from the current turn or recent context, so the VasQ matrix "
+                "was not queried."
+            )
 
-        # 2. hard-route true expression-value questions to matrix backend
-        if not retrieved_info and expression_query:
-            if wants_matrix_expression_query(user_input) and not wants_marker_query(user_input):
-                try:
-                    retrieved_info = matrix_expression(user_input)
-                except Exception:
-                    logger.exception("matrix pre-routing failed")
-                    retrieved_info = None
+    vasq_text, graph_json = retrieved_text_and_graph(vasq_result)
 
-        # 3. only ask the model to choose a function if nothing already succeeded
-        if not retrieved_info:
-            chat_message = call_api(history, functions)
-            logger.info("First model content: %s", getattr(chat_message, "content", None))
-            logger.info("Function call present: %s", bool(chat_message.function_call))
+    # Branch C: any resolved gene or disease triggers a separate current search
+    # for direct modulators, pathway compounds, and disease treatments.
+    drug_result = None
+    if genes or diseases:
+        try:
+            drug_result = search_drugs_and_small_molecules(
+                resolved_question,
+                genes=genes,
+                diseases=diseases,
+            )
+        except Exception:
+            logger.exception("Drug/small-molecule Web Search branch failed")
+            drug_result = None
 
-            if chat_message.function_call:
-                try:
-                    retrieved_info = func_call(user_input, chat_message, history)
-                except Exception:
-                    logger.exception("func_call failed")
-                    retrieved_info = None
-            else:
-                direct_reply = getattr(chat_message, "content", None)
+    # Cap each source independently so a long Web result cannot erase VasQ data.
+    evidence_parts = []
 
-                # For non-expression conversational follow-ups, allow direct reply.
-                # For expression/top-gene questions, prefer dataset/tool routing.
-                if direct_reply and direct_reply.strip() and not expression_query:
-                    logger.info("Keeping direct model reply for final synthesis")
-                    retrieved_info = direct_reply
+    if vasq_text:
+        evidence_parts.append(
+            "VASQ EXPRESSION OR MARKER DATA:\n"
+            + cap_source_text(vasq_text, 4500)
+        )
+    elif vasq_note:
+        evidence_parts.append("VASQ STATUS:\n" + vasq_note)
 
-        # 4. heuristic routing fallback
-        if not retrieved_info and expression_query:
-            if top_gene_query or wants_marker_query(user_input):
-                logger.info("Routing to marker backend")
-                try:
-                    retrieved_info = gene_expression(user_input)
-                except Exception:
-                    logger.exception("marker backend failed")
-                    retrieved_info = None
-
-            if not retrieved_info and wants_matrix_expression_query(user_input):
-                logger.info("Routing to matrix expression backend")
-                try:
-                    retrieved_info = matrix_expression(user_input)
-                except Exception:
-                    logger.exception("matrix backend failed")
-                    retrieved_info = None
-
-            if not retrieved_info:
-                logger.info("Expression fallback: matrix first, then marker")
-                try:
-                    retrieved_info = matrix_expression(user_input)
-                except Exception:
-                    logger.exception("matrix fallback failed")
-                    retrieved_info = None
-
-                if not retrieved_info:
-                    try:
-                        retrieved_info = gene_expression(user_input)
-                    except Exception:
-                        logger.exception("marker fallback failed")
-                        retrieved_info = None
-
-        # 5. KG fallback
-        if not retrieved_info:
-            lowered = user_input.lower()
-            kg_terms = [
-                "drug", "drugs", "target", "targets", "disease",
-                "association", "associated", "pathway", "pathways",
-                "implicated", "implication"
-            ]
-            if any(term in lowered for term in kg_terms):
-                try:
-                    retrieved_info = query_kg_rag(user_input)
-                except Exception:
-                    logger.exception("KG query failed")
-                    retrieved_info = None
-
-        # 6. Reuse the Web Search result obtained at the start of chat.
-        if not retrieved_info:
-            retrieved_info = web_result
-
-    if not retrieved_info:
-        retrieved_info = ""
-
-    if isinstance(retrieved_info, dict):
-        graph_json = retrieved_info.get("graph_json")
-        retrieved_text = retrieved_info.get("text", "")
+    if kg_result and kg_assessment.get("relevant"):
+        evidence_parts.append(
+            "RELEVANT BIOMEDICAL KNOWLEDGE-GRAPH CONTEXT:\n"
+            + cap_source_text(kg_result, 3000)
+        )
     else:
-        retrieved_text = retrieved_info
-
-    if not isinstance(retrieved_text, str):
-        retrieved_text = str(retrieved_text)
-
-    retrieved_parts = []
-
-    if web_result and web_result.strip():
-        retrieved_parts.append(
-            "OPENAI WEB SEARCH RESULTS:\n" + web_result.strip()
+        evidence_parts.append(
+            "KNOWLEDGE-GRAPH STATUS:\n"
+            "No sufficiently relevant knowledge-graph content was available."
         )
 
-    if retrieved_text and retrieved_text.strip():
-        # Avoid adding the same Web Search response twice.
-        if not web_result or retrieved_text.strip() != web_result.strip():
-            retrieved_parts.append(
-                "VASQ DATASET OR KG-RAG RESULTS:\n" + retrieved_text.strip()
+    if scientific_web_result:
+        evidence_parts.append(
+            "SCIENTIFIC WEB/LITERATURE EVIDENCE:\n"
+            + cap_source_text(scientific_web_result, 5000)
+        )
+    else:
+        evidence_parts.append(
+            "SCIENTIFIC WEB STATUS:\nNo usable web evidence was returned."
+        )
+
+    if genes or diseases:
+        if drug_result:
+            evidence_parts.append(
+                "DRUG AND SMALL-MOLECULE EVIDENCE:\n"
+                + cap_source_text(drug_result, 5000)
+            )
+        else:
+            evidence_parts.append(
+                "DRUG SEARCH STATUS:\n"
+                "No usable drug or small-molecule search result was returned."
             )
 
-    retrieved_text = "\n\n".join(retrieved_parts)[:12000]
+    evidence_package = "\n\n".join(evidence_parts)
 
-    synthesis_messages = history[:] + [
-        {
-            "role": "system",
-            "content": (
-                "Answer the user's question directly using the retrieved information below. "
-                "Use the web results for current external facts and the VasQ dataset results "
-                "for measured gene-expression claims. Preserve source citations when present. "
-                "Do not mention internal routing."
-            )
-        },
-        {
-            "role": "user",
-            "content": f"Retrieved information:\n{retrieved_text}"
-        }
-    ]
+    synthesis_instruction = {
+        "role": "system",
+        "content": (
+            "Answer the user's scientific question directly using the evidence "
+            "package supplied after the conversation. Integrate only relevant "
+            "evidence. Treat knowledge-graph relationships as associations, "
+            "not proof of causality. Use web/literature evidence for current "
+            "function, pathway, mechanism, clinical-stage, and regulatory "
+            "claims, and preserve its citations. Use VasQ only for measured "
+            "brain-vasculature expression claims; distinguish matrix mean "
+            "expression from marker rank/score. In the drug section, clearly "
+            "separate direct gene/protein modulators, pathway-related "
+            "compounds, and disease-directed treatments, and distinguish "
+            "approved, clinical, preclinical, and research-tool status. Never "
+            "claim that a disease drug directly targets a gene without direct "
+            "support. If a source reports no result, state the limitation "
+            "briefly rather than inventing content. Do not mention internal "
+            "routing or implementation details."
+        ),
+    }
 
-    final_message = call_api(synthesis_messages).content
+    if history and history[0].get("role") == "system":
+        synthesis_messages = (
+            [history[0], synthesis_instruction]
+            + history[1:]
+        )
+    else:
+        synthesis_messages = [synthesis_instruction] + history[:]
+
+    synthesis_messages.append({
+        "role": "user",
+        "content": (
+            "Evidence package for the current question:\n\n"
+            + evidence_package
+        ),
+    })
+
+    final_message_obj = call_api(synthesis_messages)
+    final_message = getattr(final_message_obj, "content", None) or (
+        "I'm sorry, but I couldn't synthesize the available evidence."
+    )
     logger.info("Final message returned to UI: %r", final_message)
     update_history(history, "assistant", final_message)
 
