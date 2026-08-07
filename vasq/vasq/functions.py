@@ -147,8 +147,8 @@ def initialize(history):
         based on single-nucleus RNA sequencing (snRNA-seq) from the Brain \
         Resilience Laboratory at Stanford University. \n2. Biomedical \
         Knowledge Graph: A curated knowledge graph based on SPOKE (from UCSF), \
-        containing molecular and disease biology relationships. \n3. Google \
-        Search API: Allows web search for up-to-date biomedical information. \
+        containing molecular and disease biology relationships. \n3. OpenAI \
+        Web Search: Provides current biomedical information from the web. \
         \n4. Pretrained Scientific Knowledge: You may also draw on your own \
         scientific knowledge acquired during pre-training. \nWHEN TO CALL \
         gene_expression: \n- If the user asks about gene expression or \
@@ -1797,6 +1797,14 @@ def chat(user_input, history):
     retrieved_info = None
     graph_json = None
 
+    # Always run OpenAI Web Search exactly once for every user question.
+    try:
+        logger.info("Calling OpenAI Web Search at start of chat...")
+        web_result = search_openai_web(user_input)
+    except Exception:
+        logger.exception("OpenAI Web Search failed")
+        web_result = None
+
     expression_query = looks_like_expression_query(user_input)
     top_gene_query = (
         wants_top_genes(user_input)
@@ -1806,12 +1814,11 @@ def chat(user_input, history):
     )
 
     if wants_web_search(user_input):
-        logger.info("Explicit web/literature intent detected; routing directly to Google")
-        try:
-            retrieved_info = search_openai_web(user_input)
-        except Exception:
-            logger.exception("Google search failed")
-            retrieved_info = None
+        logger.info(
+            "Explicit web/literature intent detected; "
+            "OpenAI Web Search already completed"
+        )
+        retrieved_info = web_result
     else:
         # 1. hard-route top-gene / marker questions to ranked backend first
         if expression_query and top_gene_query:
@@ -1848,9 +1855,8 @@ def chat(user_input, history):
                 # For non-expression conversational follow-ups, allow direct reply.
                 # For expression/top-gene questions, prefer dataset/tool routing.
                 if direct_reply and direct_reply.strip() and not expression_query:
-                    logger.info("Returning direct model reply without tool call")
-                    update_history(history, "assistant", direct_reply)
-                    return direct_reply, history, None
+                    logger.info("Keeping direct model reply for final synthesis")
+                    retrieved_info = direct_reply
 
         # 4. heuristic routing fallback
         if not retrieved_info and expression_query:
@@ -1900,14 +1906,9 @@ def chat(user_input, history):
                     logger.exception("KG query failed")
                     retrieved_info = None
 
-        # 6. Google fallback
+        # 6. Reuse the Web Search result obtained at the start of chat.
         if not retrieved_info:
-            logger.info("Calling Google Vertex AI API...")
-            try:
-                retrieved_info = search_openai_web(user_input)
-            except Exception:
-                logger.exception("Google search failed")
-                retrieved_info = None
+            retrieved_info = web_result
 
     if not retrieved_info:
         retrieved_info = ""
@@ -1921,14 +1922,30 @@ def chat(user_input, history):
     if not isinstance(retrieved_text, str):
         retrieved_text = str(retrieved_text)
 
-    retrieved_text = retrieved_text[:4000]
+    retrieved_parts = []
+
+    if web_result and web_result.strip():
+        retrieved_parts.append(
+            "OPENAI WEB SEARCH RESULTS:\n" + web_result.strip()
+        )
+
+    if retrieved_text and retrieved_text.strip():
+        # Avoid adding the same Web Search response twice.
+        if not web_result or retrieved_text.strip() != web_result.strip():
+            retrieved_parts.append(
+                "VASQ DATASET OR KG-RAG RESULTS:\n" + retrieved_text.strip()
+            )
+
+    retrieved_text = "\n\n".join(retrieved_parts)[:12000]
 
     synthesis_messages = history[:] + [
         {
             "role": "system",
             "content": (
                 "Answer the user's question directly using the retrieved information below. "
-                "Do not mention search tools or internal routing."
+                "Use the web results for current external facts and the VasQ dataset results "
+                "for measured gene-expression claims. Preserve source citations when present. "
+                "Do not mention internal routing."
             )
         },
         {
