@@ -1803,21 +1803,52 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
                 "font": {"color": "#32175a"},
             },
             "xaxis": {
-                "title": {"text": "Brain region", "standoff": 18},
+                "title": {
+                    "text": "Brain region",
+                    "standoff": 18
+                },
                 "categoryorder": "array",
-                "categoryarray": [region_labels[r] for r in region_order],
+                "categoryarray": [
+                    region_labels[r]
+                    for r in region_order
+                ],
                 "tickangle": 0,
-                "tickfont": {"size": 15},
+                "tickfont": {"size": 10},
+            
+                "showticklabels": True,
+                "showline": True,
+                "linecolor": "#32175a",
+                "linewidth": 1,
+                "ticks": "outside",
+                "ticklen": 6,
+                "tickwidth": 1,
+                "tickcolor": "#32175a",
+            
                 "showgrid": True,
                 "gridcolor": "#edf2f7",
                 "zeroline": False,
                 "automargin": True,
             },
             "yaxis": {
-                "title": {"text": "Gene", "standoff": 15},
+                "title": {
+                    "text": "Gene",
+                    "standoff": 12
+                },
                 "categoryorder": "array",
-                # Plotly orders categorical y values from bottom to top.
-                "categoryarray": list(reversed(gene_order)),
+                "categoryarray": list(
+                    reversed(gene_order)
+                ),
+                "showticklabels": True,
+            
+                # 显示 y 轴和刻度线
+                "showline": True,
+                "linecolor": "#32175a",
+                "linewidth": 1,
+                "ticks": "outside",
+                "ticklen": 6,
+                "tickwidth": 1,
+                "tickcolor": "#32175a",
+            
                 "showgrid": True,
                 "gridcolor": "#edf2f7",
                 "zeroline": False,
