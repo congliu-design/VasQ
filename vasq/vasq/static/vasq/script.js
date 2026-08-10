@@ -8,6 +8,37 @@ document.addEventListener("DOMContentLoaded", function() {
     let queueRunning = false;
     let stopQueueRequested = false;
 
+    function createChatId() {
+        if (
+            window.crypto &&
+            typeof window.crypto.randomUUID === 'function'
+        ) {
+            return window.crypto.randomUUID();
+        }
+    
+        const bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+    
+        // UUID version 4
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    
+        const hex = Array.from(
+            bytes,
+            value => value.toString(16).padStart(2, '0')
+        );
+    
+        return [
+            hex.slice(0, 4).join(''),
+            hex.slice(4, 6).join(''),
+            hex.slice(6, 8).join(''),
+            hex.slice(8, 10).join(''),
+            hex.slice(10, 16).join('')
+        ].join('-');
+    }
+    
+    // A new ID is generated every time a chat page is opened.
+    const tabChatId = createChatId();
     // Export chat as PDF
     document.getElementById('export-pdf').addEventListener('click', function() {
         const element = document.getElementById('messages-container');
@@ -581,7 +612,8 @@ document.addEventListener("DOMContentLoaded", function() {
                 },
                 body: JSON.stringify({
                     message: message,
-                    reset_history: resetHistory
+                    reset_history: resetHistory,
+                    chat_id: options.chatId || tabChatId
                 })
             });
 
@@ -682,7 +714,8 @@ document.addEventListener("DOMContentLoaded", function() {
                 const result = await sendQuestion(questions[index], {
                     queueIndex: index + 1,
                     queueTotal: questions.length,
-                    resetHistory: true
+                    resetHistory: true,
+                    chatId: createChatId()
                 });
                 results.push({
                     question: questions[index],
