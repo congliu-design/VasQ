@@ -3,6 +3,10 @@ document.addEventListener("DOMContentLoaded", function() {
     const messagesContainer = document.getElementById('messages');
     const form = document.getElementById("chat-form");
     const fileInput = document.getElementById("file-upload");
+    const sendButton = document.getElementById("send-message");
+    const queueButton = document.getElementById("run-queue");
+    let queueRunning = false;
+    let stopQueueRequested = false;
 
     // Export chat as PDF
     document.getElementById('export-pdf').addEventListener('click', function() {
@@ -392,60 +396,222 @@ document.addEventListener("DOMContentLoaded", function() {
         return messageElement;
     }
 
+    function addQueueStatus(messageText) {
+        const messageElement = document.createElement('div');
+        messageElement.classList.add('system-message', 'queue-status-message');
+        messageElement.textContent = messageText;
+        messagesContainer.appendChild(messageElement);
+        scrollToBottom();
+        return messageElement;
+    }
+
     // Identify message type
     function isTextMessage(message) {
         return typeof message === 'string';
     }
 
-    // Handle form submission
-    if (form && messageInput && messagesContainer) {
-    form.onsubmit = async function(e) {
-        e.preventDefault();
-        const message = messageInput.value.trim();
+    function parseQuestionQueue(rawText) {
+        return rawText
+            .split(/\r?\n/)
+            .map(function(line) {
+                return line
+                    .trim()
+                    .replace(/^(?:\d+[.)]|[-*\u2022])\s+/, '')
+                    .trim();
+            })
+            .filter(Boolean);
+    }
 
-        if (message) {
-            messageInput.value = '';
-            addChatMessage(message, true);
+    function setQueueControls(isRunning) {
+        queueRunning = isRunning;
+        messageInput.disabled = isRunning;
+        sendButton.disabled = isRunning;
+
+        if (isRunning) {
+            queueButton.textContent = 'Stop after current';
+            queueButton.disabled = false;
+        } else {
+            queueButton.textContent = 'Run Queue';
+            queueButton.disabled = false;
+        }
+    }
+
+    function renderGraph(graphJsonValue) {
+        if (!graphJsonValue) return;
+
+        try {
+            const graphJson = typeof graphJsonValue === 'string'
+                ? JSON.parse(graphJsonValue)
+                : graphJsonValue;
+            const graphDiv = document.createElement('div');
+            graphDiv.className = 'vasq-plot-card';
+            graphDiv.setAttribute(
+                'aria-label',
+                'VasQ gene expression across brain regions'
+            );
+            messagesContainer.appendChild(graphDiv);
+            Plotly.react(
+                graphDiv,
+                graphJson.data,
+                graphJson.layout,
+                {
+                    responsive: true,
+                    displaylogo: false,
+                    scrollZoom: false,
+                    modeBarButtonsToRemove: [
+                        'select2d',
+                        'lasso2d',
+                        'autoScale2d'
+                    ]
+                }
+            );
             scrollToBottom();
+        } catch (error) {
+            console.error('Could not render graph:', error);
+            addChatMessage('The answer was returned, but its graph could not be rendered.', false);
+        }
+    }
 
-            const thinkingMessage = addTemporaryMessage("Thinking...");
+    async function sendQuestion(message, options = {}) {
+        const queueIndex = options.queueIndex || null;
+        const queueTotal = options.queueTotal || null;
+        const resetHistory = options.resetHistory === true;
+        const prefix = queueIndex && queueTotal
+            ? `[${queueIndex}/${queueTotal}] `
+            : '';
 
-            try {
-                const response = await fetch(chatUrl, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "X-CSRFToken": csrfToken
-                    },
-                    body: JSON.stringify({ message: message })
+        addChatMessage(prefix + message, true);
+        const thinkingMessage = addTemporaryMessage(
+            queueIndex && queueTotal
+                ? `Running question ${queueIndex} of ${queueTotal}...`
+                : 'Thinking...'
+        );
+
+        try {
+            const response = await fetch(chatUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
+                body: JSON.stringify({
+                    message: message,
+                    reset_history: resetHistory
+                })
+            });
+
+            const data = await response.json().catch(function() {
+                return {};
+            });
+
+            if (!response.ok) {
+                throw new Error(
+                    data.response || `Server returned HTTP ${response.status}`
+                );
+            }
+
+            if (data.response) {
+                addChatMessage(data.response, false);
+            } else {
+                addChatMessage('I could not generate a response.', false);
+            }
+
+            renderGraph(data.graph_json);
+            return true;
+        } catch (error) {
+            console.error('Error:', error);
+            addChatMessage(
+                `${prefix}Failed: ${error.message || 'Could not send this question.'}`,
+                false
+            );
+            return false;
+        } finally {
+            thinkingMessage.remove();
+            scrollToBottom();
+        }
+    }
+
+    // Handle form submission
+    if (
+        form &&
+        messageInput &&
+        messagesContainer &&
+        sendButton &&
+        queueButton
+    ) {
+        form.onsubmit = async function(e) {
+            e.preventDefault();
+            if (queueRunning) return;
+
+            const message = messageInput.value.trim();
+            if (!message) return;
+
+            messageInput.value = '';
+            sendButton.disabled = true;
+            queueButton.disabled = true;
+            await sendQuestion(message, { resetHistory: false });
+            sendButton.disabled = false;
+            queueButton.disabled = false;
+            messageInput.focus();
+        };
+
+        queueButton.addEventListener('click', async function() {
+            if (queueRunning) {
+                stopQueueRequested = true;
+                queueButton.textContent = 'Stopping...';
+                queueButton.disabled = true;
+                return;
+            }
+
+            const questions = parseQuestionQueue(messageInput.value);
+            if (!questions.length) {
+                addQueueStatus('Paste one question per line, then click Run Queue.');
+                return;
+            }
+
+            if (questions.length > 50) {
+                addQueueStatus('A queue can contain at most 50 questions.');
+                return;
+            }
+
+            messageInput.value = '';
+            stopQueueRequested = false;
+            setQueueControls(true);
+            addQueueStatus(`Queue started: ${questions.length} question(s).`);
+
+            let completed = 0;
+            let failed = 0;
+
+            for (let index = 0; index < questions.length; index += 1) {
+                if (stopQueueRequested) break;
+
+                const succeeded = await sendQuestion(questions[index], {
+                    queueIndex: index + 1,
+                    queueTotal: questions.length,
+                    resetHistory: true
                 });
 
-                const data = await response.json();
-
-                if (thinkingMessage) thinkingMessage.remove();
-
-                if (data.response) {
-                    addChatMessage(data.response, false);
+                if (succeeded) {
+                    completed += 1;
                 } else {
-                    addChatMessage("I could not generate a response.", false);
+                    failed += 1;
                 }
-
-                if (data.graph_json) {
-                    const graphJson = JSON.parse(data.graph_json);
-                    const graphDiv = document.createElement('div');
-                    messagesContainer.appendChild(graphDiv);
-                    Plotly.react(graphDiv, graphJson.data, graphJson.layout);
-                    scrollToBottom();
-                }
-
-            } catch (error) {
-                console.error('Error:', error);
-                if (thinkingMessage) thinkingMessage.remove();
-                addChatMessage("Failed to send message.", false);
-                scrollToBottom();
             }
-        }
-     };
-  }
+
+            if (stopQueueRequested) {
+                addQueueStatus(
+                    `Queue stopped. Completed: ${completed}; failed: ${failed}.`
+                );
+            } else {
+                addQueueStatus(
+                    `Queue finished. Completed: ${completed}; failed: ${failed}.`
+                );
+            }
+
+            stopQueueRequested = false;
+            setQueueControls(false);
+            messageInput.focus();
+        });
+    }
     
 });

@@ -44,6 +44,10 @@ body, html {
 
 #message-input {
   flex-grow: 1;
+  min-height: 52px;
+  max-height: 160px;
+  resize: vertical;
+  box-sizing: border-box;
   padding: 15px;
   border-radius: 20px;
   border: 0.5px solid var(--clr-light);
@@ -175,7 +179,8 @@ img.header-logo {
 
 /* SEND BUTTON */
 
-#send-message {
+#send-message,
+#run-queue {
   padding: 15px;
   border-radius: 20px;
   border: none;
@@ -188,16 +193,44 @@ img.header-logo {
   transition: background-color 0.3s ease;
 }
 
-#send-message:hover {
+#send-message:hover,
+#run-queue:hover {
   background-color: var(--clr-send-hover);
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3); 
+}
+
+#run-queue {
+  background-color: var(--clr-medium);
+  color: var(--clr-dark);
+}
+
+#send-message:disabled,
+#run-queue:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.send-button-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 112px;
+}
+
+.queue-status-message {
+  align-self: center;
+  max-width: 92%;
+  background-color: rgba(255, 255, 255, 0.72);
+  color: var(--clr-dark);
+  font-weight: 600;
+  text-align: center;
 }
 
 /* FOOTER */
 
 .footer-flex-container {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 10px;
 }
 
