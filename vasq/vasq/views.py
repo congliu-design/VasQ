@@ -23,17 +23,24 @@ def index(request):
 
 # Parse user input
 def parse_input(request):
-    return json.loads(request.body).get('message', '')
+    payload = json.loads(request.body)
+    return (
+        payload.get('message', ''),
+        bool(payload.get('reset_history', False)),
+    )
 
 # API endpoint for chat
 
 
 def api_chat(request):
     try:
-        user_input = parse_input(request)
+        user_input, reset_history = parse_input(request)
         logger.info("Received message: %s", user_input)
 
-        history = request.session.get('history', [])
+        # Batch-queue questions are independent tests. Starting them with an
+        # empty history prevents the preceding question from influencing the
+        # next question's intent, genes, evidence, or final answer.
+        history = [] if reset_history else request.session.get('history', [])
         
         content, history, graph_json = chat(user_input, history)
 
@@ -51,4 +58,3 @@ def api_chat(request):
             {"response": "Sorry, something went wrong while processing your message."},
             status=500
         )
-
