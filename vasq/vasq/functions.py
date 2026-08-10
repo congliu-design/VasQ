@@ -701,26 +701,42 @@ def matrix_expression(user_input, genes_override=None):
         return "No matching cells found for the requested filters."
 
     all_sections = []
-    plot_json = None
+    regional_plot_frames = []
 
-    for i, gene in enumerate(present_genes):
-        if len(cell_indices) > 0:
-            stats = summarize_group_expression(
-                gene,
-                cell_indices,
-                ["brain_region", "cell_class", "cell_type"]
-            )
-        else:
-            stats = summarize_group_expression(
-                gene,
-                MATRIX_META.index.to_numpy(),
-                ["brain_region", "cell_class", "cell_type"]
-            )
+    if len(cell_indices) > 0:
+        effective_cell_indices = cell_indices
+    else:
+        effective_cell_indices = MATRIX_META.index.to_numpy()
+
+    for gene in present_genes:
+        # Keep the detailed region/cell-type table used by the text answer.
+        stats = summarize_group_expression(
+            gene,
+            effective_cell_indices,
+            ["brain_region", "cell_class", "cell_type"]
+        )
 
         all_sections.append(format_matrix_expression_summary(stats, gene, max_rows=5))
 
-        if i == 0:
-            plot_json = build_matrix_expression_plot(stats, gene_name=gene, max_rows=8)
+        # Build a stable region-level summary for the visual. Aggregating at
+        # the region level prevents n=1 cell subgroups from dominating the
+        # chart and lets all requested genes appear in one figure.
+        region_stats = summarize_group_expression(
+            gene,
+            effective_cell_indices,
+            ["brain_region"]
+        )
+        if not region_stats.empty:
+            regional_plot_frames.append(region_stats)
+
+    plot_json = None
+    if regional_plot_frames:
+        plot_stats = pd.concat(regional_plot_frames, ignore_index=True)
+        plot_json = build_matrix_expression_plot(
+            plot_stats,
+            gene_order=present_genes,
+            region_order=regions,
+        )
 
     return {
         "text": "\n\n".join(notes + [""] + all_sections),
@@ -1621,60 +1637,186 @@ def query_kg_rag(user_input):
         return None
 
 
-def build_matrix_expression_plot(stats_df, gene_name=None, max_rows=8):
-    plot_df = stats_df.copy()
+def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
+    """Build a gene-by-region dot plot from region-level matrix summaries.
 
+    Marker color represents mean log-normalized expression, while marker size
+    represents the fraction of cells with non-zero expression.
+    """
+    required = {"gene", "brain_region", "mean_expr", "pct_expr", "n_cells"}
+    if stats_df.empty or not required.issubset(stats_df.columns):
+        return None
+
+    plot_df = stats_df.dropna(subset=["gene", "brain_region"]).copy()
     if plot_df.empty:
         return None
 
-    plot_df = plot_df.sort_values(
-        ["mean_expr", "pct_expr", "n_cells"],
-        ascending=[False, False, False]
-    ).head(max_rows)
+    plot_df["gene"] = plot_df["gene"].astype(str)
+    plot_df["brain_region"] = plot_df["brain_region"].astype(str)
+    plot_df["mean_expr"] = pd.to_numeric(
+        plot_df["mean_expr"], errors="coerce"
+    ).fillna(0.0).clip(lower=0.0)
+    plot_df["pct_expr"] = pd.to_numeric(
+        plot_df["pct_expr"], errors="coerce"
+    ).fillna(0.0).clip(lower=0.0, upper=1.0)
+    plot_df["n_cells"] = pd.to_numeric(
+        plot_df["n_cells"], errors="coerce"
+    ).fillna(0).astype(int)
 
-    def make_label(row):
-        parts = []
-        if "brain_region" in plot_df.columns and pd.notna(row.get("brain_region")):
-            parts.append(str(row["brain_region"]))
-        if "cell_class" in plot_df.columns and pd.notna(row.get("cell_class")):
-            parts.append(str(row["cell_class"]))
-        if "cell_type" in plot_df.columns and pd.notna(row.get("cell_type")):
-            parts.append(str(row["cell_type"]))
-        return " | ".join(parts)
+    available_genes = plot_df["gene"].drop_duplicates().tolist()
+    gene_order = [g for g in (gene_order or []) if g in available_genes]
+    gene_order += [g for g in available_genes if g not in gene_order]
 
-    labels = [make_label(row) for _, row in plot_df.iterrows()]
-    y_vals = plot_df["mean_expr"].tolist()
+    available_regions = plot_df["brain_region"].drop_duplicates().tolist()
+    region_order = [r for r in (region_order or []) if r in available_regions]
+    region_order += sorted(r for r in available_regions if r not in region_order)
 
-    hover_text = []
-    for _, row in plot_df.iterrows():
-        text = f"{gene_name or row.get('gene', 'gene')}"
-        if "brain_region" in plot_df.columns:
-            text += f"<br>region: {row.get('brain_region', '')}"
-        if "cell_class" in plot_df.columns:
-            text += f"<br>cell class: {row.get('cell_class', '')}"
-        if "cell_type" in plot_df.columns:
-            text += f"<br>cell type: {row.get('cell_type', '')}"
-        text += f"<br>mean_expr {row['mean_expr']:.3f}"
-        text += f"<br>pct_expr {row['pct_expr']:.3f}"
-        text += f"<br>n_cells {int(row['n_cells'])}"
-        hover_text.append(text)
+    gene_rank = {gene: i for i, gene in enumerate(gene_order)}
+    region_rank = {region: i for i, region in enumerate(region_order)}
+    plot_df["_gene_order"] = plot_df["gene"].map(gene_rank)
+    plot_df["_region_order"] = plot_df["brain_region"].map(region_rank)
+    plot_df = plot_df.sort_values(["_gene_order", "_region_order"])
+
+    def wrap_axis_label(value, width=18):
+        words = str(value).split()
+        lines = []
+        current = []
+        for word in words:
+            candidate = " ".join(current + [word])
+            if current and len(candidate) > width:
+                lines.append(" ".join(current))
+                current = [word]
+            else:
+                current.append(word)
+        if current:
+            lines.append(" ".join(current))
+        return "<br>".join(lines)
+
+    region_labels = {
+        region: wrap_axis_label(region)
+        for region in region_order
+    }
+    x_values = [region_labels[region] for region in plot_df["brain_region"]]
+    y_values = plot_df["gene"].tolist()
+
+    # Square-root scaling keeps low expressing fractions visible without
+    # letting highly expressed groups overwhelm the figure.
+    marker_sizes = (
+        9.0 + 31.0 * np.sqrt(plot_df["pct_expr"].to_numpy())
+    ).round(1).tolist()
+    marker_opacity = [
+        0.45 if n_cells < 20 else 0.9
+        for n_cells in plot_df["n_cells"]
+    ]
+
+    color_values = plot_df["mean_expr"].tolist()
+    positive_colors = plot_df.loc[plot_df["mean_expr"] > 0, "mean_expr"]
+    color_max = (
+        float(positive_colors.quantile(0.95))
+        if not positive_colors.empty
+        else 1.0
+    )
+    color_max = max(color_max, 0.001)
+
+    customdata = [
+        [
+            row["gene"],
+            row["brain_region"],
+            float(row["mean_expr"]),
+            float(row["pct_expr"]) * 100.0,
+            int(row["n_cells"]),
+        ]
+        for _, row in plot_df.iterrows()
+    ]
 
     fig = {
         "data": [
             {
-                "type": "bar",
-                "x": labels,
-                "y": y_vals,
-                "text": hover_text,
-                "hoverinfo": "text"
+                "type": "scatter",
+                "mode": "markers",
+                "x": x_values,
+                "y": y_values,
+                "customdata": customdata,
+                "hovertemplate": (
+                    "<b>%{customdata[0]}</b>"
+                    "<br>Brain region: %{customdata[1]}"
+                    "<br>Mean expression: %{customdata[2]:.3f}"
+                    "<br>Expressing cells: %{customdata[3]:.1f}%"
+                    "<br>Cells: %{customdata[4]:,}"
+                    "<extra></extra>"
+                ),
+                "marker": {
+                    "size": marker_sizes,
+                    "sizemode": "diameter",
+                    "color": color_values,
+                    "cmin": 0,
+                    "cmax": color_max,
+                    "colorscale": [
+                        [0.00, "#eef6f8"],
+                        [0.25, "#8ab4c4"],
+                        [0.60, "#5b3d8b"],
+                        [1.00, "#32175a"],
+                    ],
+                    "opacity": marker_opacity,
+                    "line": {"color": "#ffffff", "width": 1},
+                    "colorbar": {
+                        "title": {"text": "Mean<br>expression"},
+                        "thickness": 14,
+                        "len": 0.72,
+                        "outlinewidth": 0,
+                    },
+                },
+                "showlegend": False,
             }
         ],
         "layout": {
-            "title": f"{gene_name} expression across matched groups" if gene_name else "Expression across matched groups",
-            "xaxis": {"title": "Region | Cell class | Cell type"},
-            "yaxis": {"title": "Mean log-normalized expression"},
-            "margin": {"l": 70, "r": 20, "t": 60, "b": 180}
-        }
+            "title": {
+                "text": (
+                    "<b>VasQ expression across brain regions</b>"
+                    "<br><span style='font-size:12px;color:#64748b'>"
+                    "Color = mean expression · Size = expressing-cell fraction"
+                    "</span>"
+                ),
+                "x": 0.02,
+                "xanchor": "left",
+            },
+            "height": max(440, 170 + 32 * len(gene_order)),
+            "autosize": True,
+            "paper_bgcolor": "rgba(0,0,0,0)",
+            "plot_bgcolor": "#ffffff",
+            "font": {
+                "family": "Satoshi, Arial, sans-serif",
+                "color": "#32175a",
+                "size": 12,
+            },
+            "hoverlabel": {
+                "bgcolor": "#ffffff",
+                "bordercolor": "#8ab4c4",
+                "font": {"color": "#32175a"},
+            },
+            "xaxis": {
+                "title": {"text": "Brain region", "standoff": 18},
+                "categoryorder": "array",
+                "categoryarray": [region_labels[r] for r in region_order],
+                "tickangle": 0,
+                "tickfont": {"size": 10},
+                "showgrid": True,
+                "gridcolor": "#edf2f7",
+                "zeroline": False,
+                "automargin": True,
+            },
+            "yaxis": {
+                "title": {"text": "Gene", "standoff": 12},
+                "categoryorder": "array",
+                # Plotly orders categorical y values from bottom to top.
+                "categoryarray": list(reversed(gene_order)),
+                "showgrid": True,
+                "gridcolor": "#edf2f7",
+                "zeroline": False,
+                "automargin": True,
+            },
+            "margin": {"l": 90, "r": 100, "t": 90, "b": 125},
+        },
     }
 
     return json.dumps(fig)
