@@ -1378,29 +1378,64 @@ def resolve_entities_from_text(user_input, alias_map):
 def extract_entities(user_input):
     ensure_expression_data_loaded()
 
-    # first try deterministic alias matching
-    cell_matches = resolve_entities_from_text(user_input, CELL_TYPE_ALIAS_MAP)
-    region_matches = resolve_entities_from_text(user_input, REGION_ALIAS_MAP)
-
-    # then let GPT broaden or refine using actual dataset labels
-    gpt_cell_matches, gpt_region_matches = resolve_dataset_entities_with_gpt(
+    # Local alias matching is retained as a fallback.
+    alias_cell_matches = resolve_entities_from_text(
         user_input,
-        AVAILABLE_CELL_TYPES,
-        AVAILABLE_REGIONS
+        CELL_TYPE_ALIAS_MAP,
+    )
+    alias_region_matches = resolve_entities_from_text(
+        user_input,
+        REGION_ALIAS_MAP,
     )
 
-    combined_cell_matches = list(dict.fromkeys(cell_matches + gpt_cell_matches))
-    combined_region_matches = list(dict.fromkeys(region_matches + gpt_region_matches))
+    # GPT selects the best matching labels from the actual dataset schema.
+    gpt_cell_matches, gpt_region_matches = (
+        resolve_dataset_entities_with_gpt(
+            user_input,
+            AVAILABLE_CELL_TYPES,
+            AVAILABLE_REGIONS,
+        )
+    )
+
+    # GPT's more specific result takes priority.
+    # Local alias matching is used only if GPT returned no match.
+    selected_cell_matches = (
+        gpt_cell_matches
+        if gpt_cell_matches
+        else alias_cell_matches
+    )
+
+    selected_region_matches = (
+        gpt_region_matches
+        if gpt_region_matches
+        else alias_region_matches
+    )
+
+    selected_cell_matches = list(
+        dict.fromkeys(selected_cell_matches)
+    )
+    selected_region_matches = list(
+        dict.fromkeys(selected_region_matches)
+    )
 
     logger.info(
-        "extract_entities user_input=%s cell_matches=%s region_matches=%s",
+        "extract_entities user_input=%s "
+        "alias_cell_matches=%s "
+        "gpt_cell_matches=%s "
+        "selected_cell_matches=%s "
+        "alias_region_matches=%s "
+        "gpt_region_matches=%s "
+        "selected_region_matches=%s",
         user_input,
-        combined_cell_matches,
-        combined_region_matches
+        alias_cell_matches,
+        gpt_cell_matches,
+        selected_cell_matches,
+        alias_region_matches,
+        gpt_region_matches,
+        selected_region_matches,
     )
 
-    return combined_cell_matches, combined_region_matches
-
+    return selected_cell_matches, selected_region_matches
 
 
 def extract_genes(user_input):
