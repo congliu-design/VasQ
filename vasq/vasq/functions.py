@@ -394,11 +394,13 @@ def func_call(user_input, chat_message, history):
     func_name = chat_message.function_call.name
 
     if (
-        func_name == "gene_expression"
+        func_name == "marker_gene_expression"
         and wants_matrix_expression_query(user_input)
         and not wants_marker_query(user_input)
     ):
-        logger.info("Overriding model-selected gene_expression -> matrix_expression")
+        logger.info(
+            "Overriding model-selected marker_gene_expression -> matrix_expression"
+        )
         func_name = "matrix_expression"
 
     print("Calling", func_name, "...")
@@ -875,6 +877,17 @@ def load_expression_data():
     if missing:
         raise ValueError(f"Expression table missing required columns: {missing}")
 
+    # Marker rows without a gene, context, or numeric rank cannot be used.
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+    df["rank"] = df["rank"].replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=["gene", "cell_type", "region", "rank"]).copy()
+
+    # Optional statistics must be numeric before sorting or JSON encoding.
+    for column in ["score", "logFC", "pct_expr"]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+            df[column] = df[column].replace([np.inf, -np.inf], np.nan)
+
     df["gene"] = df["gene"].astype(str).str.upper().str.strip()
     df["cell_type"] = df["cell_type"].astype(str).str.strip()
     df["region"] = df["region"].astype(str).str.strip()
@@ -1007,62 +1020,245 @@ def build_cell_type_alias_map(df):
     return alias_map
 
 
-def build_expression_plot(df, gene_name=None, max_rows=8, metric="score"):
-    plot_df = df.copy()
+def select_marker_rows(
+    df,
+    *,
+    gene_order=None,
+    max_rows=18,
+    max_per_gene=4,
+    unique_genes=False,
+):
+    """Select a balanced, deterministic subset of precomputed marker rows."""
+    if df.empty:
+        return df.copy()
 
+    work = df.copy()
+    work["rank"] = pd.to_numeric(work["rank"], errors="coerce")
+    work["rank"] = work["rank"].replace([np.inf, -np.inf], np.nan)
+    work = work.dropna(subset=["gene", "cell_type", "region", "rank"])
+    work = work.drop_duplicates(
+        subset=["gene", "cell_type", "region"],
+        keep="first",
+    )
+
+    if work.empty:
+        return work
+
+    gene_order = [
+        str(g).upper().strip()
+        for g in (gene_order or [])
+        if str(g).strip()
+    ]
+
+    # For explicit genes, retain several contexts per gene so one strong gene
+    # cannot crowd every other requested gene out of the chart.
+    if gene_order:
+        frames = []
+        per_gene = max(
+            1,
+            min(max_per_gene, max_rows // max(1, len(gene_order))),
+        )
+        for gene in gene_order:
+            group = work[work["gene"] == gene].copy()
+            if group.empty:
+                continue
+            if "score" in group.columns and group["score"].notna().any():
+                group = group.sort_values(
+                    ["score", "rank"],
+                    ascending=[False, True],
+                    na_position="last",
+                )
+            else:
+                group = group.sort_values("rank", ascending=True)
+            frames.append(group.head(per_gene))
+
+        if not frames:
+            return work.head(0)
+        return pd.concat(frames, ignore_index=True).head(max_rows)
+
+    # For an open-ended top-marker request, the table's precomputed rank is
+    # the primary ordering. Score is only a tie-breaker when it is available.
+    sort_columns = ["rank"]
+    ascending = [True]
+    if "score" in work.columns:
+        sort_columns.append("score")
+        ascending.append(False)
+    ranked = work.sort_values(
+        sort_columns,
+        ascending=ascending,
+        na_position="last",
+    )
+    if unique_genes:
+        ranked = ranked.drop_duplicates(subset=["gene"], keep="first")
+    return ranked.head(max_rows)
+
+
+def build_marker_bar_plot(marker_rows, title=None):
+    """Build a readable horizontal chart for precomputed marker statistics."""
+    plot_df = marker_rows.copy()
     if plot_df.empty:
         return None
 
-    if metric not in plot_df.columns:
-        metric = "rank"
+    # Prefer a statistic whose values are valid for every selected bar. When
+    # optional statistics are incomplete, reciprocal rank is deterministic,
+    # finite, and keeps rank 1 visually strongest.
+    metric = None
+    for candidate in ["score", "logFC", "pct_expr"]:
+        if candidate not in plot_df.columns:
+            continue
+        values = pd.to_numeric(plot_df[candidate], errors="coerce")
+        values = values.replace([np.inf, -np.inf], np.nan)
+        if values.notna().all():
+            plot_df[candidate] = values
+            metric = candidate
+            break
 
-    if metric == "rank":
-        plot_df = plot_df.sort_values("rank", ascending=True).head(max_rows)
-        y_vals = plot_df["rank"].tolist()
-        y_title = "Rank"
+    plot_df["rank"] = pd.to_numeric(plot_df["rank"], errors="coerce")
+    plot_df["rank"] = plot_df["rank"].replace([np.inf, -np.inf], np.nan)
+    plot_df = plot_df.dropna(subset=["rank"])
+    if plot_df.empty:
+        return None
+
+    if metric == "score":
+        plot_df["_plot_value"] = plot_df["score"].astype(float)
+        x_title = "Marker score"
+        plot_df["_value_label"] = [
+            f"score {value:.2f}" for value in plot_df["score"]
+        ]
+    elif metric == "logFC":
+        plot_df["_plot_value"] = plot_df["logFC"].astype(float)
+        x_title = "Marker log fold-change"
+        plot_df["_value_label"] = [
+            f"logFC {value:.2f}" for value in plot_df["logFC"]
+        ]
+    elif metric == "pct_expr":
+        pct_values = plot_df["pct_expr"].astype(float)
+        plot_df["_plot_value"] = np.where(
+            pct_values.abs() <= 1.0,
+            pct_values * 100.0,
+            pct_values,
+        )
+        x_title = "Expressing cells (%)"
+        plot_df["_value_label"] = [
+            f"{(100.0 * value if abs(value) <= 1.0 else value):.1f}%"
+            for value in pct_values
+        ]
     else:
-        plot_df = plot_df.sort_values([metric, "rank"], ascending=[False, True]).head(max_rows)
-        y_vals = plot_df[metric].tolist()
-        y_title = metric
+        safe_rank = plot_df["rank"].clip(lower=1.0).astype(float)
+        plot_df["_plot_value"] = 1.0 / safe_rank
+        x_title = "Reciprocal marker rank (higher = stronger)"
+        plot_df["_value_label"] = [
+            f"rank {int(value)}" for value in safe_rank
+        ]
 
+    plot_df = plot_df.sort_values("_plot_value", ascending=False)
+    value_labels = plot_df["_value_label"].tolist()
     labels = [
-        f"{pretty_region_name(row['region'])} | {row['cell_type']}"
+        (
+            f"{row['gene']} · {pretty_region_name(row['region'])}"
+            f" | {row['cell_type']}"
+        )
         for _, row in plot_df.iterrows()
     ]
 
     hover_text = []
     for _, row in plot_df.iterrows():
-        text = f"{row['gene']}<br>{pretty_region_name(row['region'])}<br>{row['cell_type']}"
-        text += f"<br>rank {row['rank']}"
+        details = [
+            f"<b>{row['gene']}</b>",
+            f"Region: {pretty_region_name(row['region'])}",
+            f"Cell type: {row['cell_type']}",
+            f"Marker rank: {int(row['rank'])}",
+        ]
         if "score" in plot_df.columns and pd.notna(row.get("score")):
-            text += f"<br>score {row['score']:.2f}"
+            details.append(f"Marker score: {float(row['score']):.3f}")
         if "logFC" in plot_df.columns and pd.notna(row.get("logFC")):
-            text += f"<br>logFC {row['logFC']:.2f}"
+            details.append(f"logFC: {float(row['logFC']):.3f}")
         if "pct_expr" in plot_df.columns and pd.notna(row.get("pct_expr")):
-            text += f"<br>pct_expr {row['pct_expr']:.2f}"
-        hover_text.append(text)
+            pct_value = float(row["pct_expr"])
+            if abs(pct_value) <= 1.0:
+                pct_value *= 100.0
+            details.append(f"Expressing cells: {pct_value:.1f}%")
+        hover_text.append("<br>".join(details))
 
-    title = f"{gene_name} expression across matched regions/cell types" if gene_name else "Expression across matched regions/cell types"
-
+    values = plot_df["_plot_value"].astype(float).tolist()
     fig = {
         "data": [
             {
                 "type": "bar",
-                "x": labels,
-                "y": y_vals,
-                "text": hover_text,
-                "hoverinfo": "text"
+                "orientation": "h",
+                "x": values,
+                "y": labels,
+                "text": value_labels,
+                "textposition": "outside",
+                "cliponaxis": False,
+                "hovertext": hover_text,
+                "hoverinfo": "text",
+                "marker": {
+                    "color": values,
+                    "colorscale": [
+                        [0.00, "#8ab4c4"],
+                        [0.55, "#5b3d8b"],
+                        [1.00, "#32175a"],
+                    ],
+                    "showscale": False,
+                    "line": {"color": "#ffffff", "width": 1},
+                },
             }
         ],
         "layout": {
-            "title": title,
-            "xaxis": {"title": "Region | Cell type"},
-            "yaxis": {"title": y_title},
-            "margin": {"l": 60, "r": 20, "t": 60, "b": 160}
-        }
+            "title": {
+                "text": (
+                    f"<b>{title or 'VasQ marker-gene evidence'}</b>"
+                    "<br><span style='font-size:12px;color:#64748b'>"
+                    "Precomputed marker statistics; not absolute expression"
+                    "</span>"
+                ),
+                "x": 0.02,
+                "xanchor": "left",
+            },
+            "height": max(420, 165 + 38 * len(plot_df)),
+            "autosize": True,
+            "bargap": 0.26,
+            "paper_bgcolor": "rgba(0,0,0,0)",
+            "plot_bgcolor": "#ffffff",
+            "font": {
+                "family": "Satoshi, Arial, sans-serif",
+                "color": "#32175a",
+                "size": 14,
+            },
+            "hoverlabel": {
+                "bgcolor": "#ffffff",
+                "bordercolor": "#8ab4c4",
+                "font": {"color": "#32175a"},
+            },
+            "xaxis": {
+                "title": {"text": x_title, "standoff": 14},
+                "showline": True,
+                "linecolor": "#32175a",
+                "linewidth": 1,
+                "showgrid": True,
+                "gridcolor": "#edf2f7",
+                "zeroline": True,
+                "zerolinecolor": "#cbd5e1",
+                "automargin": True,
+            },
+            "yaxis": {
+                "categoryorder": "array",
+                "categoryarray": labels,
+                "autorange": "reversed",
+                "showline": True,
+                "linecolor": "#32175a",
+                "linewidth": 1,
+                "ticks": "outside",
+                "ticklen": 5,
+                "tickfont": {"size": 12},
+                "automargin": True,
+            },
+            "margin": {"l": 285, "r": 110, "t": 95, "b": 85},
+        },
     }
 
-    return json.dumps(fig)
+    return json.dumps(fig, allow_nan=False)
 
 
 
@@ -1329,7 +1525,8 @@ def is_region_filtered_query(user_input):
 
     return "true" in response.choices[0].message.content.strip().lower()
 
-def format_single_gene_expression_rows(df, max_rows=20):
+def format_marker_rows(df, max_rows=20):
+    """Format precomputed marker-table rows without implying absolute expression."""
     lines = []
 
     for _, row in df.head(max_rows).iterrows():
@@ -1337,16 +1534,20 @@ def format_single_gene_expression_rows(df, max_rows=20):
         region = row.get("region", "Unknown region")
         gene = row.get("gene", "Unknown gene")
 
-        line = f"{cell_type} in {region}: {gene} (rank {row['rank']}"
+        line = (
+            f"- {gene} — {pretty_region_name(region)} | {cell_type}: "
+            f"rank {int(row['rank'])}"
+        )
 
         if "score" in df.columns and pd.notna(row.get("score")):
-            line += f", score {row['score']:.2f}"
+            line += f"; score {float(row['score']):.3f}"
         if "logFC" in df.columns and pd.notna(row.get("logFC")):
-            line += f", logFC {row['logFC']:.2f}"
+            line += f"; logFC {float(row['logFC']):.3f}"
         if "pct_expr" in df.columns and pd.notna(row.get("pct_expr")):
-            line += f", pct_expr {row['pct_expr']:.2f}"
-
-        line += ")"
+            pct_value = float(row["pct_expr"])
+            if abs(pct_value) <= 1.0:
+                pct_value *= 100.0
+            line += f"; expressing cells {pct_value:.1f}%"
         lines.append(line)
 
     return "\n".join(lines)
@@ -1359,29 +1560,31 @@ def wants_top_genes(user_input):
         "top 10 genes",
         "top 20 genes",
         "top markers",
-        "top expressed", "highest expressed", "highest expression",
-        "top genes", "marker genes", "markers", "most expressed"
+        "top marker genes",
+        "top genes",
+        "marker genes",
+        "markers",
     ]
     return any(t in text for t in triggers)
 
 
+def requested_top_marker_count(user_input, default=12, maximum=25):
+    """Read requests such as 'top 5 markers' or '前 10 个 marker genes'."""
+    text = str(user_input or "")
+    patterns = [
+        r"\btop\s+(\d{1,3})\b",
+        r"\bfirst\s+(\d{1,3})\b",
+        r"前\s*(\d{1,3})\s*(?:个|名)?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return max(1, min(maximum, int(match.group(1))))
+    return max(1, min(maximum, int(default)))
+
+
 def wants_specific_gene(user_input, genes):
     return len(genes) > 0
-
-
-def format_gene_rows(df, max_rows=20):
-    lines = []
-    for _, row in df.head(max_rows).iterrows():
-        line = f"{row['gene']} (rank {row['rank']}"
-        if "score" in df.columns and pd.notna(row.get("score")):
-            line += f", score {row['score']:.2f}"
-        if "logFC" in df.columns and pd.notna(row.get("logFC")):
-            line += f", logFC {row['logFC']:.2f}"
-        if "pct_expr" in df.columns and pd.notna(row.get("pct_expr")):
-            line += f", pct_expr {row['pct_expr']:.2f}"
-        line += ")"
-        lines.append(line)
-    return "\n".join(lines)
 
 
 def pretty_region_name(region):
@@ -1393,11 +1596,20 @@ def pretty_region_name(region):
     }
     return region_map.get(region, region)
 
-def gene_expression(user_input):
+def marker_gene_expression(user_input, genes_override=None):
+    """Query the precomputed marker table for top markers or explicit genes."""
     ensure_expression_data_loaded()
     all_regions_flag = all_regions(user_input)
     cell_types, regions = extract_entities(user_input)
-    gene_names = extract_genes(user_input)
+    if genes_override is not None:
+        gene_names = [
+            str(g).upper().strip()
+            for g in genes_override
+            if str(g).strip()
+        ]
+        gene_names = list(dict.fromkeys(gene_names))
+    else:
+        gene_names = extract_genes(user_input)
 
     base_df = EXPR_DF.copy()
 
@@ -1457,133 +1669,88 @@ def gene_expression(user_input):
             match_note = f"expanded cell type match: {expanded_cell_types}"
 
     logger.info(
-        "gene_expression cell_types=%s regions=%s genes=%s rows=%s match_note=%s",
+        "marker_gene_expression cell_types=%s regions=%s genes=%s rows=%s match_note=%s",
         cell_types, regions, gene_names, len(df), match_note
     )
 
     if df.empty:
-        return "No matching gene expression data found for the specified query."
+        if gene_names:
+            return (
+                "No matching precomputed marker-table rows were found for "
+                + ", ".join(gene_names)
+                + " in the requested region/cell-type context."
+            )
+        return "No matching marker-gene data found for the specified query."
 
     prefix = ""
     if match_note != "exact match":
         prefix = f"Using {match_note} because no exact dataset match was found.\n\n"
 
-    # case 1: user asked about specific gene(s)
-
-    if wants_specific_gene(user_input, gene_names):
-        if "score" in df.columns:
-            df = df.sort_values(["score", "rank"], ascending=[False, True])
-        else:
-            df = df.sort_values("rank", ascending=True)
-
-        gene_name = gene_names[0] if len(gene_names) == 1 else ", ".join(gene_names)
-
-        text = summarize_single_gene_expression(df, gene_name, max_rows=5)
-        graph_json = build_expression_plot(df, gene_name=gene_name, max_rows=8, metric="score")
-
-        return {
-           "text": prefix + text,
-           "graph_json": graph_json
-        }
-
-
-    # case 2: top genes / markers
-    if wants_top_genes(user_input) or not gene_names:
-        sort_cols = ["rank"]
-        if "score" in df.columns:
-            sort_cols = ["rank", "score"]
-
-        df = df.sort_values(sort_cols, ascending=[True, False] if len(sort_cols) == 2 else True)
-
-        group_cols = []
-        if cell_types:
-            group_cols.append("cell_type")
-        if regions and not all_regions_flag:
-            group_cols.append("region")
-
-        if not group_cols:
-            if cell_types:
-                group_cols = ["cell_type"]
-            elif regions and not all_regions_flag:
-                group_cols = ["region"]
-            else:
-                group_cols = ["cell_type", "region"]
-
-        sections = []
-        grouped = df.groupby(group_cols)
-
-        for key, g in grouped:
-            if not isinstance(key, tuple):
-                key = (key,)
-            key_map = dict(zip(group_cols, key))
-
-            if "cell_type" in key_map and "region" in key_map:
-                header = f"Top marker genes for {key_map['cell_type']} in {key_map['region']}"
-            elif "cell_type" in key_map:
-                header = f"Top marker genes for {key_map['cell_type']}"
-            elif "region" in key_map:
-                header = f"Top marker genes in {key_map['region']}"
-            else:
-                header = "Top marker genes"
-
-            sections.append(header)
-            sections.append(format_gene_rows(g, max_rows=15))
-            sections.append("")
-
-        return prefix + "\n".join(sections).strip()
-
-    return "No matching gene expression data found for the specified query."
-
-
-def summarize_single_gene_expression(df, gene_name, max_rows=5):
-    if df.empty:
-        return f"No expression data found for {gene_name}."
-
-    work_df = df.copy()
-
-    if "score" in work_df.columns:
-        work_df = work_df.sort_values(["score", "rank"], ascending=[False, True])
-    else:
-        work_df = work_df.sort_values("rank", ascending=True)
-
-    top_rows = work_df.head(max_rows)
-
-    top = top_rows.iloc[0]
-    top_region = pretty_region_name(top.get("region", "unknown region"))
-    top_cell_type = top.get("cell_type", "unknown cell type")
-
-    summary = (
-        f"{gene_name} is highest in {top_cell_type.lower()} beds, especially in {top_region}. "
+    disclaimer = (
+        "These results come from the precomputed VasQ marker table. Rank and "
+        "optional score/logFC values are relative marker statistics, not "
+        "absolute or matrix mean expression."
     )
 
-    if len(top_rows) > 1:
-        second = top_rows.iloc[1]
-        second_region = pretty_region_name(second.get("region", "another region"))
-        second_cell_type = second.get("cell_type", "another vascular compartment")
-        summary += (
-            f"In this dataset, the strongest signal appears in {top_cell_type.lower()} of {top_region}, "
-            f"with another notable signal in {second_region} {second_cell_type.lower()} compartments"
+    # Case 1: compare marker evidence for genes explicitly supplied by the user.
+    if gene_names:
+        selected = select_marker_rows(
+            df,
+            gene_order=gene_names,
+            max_rows=min(24, max(8, 4 * len(gene_names))),
+            max_per_gene=4,
         )
+        present_genes = selected["gene"].drop_duplicates().tolist()
+        missing_genes = [g for g in gene_names if g not in present_genes]
+        text_parts = [
+            disclaimer,
+            "Marker-table evidence for the requested genes:",
+            format_marker_rows(selected, max_rows=24),
+        ]
+        if missing_genes:
+            text_parts.append(
+                "No matching marker rows were found for: "
+                + ", ".join(missing_genes)
+            )
 
-        if len(top_rows) > 2:
-            summary += ", while other vascular compartments are weaker."
-        else:
-            summary += "."
-    else:
-        summary += "in this dataset."
+        graph_json = build_marker_bar_plot(
+            selected,
+            title="Marker evidence for " + ", ".join(present_genes),
+        )
+        return {
+            "text": prefix + "\n\n".join(part for part in text_parts if part),
+            "graph_json": graph_json,
+            "genes": present_genes,
+        }
 
-    details = []
-    for _, row in top_rows.iterrows():
-        line = f"- {pretty_region_name(row['region'])}, {row['cell_type']}: rank {row['rank']}"
-        if "score" in work_df.columns and pd.notna(row.get("score")):
-            line += f", score {row['score']:.2f}"
-        if "logFC" in work_df.columns and pd.notna(row.get("logFC")):
-            line += f", logFC {row['logFC']:.2f}"
-        if "pct_expr" in work_df.columns and pd.notna(row.get("pct_expr")):
-            line += f", pct_expr {row['pct_expr']:.2f}"
-        details.append(line)
-
-    return summary + "\n\n" + "\n".join(details)
+    # Case 2: discover top genes directly from the marker table. This path does
+    # not require a user-provided or Web-Search-derived gene list.
+    top_n = requested_top_marker_count(user_input)
+    selected = select_marker_rows(
+        df,
+        max_rows=top_n,
+        unique_genes=True,
+    )
+    selected_genes = selected["gene"].drop_duplicates().tolist()
+    context_parts = []
+    if requested_cell_types:
+        context_parts.append("cell type: " + ", ".join(requested_cell_types))
+    if requested_regions:
+        context_parts.append("region: " + ", ".join(requested_regions))
+    context_text = "; ".join(context_parts) or "all matched contexts"
+    title = f"Top {len(selected_genes)} marker genes — " + context_text
+    text = (
+        disclaimer
+        + "\n\n"
+        + title
+        + "\n"
+        + format_marker_rows(selected, max_rows=top_n)
+    )
+    return {
+        "text": prefix + text,
+        "graph_json": build_marker_bar_plot(selected, title=title),
+        "genes": selected_genes,
+    }
 
 
 
@@ -2339,9 +2506,12 @@ def build_partial_response(
 
 functions = [
     {
-        "name": "gene_expression",
-        "description": "Collects information on gene expression rankings by \
-        cell type and region in brain vasculature.",
+        "name": "marker_gene_expression",
+        "description": "Queries precomputed VasQ marker-gene rankings by \
+        cell type and brain region. Use it for top-marker, marker-rank, or \
+        enriched-gene questions; a top-marker query does not require the user \
+        to provide genes. These marker statistics are not matrix mean \
+        expression.",
         "parameters": {
             "type": "object",
             "properties": 
@@ -2541,7 +2711,8 @@ def _chat_impl(user_input, history):
         return final_message, history, None
 
     resolved_question = intent.get("resolved_question") or user_input
-    genes = intent.get("genes") or []
+    user_supplied_genes = list(intent.get("genes") or [])
+    genes = user_supplied_genes[:]
     diseases = intent.get("diseases") or []
 
     # Branch A: every scientific question goes through KG-RAG, followed by a
@@ -2568,7 +2739,9 @@ def _chat_impl(user_input, history):
 
     # The first search can discover genes that were not explicitly written in
     # the user's question (for example, an Alzheimer's disease question). Use
-    # that evidence-derived list for both VasQ and the second drug search.
+    # that evidence-derived list for matrix expression and drug searches. An
+    # open-ended top-marker request must still discover genes from the VasQ
+    # marker table rather than being restricted by Web Search suggestions.
     genes = derive_genes_from_first_search(
         resolved_question,
         scientific_web_result,
@@ -2586,16 +2759,18 @@ def _chat_impl(user_input, history):
 
     if intent.get("asks_expression") and intent.get("use_vasq"):
         if genes or intent.get("asks_markers"):
-            vasq_query = resolved_question
-            if genes:
-                vasq_query += "\nExplicit genes for the VasQ query: " + ", ".join(genes)
-
             try:
                 if intent.get("asks_markers"):
-                    vasq_result = gene_expression(vasq_query)
+                    vasq_result = marker_gene_expression(
+                        resolved_question,
+                        genes_override=user_supplied_genes,
+                    )
+                    if isinstance(vasq_result, dict):
+                        marker_genes = vasq_result.get("genes") or []
+                        genes = list(dict.fromkeys(marker_genes + genes))[:20]
                 else:
                     vasq_result = matrix_expression(
-                        vasq_query,
+                        resolved_question,
                         genes_override=genes,
                     )
                 logger.info("VasQ analysis completed for genes: %s", genes)
