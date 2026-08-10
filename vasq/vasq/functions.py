@@ -1795,7 +1795,7 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
             "font": {
                 "family": "Satoshi, Arial, sans-serif",
                 "color": "#32175a",
-                "size": 12,
+                "size": 15,
             },
             "hoverlabel": {
                 "bgcolor": "#ffffff",
@@ -1807,14 +1807,14 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
                 "categoryorder": "array",
                 "categoryarray": [region_labels[r] for r in region_order],
                 "tickangle": 0,
-                "tickfont": {"size": 10},
+                "tickfont": {"size": 15},
                 "showgrid": True,
                 "gridcolor": "#edf2f7",
                 "zeroline": False,
                 "automargin": True,
             },
             "yaxis": {
-                "title": {"text": "Gene", "standoff": 12},
+                "title": {"text": "Gene", "standoff": 15},
                 "categoryorder": "array",
                 # Plotly orders categorical y values from bottom to top.
                 "categoryarray": list(reversed(gene_order)),
