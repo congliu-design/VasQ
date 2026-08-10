@@ -1702,7 +1702,7 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
     # Square-root scaling keeps low expressing fractions visible without
     # letting highly expressed groups overwhelm the figure.
     marker_sizes = (
-        9.0 + 31.0 * np.sqrt(plot_df["pct_expr"].to_numpy())
+        6.0 + 18.0 * np.sqrt(plot_df["pct_expr"].to_numpy())
     ).round(1).tolist()
     marker_opacity = [
         0.45 if n_cells < 20 else 0.9
