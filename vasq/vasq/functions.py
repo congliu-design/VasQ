@@ -1,10 +1,12 @@
 import difflib
+import contextvars
 import json
 import openai
 import os
 import pandas as pd
 import re
 import requests
+import time
 import difflib
 import ast
 import logging
@@ -22,6 +24,58 @@ from openai import OpenAI
 logger = logging.getLogger(__name__)
 logger.info("OpenAI SDK version: %s", openai.__version__)
 
+
+class TurnBudgetExceeded(TimeoutError):
+    """Raised when there is not enough time left to start another stage."""
+
+
+_TURN_DEADLINE = contextvars.ContextVar("vasq_turn_deadline", default=None)
+
+
+def _env_float(name, default, minimum=1.0):
+    """Read a positive float setting without allowing bad env values to crash."""
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s; using default=%s", name, default)
+        value = float(default)
+    return max(float(minimum), value)
+
+
+def _env_int(name, default, minimum=0, maximum=5):
+    """Read and bound small integer settings such as retry counts."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s; using default=%s", name, default)
+        value = int(default)
+    return max(minimum, min(maximum, value))
+
+
+def _stage_timeout(stage_name, requested_seconds, reserve_seconds=5.0):
+    """Cap a network call by both its stage limit and the current turn budget."""
+    requested_seconds = max(1.0, float(requested_seconds))
+    deadline = _TURN_DEADLINE.get()
+    if deadline is None:
+        return requested_seconds
+
+    remaining = deadline - time.monotonic()
+    usable = remaining - max(0.0, float(reserve_seconds))
+    if usable < 1.0:
+        raise TurnBudgetExceeded(
+            f"Skipping {stage_name}: only {remaining:.1f}s remains in turn budget"
+        )
+
+    effective = min(requested_seconds, usable)
+    logger.info(
+        "Stage %s timeout=%.1fs turn_remaining=%.1fs reserve=%.1fs",
+        stage_name,
+        effective,
+        remaining,
+        reserve_seconds,
+    )
+    return effective
+
 #def query_kg_rag(user_input):
 #    url = os.getenv("KG_RAG_URL", "http://kg-rag.railway.internal:8080/query")
 #    logger.info("Calling KG_RAG_URL=%s", url)
@@ -34,12 +88,26 @@ logger.info("OpenAI SDK version: %s", openai.__version__)
 # Set API key
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
+# Disable the SDK's long default retry chain at the shared-client level.
+# Individual calls opt into a small, bounded retry count below.
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    max_retries=0,
+)
+
 
 
 ### Helper Functions ###
 
 # Call OpenAI API
-def call_api(history, functions=None):
+def call_api(
+    history,
+    functions=None,
+    *,
+    stage_name="chat_completion",
+    timeout_seconds=None,
+    reserve_seconds=5.0,
+):
     model = os.getenv("OPENAI_MODEL", "gpt-5.6-terra")
 
     request_args = {
@@ -53,12 +121,32 @@ def call_api(history, functions=None):
         if model.startswith("gpt-5.6"):
             request_args["reasoning_effort"] = "none"
             
-    chat_co = openai.chat.completions.create(**request_args)
+    timeout_seconds = timeout_seconds or _env_float(
+        "OPENAI_CHAT_TIMEOUT_SECONDS", 45
+    )
+    timeout_seconds = _stage_timeout(
+        stage_name,
+        timeout_seconds,
+        reserve_seconds=reserve_seconds,
+    )
+    max_retries = _env_int("OPENAI_CHAT_MAX_RETRIES", 1)
+    # SDK timeouts apply to an individual attempt. Divide the stage allowance
+    # across attempts so one retry cannot double the wall-clock stage limit.
+    attempt_timeout = max(1.0, timeout_seconds / (max_retries + 1))
+    chat_co = client.with_options(
+        timeout=attempt_timeout,
+        max_retries=max_retries,
+    ).chat.completions.create(**request_args)
 
     return chat_co.choices[0].message
 
 
-def call_helper_api(system_prompt, user_prompt):
+def call_helper_api(
+    system_prompt,
+    user_prompt,
+    *,
+    stage_name="helper_completion",
+):
     """Call the helper model with parameters compatible with GPT-4o and GPT-5.6."""
     model = os.getenv("OPENAI_HELPER_MODEL", "gpt-4o")
 
@@ -75,23 +163,54 @@ def call_helper_api(system_prompt, user_prompt):
     if not model.startswith("gpt-5.6"):
         request_args["temperature"] = 0
 
-    return openai.chat.completions.create(**request_args)
+    timeout_seconds = _stage_timeout(
+        stage_name,
+        _env_float("OPENAI_HELPER_TIMEOUT_SECONDS", 30),
+        # Preserve enough time for the final answer even if an optional helper
+        # is reached late in the request.
+        reserve_seconds=_env_float("VASQ_SYNTHESIS_RESERVE_SECONDS", 50),
+    )
+    max_retries = _env_int("OPENAI_HELPER_MAX_RETRIES", 1)
+    attempt_timeout = max(1.0, timeout_seconds / (max_retries + 1))
+    return client.with_options(
+        timeout=attempt_timeout,
+        max_retries=max_retries,
+    ).chat.completions.create(**request_args)
 
 
 logger = logging.getLogger(__name__)
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
-def run_openai_web_search(search_prompt):
+def run_openai_web_search(
+    search_prompt,
+    *,
+    stage_name="web_search",
+    search_context_size="high",
+):
     try:
-        logger.info("Calling OpenAI Web Search...")
+        timeout_seconds = _stage_timeout(
+            stage_name,
+            _env_float("OPENAI_WEB_TIMEOUT_SECONDS", 75),
+            reserve_seconds=_env_float("VASQ_SYNTHESIS_RESERVE_SECONDS", 50),
+        )
+        logger.info(
+            "Calling OpenAI Web Search stage=%s context=%s timeout=%.1fs",
+            stage_name,
+            search_context_size,
+            timeout_seconds,
+        )
 
-        response = client.responses.create(
+        response = client.with_options(
+            timeout=timeout_seconds,
+            # A Web Search retry can repeat a large and expensive tool call.
+            # Default to no retry; it can be enabled explicitly if desired.
+            max_retries=_env_int("OPENAI_WEB_MAX_RETRIES", 0),
+        ).responses.create(
             model=os.getenv("OPENAI_MODEL", "gpt-5.6-terra"),
             tools=[
                 {
                     "type": "web_search",
-                    "search_context_size": "high",
+                    "search_context_size": search_context_size,
                     "external_web_access": True,
                 }
             ],
@@ -111,13 +230,32 @@ def run_openai_web_search(search_prompt):
             return None
 
         logger.info(
-            "OpenAI Web Search succeeded, result length=%s",
+            "OpenAI Web Search succeeded stage=%s result_length=%s request_id=%s",
+            stage_name,
             len(result),
+            getattr(response, "_request_id", None),
         )
         return result
 
+    except TurnBudgetExceeded as exc:
+        logger.warning("OpenAI Web Search skipped: %s", exc)
+        return None
+    except openai.APITimeoutError:
+        logger.warning(
+            "OpenAI Web Search timed out stage=%s; continuing with partial evidence",
+            stage_name,
+            exc_info=True,
+        )
+        return None
+    except (openai.APIConnectionError, openai.RateLimitError):
+        logger.warning(
+            "OpenAI Web Search unavailable stage=%s; continuing with partial evidence",
+            stage_name,
+            exc_info=True,
+        )
+        return None
     except Exception:
-        logger.exception("OpenAI Web Search failed")
+        logger.exception("OpenAI Web Search failed stage=%s", stage_name)
         return None
 
 
@@ -128,7 +266,8 @@ def search_openai_web(user_input):
         "question. Prioritize peer-reviewed literature, PubMed, FDA, "
         "ClinicalTrials.gov, and authoritative medical sources. "
         "Provide source citations.\n\n"
-        f"Question: {user_input}"
+        f"Question: {user_input}",
+        stage_name="generic_biomedical_web_search",
     )
 
 
@@ -168,7 +307,11 @@ def search_scientific_web(user_input, kg_context=None, kg_assessment=None):
         "Provide source citations and distinguish established evidence from "
         "hypotheses.\n\n"
         + context_block
-        + f"Question: {user_input}"
+        + f"Question: {user_input}",
+        stage_name="scientific_web_search",
+        search_context_size=os.getenv(
+            "OPENAI_SCIENTIFIC_SEARCH_CONTEXT_SIZE", "high"
+        ),
     )
 
 
@@ -201,7 +344,11 @@ def search_drugs_and_small_molecules(user_input, genes=None, diseases=None):
         "provide source citations, and explicitly state when no reliable "
         "direct small-molecule match is found.\n\n"
         + "\n".join(entity_lines)
-        + f"\n\nOriginal scientific question: {user_input}"
+        + f"\n\nOriginal scientific question: {user_input}",
+        stage_name="drug_web_search",
+        # Drug searches can fan out across many entities. Medium context keeps
+        # the optional branch bounded; override via env when high is required.
+        search_context_size=os.getenv("OPENAI_DRUG_SEARCH_CONTEXT_SIZE", "medium"),
     )
 
 
@@ -1434,10 +1581,16 @@ def query_kg_rag(user_input):
     )
 
     try:
+        timeout_seconds = _stage_timeout(
+            "kg_rag",
+            _env_float("KG_RAG_TIMEOUT_SECONDS", 35),
+            reserve_seconds=_env_float("VASQ_RETRIEVAL_RESERVE_SECONDS", 110),
+        )
+        logger.info("Calling KG-RAG timeout=%.1fs", timeout_seconds)
         response = requests.post(
             url,
             json={"query": user_input},
-            timeout=180,
+            timeout=timeout_seconds,
         )
         response.raise_for_status()
 
@@ -1790,6 +1943,14 @@ def fallback_query_intent(user_input):
     ]
     asks_markers = wants_marker_query(text) or wants_top_genes(text)
     asks_expression = asks_markers or wants_matrix_expression_query(text)
+    drug_terms = [
+        "drug", "drugs", "treatment", "treatments", "therapy", "therapies",
+        "therapeutic", "therapeutics", "compound", "compounds",
+        "small molecule", "small molecules", "modulator", "modulators",
+        "inhibitor", "inhibitors", "agonist", "agonists",
+        "antagonist", "antagonists", "clinical trial", "clinical trials",
+    ]
+    asks_drugs = any(term in lowered for term in drug_terms)
 
     return {
         "is_scientific": bool(
@@ -1799,6 +1960,7 @@ def fallback_query_intent(user_input):
         ),
         "asks_expression": asks_expression,
         "asks_markers": asks_markers,
+        "asks_drugs": asks_drugs,
         "use_vasq": asks_expression and not any(
             term in lowered
             for term in [
@@ -1820,6 +1982,7 @@ def analyze_query_intent(user_input, history=None):
             "is_scientific": False,
             "asks_expression": False,
             "asks_markers": False,
+            "asks_drugs": False,
             "use_vasq": False,
             "genes": [],
             "diseases": [],
@@ -1829,9 +1992,13 @@ def analyze_query_intent(user_input, history=None):
     system_prompt = (
         "Classify a conversation turn for a biomedical/neuroscience research "
         "assistant. Return JSON only with keys: is_scientific (boolean), "
-        "asks_expression (boolean), asks_markers (boolean), genes (array of "
-        "human gene symbols), diseases (array of disease/condition names), "
-        "use_vasq (boolean), and resolved_question (string). A greeting, "
+        "asks_expression (boolean), asks_markers (boolean), asks_drugs "
+        "(boolean), genes (array of human gene symbols), diseases (array of "
+        "disease/condition names), use_vasq (boolean), and resolved_question "
+        "(string). Set asks_drugs only when the current question explicitly "
+        "asks about drugs, compounds, treatments, therapies, modulators, or "
+        "clinical candidates; the mere presence of a disease or gene is not "
+        "enough. A greeting, "
         "thanks, casual chat, or "
         "app/meta question is not scientific. Set asks_expression only when "
         "the user is asking about measured gene expression, expression "
@@ -1872,6 +2039,7 @@ def analyze_query_intent(user_input, history=None):
             "is_scientific": bool(parsed.get("is_scientific", False)),
             "asks_expression": bool(parsed.get("asks_expression", False)),
             "asks_markers": bool(parsed.get("asks_markers", False)),
+            "asks_drugs": bool(parsed.get("asks_drugs", False)),
             "use_vasq": bool(parsed.get("use_vasq", False)),
             "genes": list(dict.fromkeys(genes)),
             "diseases": list(dict.fromkeys(diseases)),
@@ -1950,6 +2118,40 @@ def cap_source_text(text, limit):
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "\n[Source text truncated]"
+
+
+def build_partial_response(
+    genes,
+    vasq_text,
+    scientific_web_result,
+    drug_result=None,
+):
+    """Return recovered evidence if the final model synthesis is unavailable."""
+    sections = [
+        "I recovered partial results, but the final evidence synthesis was "
+        "not available before the request deadline."
+    ]
+    if genes:
+        sections.append("Associated genes:\n" + ", ".join(genes))
+    if vasq_text:
+        sections.append(
+            "VasQ expression results:\n" + cap_source_text(vasq_text, 6000)
+        )
+    if scientific_web_result:
+        sections.append(
+            "Scientific evidence:\n"
+            + cap_source_text(scientific_web_result, 4000)
+        )
+    if drug_result:
+        sections.append(
+            "Drug and small-molecule evidence:\n"
+            + cap_source_text(drug_result, 3000)
+        )
+    if len(sections) == 1:
+        sections.append(
+            "No reliable partial evidence was available. Please retry the request."
+        )
+    return "\n\n".join(sections)
 
 
 ### Function Descriptions ###
@@ -2134,7 +2336,7 @@ def looks_like_expression_query(user_input):
 
 
 
-def chat(user_input, history):
+def _chat_impl(user_input, history):
     if history is None:
         history = []
 
@@ -2146,7 +2348,11 @@ def chat(user_input, history):
 
     # Greetings, thanks, casual conversation, and meta questions do not search.
     if not intent.get("is_scientific"):
-        direct_message = call_api(history)
+        direct_message = call_api(
+            history,
+            stage_name="direct_answer",
+            timeout_seconds=_env_float("OPENAI_SYNTHESIS_TIMEOUT_SECONDS", 45),
+        )
         final_message = getattr(direct_message, "content", None) or (
             "I'm sorry, but I couldn't generate a response."
         )
@@ -2225,11 +2431,11 @@ def chat(user_input, history):
 
     vasq_text, graph_json = retrieved_text_and_graph(vasq_result)
 
-    # Branch C: second and final Web Search. It uses the gene list produced by
-    # the first search to find direct modulators, pathway compounds, and
-    # disease-directed treatments.
+    # Branch C: optional second Web Search. Only run it when the user actually
+    # asked for drugs/therapeutics; a disease or gene alone is not sufficient.
     drug_result = None
-    if genes or diseases:
+    asks_drugs = bool(intent.get("asks_drugs"))
+    if asks_drugs and (genes or diseases):
         try:
             logger.info(
                 "Web Search stage 2/2: drugs for genes=%s diseases=%s",
@@ -2283,7 +2489,7 @@ def chat(user_input, history):
             "SCIENTIFIC WEB STATUS:\nNo usable web evidence was returned."
         )
 
-    if genes or diseases:
+    if asks_drugs and (genes or diseases):
         if drug_result:
             evidence_parts.append(
                 "DRUG AND SMALL-MOLECULE EVIDENCE:\n"
@@ -2313,12 +2519,15 @@ def chat(user_input, history):
             "approved, clinical, preclinical, and research-tool status. Never "
             "claim that a disease drug directly targets a gene without direct "
             "support. For disease questions that ask about genes and their "
-            "expression, organize the answer into three explicit sections: "
-            "(1) associated genes and supporting knowledge, (2) VasQ matrix "
-            "expression by brain region/cell type with the supplied measured "
-            "values, and (3) drugs or therapeutic compounds related to those "
-            "genes. Cover every analyzed gene when evidence is available. If "
-            "a source reports no result, state the limitation briefly rather "
+            "expression, organize the answer into two explicit sections: "
+            "(1) associated genes and supporting knowledge and (2) VasQ "
+            "matrix expression by brain region/cell type with the supplied "
+            "measured values. Cover every analyzed gene when evidence is "
+            "available. When the user explicitly asks for drugs or "
+            "therapeutics, add a third section for compounds related to those "
+            "genes; otherwise "
+            "do not add or search for drug information. If a source reports "
+            "no result, state the limitation briefly rather "
             "than inventing content. Do not mention internal routing or "
             "implementation details."
         ),
@@ -2340,11 +2549,57 @@ def chat(user_input, history):
         ),
     })
 
-    final_message_obj = call_api(synthesis_messages)
-    final_message = getattr(final_message_obj, "content", None) or (
-        "I'm sorry, but I couldn't synthesize the available evidence."
-    )
+    try:
+        final_message_obj = call_api(
+            synthesis_messages,
+            stage_name="final_synthesis",
+            timeout_seconds=_env_float("OPENAI_SYNTHESIS_TIMEOUT_SECONDS", 45),
+            reserve_seconds=2,
+        )
+        final_message = getattr(final_message_obj, "content", None) or (
+            "I'm sorry, but I couldn't synthesize the available evidence."
+        )
+    except Exception:
+        logger.exception(
+            "Final synthesis failed; returning recovered partial evidence"
+        )
+        final_message = build_partial_response(
+            genes,
+            vasq_text,
+            scientific_web_result,
+            drug_result=drug_result,
+        )
     logger.info("Final message returned to UI: %r", final_message)
     update_history(history, "assistant", final_message)
 
     return final_message, history, graph_json
+
+
+def chat(user_input, history):
+    """Run one synchronous chat turn inside a hard wall-clock budget."""
+    budget_seconds = _env_float("VASQ_TURN_BUDGET_SECONDS", 240)
+    started_at = time.monotonic()
+    deadline_token = _TURN_DEADLINE.set(started_at + budget_seconds)
+    logger.info("VasQ turn started budget=%.1fs", budget_seconds)
+
+    try:
+        return _chat_impl(user_input, history)
+    except Exception:
+        logger.exception("VasQ turn failed before a normal response was produced")
+        safe_history = history if history is not None else []
+        if not any(
+            message.get("role") == "user"
+            and message.get("content") == user_input
+            for message in safe_history[-2:]
+        ):
+            update_history(safe_history, "user", user_input)
+        fallback = (
+            "The request could not be completed within the available time. "
+            "Please retry; any optional evidence source that is slow will be skipped."
+        )
+        update_history(safe_history, "assistant", fallback)
+        return fallback, safe_history, None
+    finally:
+        elapsed = time.monotonic() - started_at
+        logger.info("VasQ turn finished elapsed=%.1fs", elapsed)
+        _TURN_DEADLINE.reset(deadline_token)
