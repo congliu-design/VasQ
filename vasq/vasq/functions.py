@@ -764,7 +764,9 @@ def summarize_group_expression(gene, cell_indices, group_cols):
     obs = MATRIX_META.iloc[cell_indices][group_cols].copy()
     rows = []
 
-    for key, g in obs.groupby(group_cols):
+    groupby_arg = group_cols[0] if len(group_cols) == 1 else group_cols
+
+    for key, g in obs.groupby(groupby_arg):
         idx = g.index.to_numpy()
         vals = get_gene_vector(idx, gene)
 
