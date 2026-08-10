@@ -1813,7 +1813,7 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
                     for r in region_order
                 ],
                 "tickangle": 0,
-                "tickfont": {"size": 10},
+                "tickfont": {"size": 14},
             
                 "showticklabels": True,
                 "showline": True,
