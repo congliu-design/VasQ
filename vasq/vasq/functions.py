@@ -1300,13 +1300,25 @@ def ensure_expression_data_loaded():
         AVAILABLE_REGIONS = sorted(EXPR_DF["region"].dropna().unique().tolist())
 
 def resolve_dataset_entities_with_gpt(user_input, available_cell_types, available_regions):
+    # system_prompt = (
+     #   "You are helping map a biology question onto a fixed dataset schema. "
+      #  "Choose the closest matching dataset labels from the provided lists. "
+       # "Return JSON only with keys: "
+        #'{"cell_types": [], "regions": []}. '
+        #"Only use labels that appear in the provided lists. "
+        #"Do not invent labels."
+   # )
     system_prompt = (
-        "You are helping map a biology question onto a fixed dataset schema. "
-        "Choose the closest matching dataset labels from the provided lists. "
-        "Return JSON only with keys: "
+        "Map each explicitly requested biological cell type to at most one best "
+        "matching dataset cell-type label. Prefer the most specific label that "
+        "preserves every qualifier in the user's wording. Do not return both a "
+        "general parent label and a more specific child label unless the user "
+        "explicitly asks to compare both. Return multiple labels only when the "
+        "user explicitly mentions multiple distinct cell types. If there is no "
+        "reliable match, return an empty cell_types list instead of broadening or "
+        "guessing. Return JSON only with keys: "
         '{"cell_types": [], "regions": []}. '
-        "Only use labels that appear in the provided lists. "
-        "Do not invent labels."
+        "Only use labels from the supplied dataset lists."
     )
 
     user_prompt = (
@@ -1598,9 +1610,13 @@ def pretty_region_name(region):
 
 def marker_gene_expression(user_input, genes_override=None):
     """Query the precomputed marker table for top markers or explicit genes."""
+
     ensure_expression_data_loaded()
+
     all_regions_flag = all_regions(user_input)
     cell_types, regions = extract_entities(user_input)
+
+    # Use explicitly supplied genes when available.
     if genes_override is not None:
         gene_names = [
             str(g).upper().strip()
@@ -1611,148 +1627,225 @@ def marker_gene_expression(user_input, genes_override=None):
     else:
         gene_names = extract_genes(user_input)
 
-    base_df = EXPR_DF.copy()
+    requested_cell_types = (
+        list(dict.fromkeys(cell_types))
+        if cell_types
+        else []
+    )
 
-    requested_cell_types = list(cell_types) if cell_types else []
-    requested_regions = regions if (regions and not all_regions_flag) else None
+    requested_regions = (
+        list(dict.fromkeys(regions))
+        if regions and not all_regions_flag
+        else []
+    )
 
-    # 1. exact match first
-    df = base_df.copy()
+    # Start with the complete expression_markers.csv table.
+    df = EXPR_DF.copy()
 
+    # Strict cell-type filtering.
+    # Do not automatically add broader cell types.
     if requested_cell_types:
-        df = df[df["cell_type"].isin(requested_cell_types)]
+        df = df[
+            df["cell_type"].isin(requested_cell_types)
+        ]
 
+    # Optional strict region filtering.
     if requested_regions:
-        df = df[df["region"].isin(requested_regions)]
+        df = df[
+            df["region"].isin(requested_regions)
+        ]
 
+    # Optional explicit-gene filtering.
     if gene_names:
-        df = df[df["gene"].isin(gene_names)]
-
-    match_note = "exact match"
-
-    # 2. broaden vascular/endothelial labels if exact match is empty
-    if df.empty and requested_cell_types:
-        expanded_cell_types = list(requested_cell_types)
-
-        if "Endothelial" in requested_cell_types:
-            for extra in [
-                "Fenestrated Endothelial",
-                "Fenestrated Capillary",
-                "Fenestrated Capillaries",
-                "Capillary",
-                "Capillaries",
-            ]:
-                if extra in AVAILABLE_CELL_TYPES and extra not in expanded_cell_types:
-                    expanded_cell_types.append(extra)
-
-        if any(x in requested_cell_types for x in ["Capillary", "Capillaries"]):
-            for extra in [
-                "Fenestrated Capillary",
-                "Fenestrated Capillaries",
-                "Fenestrated Endothelial",
-                "Endothelial",
-                "Pericyte",
-            ]:
-                if extra in AVAILABLE_CELL_TYPES and extra not in expanded_cell_types:
-                    expanded_cell_types.append(extra)
-
-        df = base_df.copy()
-        df = df[df["cell_type"].isin(expanded_cell_types)]
-
-        if requested_regions:
-            df = df[df["region"].isin(requested_regions)]
-
-        if gene_names:
-            df = df[df["gene"].isin(gene_names)]
-
-        if not df.empty:
-            match_note = f"expanded cell type match: {expanded_cell_types}"
+        df = df[
+            df["gene"].isin(gene_names)
+        ]
 
     logger.info(
-        "marker_gene_expression cell_types=%s regions=%s genes=%s rows=%s match_note=%s",
-        cell_types, regions, gene_names, len(df), match_note
+        "marker_gene_expression "
+        "requested_cell_types=%s regions=%s genes=%s rows=%s",
+        requested_cell_types,
+        requested_regions,
+        gene_names,
+        len(df),
     )
 
+    # No automatic broadening or fallback to related cell types.
     if df.empty:
-        if gene_names:
-            return (
-                "No matching precomputed marker-table rows were found for "
-                + ", ".join(gene_names)
-                + " in the requested region/cell-type context."
-            )
-        return "No matching marker-gene data found for the specified query."
+        filters = []
 
-    prefix = ""
-    if match_note != "exact match":
-        prefix = f"Using {match_note} because no exact dataset match was found.\n\n"
+        if requested_cell_types:
+            filters.append(
+                "cell type: " + ", ".join(requested_cell_types)
+            )
+
+        if requested_regions:
+            filters.append(
+                "region: " + ", ".join(requested_regions)
+            )
+
+        if gene_names:
+            filters.append(
+                "genes: " + ", ".join(gene_names)
+            )
+
+        if filters:
+            return {
+                "text": (
+                    "No exact precomputed marker-table rows were found for "
+                    + "; ".join(filters)
+                    + ". The query was not automatically broadened to other "
+                    "cell types or regions."
+                ),
+                "graph_json": None,
+                "genes": [],
+            }
+
+        return {
+            "text": (
+                "No matching marker-gene data were found for the "
+                "specified query."
+            ),
+            "graph_json": None,
+            "genes": [],
+        }
 
     disclaimer = (
-        "These results come from the precomputed VasQ marker table. Rank and "
-        "optional score/logFC values are relative marker statistics, not "
-        "absolute or matrix mean expression."
+        "These results come from the precomputed VasQ marker table. "
+        "Rank and optional score/logFC values are relative marker "
+        "statistics, not absolute or matrix mean expression."
     )
 
-    # Case 1: compare marker evidence for genes explicitly supplied by the user.
+    # Case 1:
+    # The user supplied one or more genes and wants their marker evidence.
     if gene_names:
         selected = select_marker_rows(
             df,
             gene_order=gene_names,
-            max_rows=min(24, max(8, 4 * len(gene_names))),
+            max_rows=min(
+                24,
+                max(8, 4 * len(gene_names)),
+            ),
             max_per_gene=4,
         )
-        present_genes = selected["gene"].drop_duplicates().tolist()
-        missing_genes = [g for g in gene_names if g not in present_genes]
+
+        present_genes = (
+            selected["gene"]
+            .drop_duplicates()
+            .tolist()
+        )
+
+        missing_genes = [
+            gene
+            for gene in gene_names
+            if gene not in present_genes
+        ]
+
         text_parts = [
             disclaimer,
             "Marker-table evidence for the requested genes:",
-            format_marker_rows(selected, max_rows=24),
+            format_marker_rows(
+                selected,
+                max_rows=24,
+            ),
         ]
+
         if missing_genes:
             text_parts.append(
                 "No matching marker rows were found for: "
                 + ", ".join(missing_genes)
             )
 
+        if requested_cell_types:
+            chart_context = (
+                " in "
+                + ", ".join(requested_cell_types)
+            )
+        else:
+            chart_context = ""
+
         graph_json = build_marker_bar_plot(
             selected,
-            title="Marker evidence for " + ", ".join(present_genes),
+            title=(
+                "Marker evidence for "
+                + ", ".join(present_genes)
+                + chart_context
+            ),
         )
+
         return {
-            "text": prefix + "\n\n".join(part for part in text_parts if part),
+            "text": "\n\n".join(
+                part
+                for part in text_parts
+                if part
+            ),
             "graph_json": graph_json,
             "genes": present_genes,
         }
 
-    # Case 2: discover top genes directly from the marker table. This path does
-    # not require a user-provided or Web-Search-derived gene list.
+    # Case 2:
+    # No genes were supplied. Discover top marker genes directly
+    # from expression_markers.csv.
     top_n = requested_top_marker_count(user_input)
+
     selected = select_marker_rows(
         df,
         max_rows=top_n,
         unique_genes=True,
     )
-    selected_genes = selected["gene"].drop_duplicates().tolist()
+
+    selected_genes = (
+        selected["gene"]
+        .drop_duplicates()
+        .tolist()
+    )
+
     context_parts = []
+
     if requested_cell_types:
-        context_parts.append("cell type: " + ", ".join(requested_cell_types))
+        context_parts.append(
+            "cell type: "
+            + ", ".join(requested_cell_types)
+        )
+
     if requested_regions:
-        context_parts.append("region: " + ", ".join(requested_regions))
-    context_text = "; ".join(context_parts) or "all matched contexts"
-    title = f"Top {len(selected_genes)} marker genes — " + context_text
-    text = (
+        context_parts.append(
+            "region: "
+            + ", ".join(requested_regions)
+        )
+
+    context_text = (
+        "; ".join(context_parts)
+        if context_parts
+        else "all matched contexts"
+    )
+
+    title = (
+        f"Top {len(selected_genes)} marker genes — "
+        + context_text
+    )
+
+    result_text = (
         disclaimer
         + "\n\n"
         + title
         + "\n"
-        + format_marker_rows(selected, max_rows=top_n)
+        + format_marker_rows(
+            selected,
+            max_rows=top_n,
+        )
     )
+
+    graph_json = build_marker_bar_plot(
+        selected,
+        title=title,
+    )
+
     return {
-        "text": prefix + text,
-        "graph_json": build_marker_bar_plot(selected, title=title),
+        "text": result_text,
+        "graph_json": graph_json,
         "genes": selected_genes,
     }
-
-
 
 
 ### KG-RAG Functions ###
