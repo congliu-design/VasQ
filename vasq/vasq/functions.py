@@ -1632,7 +1632,13 @@ def query_kg_rag(user_input):
 
         return result
 
-    except Exception:
+    except requests.exceptions.Timeout:
+        logger.warning(
+            "KG-RAG timed out; continuing with scientific Web Search"
+        )
+        return None
+    
+    except requests.exceptions.RequestException:
         logger.exception("KG-RAG request failed")
         return None
 
