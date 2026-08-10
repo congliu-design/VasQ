@@ -58,214 +58,313 @@ document.addEventListener("DOMContentLoaded", function() {
     // Text display
     function typeWriter(text, element, callback) {
         let i = 0;
-        const intervalId = setInterval(() => {
-            if (i < text.length) {
-
-                // Handle bold italic text (***...***)
-                if (text.substring(i, i + 3) === '***') {
-                    i += 3;
-                    let boldItalicText = '';
-                    while (i < text.length && text.substring(i, i + 3) !== '***') {
-                        boldItalicText += text.charAt(i);
-                        i++;
-                    }
-                    i += 3;
-                    const boldItalicElement = document.createElement('strong');
-                    const italicElement = document.createElement('em');
-                    italicElement.textContent = boldItalicText;
-                    boldItalicElement.appendChild(italicElement);
-                    element.appendChild(boldItalicElement);
-                }
-
-                // Handle bold text (**...**)
-                else if (text.substring(i, i + 2) === '**') {
-                    i += 2;
-                    let boldText = '';
-                    while (i < text.length && text.substring(i, i + 2) !== '**') {
-                        boldText += text.charAt(i);
-                        i++;
-                    }
-                    i += 2;
-                    const boldElement = document.createElement('strong');
-                    boldElement.textContent = boldText;
-                    element.appendChild(boldElement);
-                }
-
-                // Handle italic text (*...*)
-                else if (text.charAt(i) === '*') {
-                    i += 1;
-                    let italicText = '';
-                    while (i < text.length && text.charAt(i) !== '*') {
-                        italicText += text.charAt(i);
-                        i++;
-                    }
-                    i += 1;
-                    const italicElement = document.createElement('em');
-                    italicElement.textContent = italicText;
-                    element.appendChild(italicElement);
-                }
-
-                // Handle strikethrough text (~~...~~)
-                else if (text.substring(i, i + 2) === '~~') {
-                    i += 2;
-                    let strikethroughText = '';
-                    while (i < text.length && text.substring(i, i + 2) !== '~~') {
-                        strikethroughText += text.charAt(i);
-                        i++;
-                    }
-                    i += 2;
-                    const strikethroughElement = document.createElement('del');
-                    strikethroughElement.textContent = strikethroughText;
-                    element.appendChild(strikethroughElement);
-                }
-
-                // Handle inline code (`...`)
-                else if (text.charAt(i) === '`') {
-                    i++;
-                    let inlineCodeText = '';
-                    while (i < text.length && text.charAt(i) !== '`') {
-                        inlineCodeText += text.charAt(i);
-                        i++;
-                    }
-                    i++;
-                    const codeElement = document.createElement('code');
-                    codeElement.textContent = inlineCodeText;
-                    element.appendChild(codeElement);
-                }
-
-                // Handle code blocks (```...```)
-                else if (text.substring(i, i + 3) === '```') {
-                    i += 3;
-                    let codeBlockText = '';
-                    while (i < text.length && text.substring(i, i + 3) !== '```') {
-                        codeBlockText += text.charAt(i);
-                        i++;
-                    }
-                    i += 3;
-                    const codeBlockElement = document.createElement('pre');
-                    const codeElement = document.createElement('code');
-                    codeElement.textContent = codeBlockText;
-                    codeBlockElement.appendChild(codeElement);
-                    element.appendChild(codeBlockElement);
-                }
-
-                // Handle blockquotes (>...)
-                else if (text.charAt(i) === '>') {
-                    i++;
-                    let blockquoteText = '';
-                    while (i < text.length && text.charAt(i) !== '\n') {
-                        blockquoteText += text.charAt(i);
-                        i++;
-                    }
-                    const blockquoteElement = document.createElement('blockquote');
-                    blockquoteElement.textContent = blockquoteText.trim();
-                    element.appendChild(blockquoteElement);
-                }
-
-                // Handle headers (#, ##, ###)
-                else if (text.substring(i, i + 3) === '###') {
-                    i += 3;
-                    let headerText = '';
-                    while (i < text.length && text.charAt(i) !== '\n') {
-                        headerText += text.charAt(i);
-                        i++;
-                    }
-                    const headerElement = document.createElement('h3');
-                    headerElement.textContent = headerText.trim();
-                    element.appendChild(headerElement);
-                }
-                else if (text.substring(i, i + 2) === '##') {
-                    i += 2;
-                    let headerText = '';
-                    while (i < text.length && text.charAt(i) !== '\n') {
-                        headerText += text.charAt(i);
-                        i++;
-                    }
-                    const headerElement = document.createElement('h2');
-                    headerElement.textContent = headerText.trim();
-                    element.appendChild(headerElement);
-                }
-                else if (text.charAt(i) === '#') {
-                    i++;
-                    let headerText = '';
-                    while (i < text.length && text.charAt(i) !== '\n') {
-                        headerText += text.charAt(i);
-                        i++;
-                    }
-                    const headerElement = document.createElement('h1');
-                    headerElement.textContent = headerText.trim();
-                    element.appendChild(headerElement);
-                }
-
-                // Handle links ([text](url))
-                else if (text.charAt(i) === '[') {
-                    i++;
-                    let linkText = '';
-                    while (i < text.length && text.charAt(i) !== ']') {
-                        linkText += text.charAt(i);
-                        i++;
-                    }
-                    i += 2;
-                    let urlText = '';
-                    while (i < text.length && text.charAt(i) !== ')') {
-                        urlText += text.charAt(i);
-                        i++;
-                    }
-                    i++;
-                    const linkElement = document.createElement('a');
-                    linkElement.textContent = linkText;
-                    linkElement.href = urlText;
-                    linkElement.target = '_blank';
-                    element.appendChild(linkElement);
-                }
-
-                // Handle images (![alt](url))
-                else if (text.substring(i, i + 2) === '![') {
-                    i += 2;
-                    let altText = '';
-                    while (i < text.length && text.charAt(i) !== ']') {
-                        altText += text.charAt(i);
-                        i++;
-                    }
-                    i += 2;
-                    let urlText = '';
-                    while (i < text.length && text.charAt(i) !== ')') {
-                        urlText += text.charAt(i);
-                        i++;
-                    }
-                    i++;
-                    const imgElement = document.createElement('img');
-                    imgElement.alt = altText;
-                    imgElement.src = urlText;
-                    imgElement.style.maxWidth = '100%';
-                    element.appendChild(imgElement);
-                }
-
-                // Handle horizontal rule (---)
-                else if (text.substring(i, i + 3) === '---') {
-                    i += 3;
-                    const hrElement = document.createElement('hr');
-                    element.appendChild(hrElement);
-                }
-
-                // Handle line breaks
-                else if (text.charAt(i) === '\n') {
-                    element.appendChild(document.createElement('br'));
-                    i++;
-                }
-
-                // Default: Append the character as is
-                else {
-                    let char = text.charAt(i);
-                    element.appendChild(document.createTextNode(char));
-                    i++;
-                }
-                scrollToBottom();
+        const fragment = document.createDocumentFragment();
+    
+        function appendText(value, parent = fragment) {
+            parent.appendChild(document.createTextNode(value));
+        }
+    
+        function appendDelimited(marker, tagName, nestedTagName = null) {
+            if (!text.startsWith(marker, i)) return false;
+    
+            const contentStart = i + marker.length;
+            const contentEnd = text.indexOf(marker, contentStart);
+            if (contentEnd === -1) return false;
+    
+            const outerElement = document.createElement(tagName);
+    
+            if (nestedTagName) {
+                const innerElement = document.createElement(nestedTagName);
+                innerElement.textContent = text.slice(contentStart, contentEnd);
+                outerElement.appendChild(innerElement);
             } else {
-                clearInterval(intervalId);
-                if (callback) callback();
+                outerElement.textContent = text.slice(contentStart, contentEnd);
             }
-        }, 20);
+    
+            fragment.appendChild(outerElement);
+            i = contentEnd + marker.length;
+            return true;
+        }
+
+        function safeUrl(rawUrl, allowMailto = false) {
+            try {
+                const parsed = new URL(rawUrl, window.location.href);
+                const allowedProtocols = allowMailto
+                    ? ['http:', 'https:', 'mailto:']
+                    : ['http:', 'https:'];
+    
+                return allowedProtocols.includes(parsed.protocol)
+                    ? parsed.href
+                    : null;
+            } catch (error) {
+                return null;
+            }
+        }
+
+        while (i < text.length) {
+            const atLineStart =
+                i === 0 || text.charAt(i - 1) === '\n';
+    
+            // Code block：必须放在 inline code 前面
+            if (text.startsWith('```', i)) {
+                const contentStart = i + 3;
+                const contentEnd = text.indexOf('```', contentStart);
+    
+                if (contentEnd !== -1) {
+                    let codeText = text.slice(
+                        contentStart,
+                        contentEnd
+                    );
+    
+                    codeText = codeText.replace(
+                        /^[A-Za-z0-9_+-]+\n/,
+                        ''
+                    );
+    
+                    const preElement =
+                        document.createElement('pre');
+                    const codeElement =
+                        document.createElement('code');
+    
+                    codeElement.textContent = codeText;
+                    preElement.appendChild(codeElement);
+                    fragment.appendChild(preElement);
+    
+                    i = contentEnd + 3;
+                    continue;
+                }
+            }
+
+            // Bold italic
+            if (
+                appendDelimited(
+                    '***',
+                    'strong',
+                    'em'
+                )
+            ) {
+                continue;
+            }
+    
+            // Bold
+            if (appendDelimited('**', 'strong')) {
+                continue;
+            }
+    
+            // Strikethrough
+            if (appendDelimited('~~', 'del')) {
+                continue;
+            }
+    
+            // Inline code
+            if (appendDelimited('`', 'code')) {
+                continue;
+            }
+    
+            // Italic
+            if (appendDelimited('*', 'em')) {
+                continue;
+            }
+    
+            // H3
+            if (
+                atLineStart &&
+                text.startsWith('###', i)
+            ) {
+                const end = text.indexOf('\n', i);
+                const contentEnd =
+                    end === -1 ? text.length : end;
+    
+                const heading =
+                    document.createElement('h3');
+    
+                heading.textContent = text
+                    .slice(i + 3, contentEnd)
+                    .trim();
+    
+                fragment.appendChild(heading);
+                i = contentEnd;
+                continue;
+            }
+    
+            // H2
+            if (
+                atLineStart &&
+                text.startsWith('##', i)
+            ) {
+                const end = text.indexOf('\n', i);
+                const contentEnd =
+                    end === -1 ? text.length : end;
+    
+                const heading =
+                    document.createElement('h2');
+    
+                heading.textContent = text
+                    .slice(i + 2, contentEnd)
+                    .trim();
+    
+                fragment.appendChild(heading);
+                i = contentEnd;
+                continue;
+            }
+    
+            // H1
+            if (
+                atLineStart &&
+                text.startsWith('#', i)
+            ) {
+                const end = text.indexOf('\n', i);
+                const contentEnd =
+                    end === -1 ? text.length : end;
+    
+                const heading =
+                    document.createElement('h1');
+    
+                heading.textContent = text
+                    .slice(i + 1, contentEnd)
+                    .trim();
+    
+                fragment.appendChild(heading);
+                i = contentEnd;
+                continue;
+            }
+    
+            // Blockquote
+            if (
+                atLineStart &&
+                text.startsWith('>', i)
+            ) {
+                const end = text.indexOf('\n', i);
+                const contentEnd =
+                    end === -1 ? text.length : end;
+    
+                const quote =
+                    document.createElement('blockquote');
+    
+                quote.textContent = text
+                    .slice(i + 1, contentEnd)
+                    .trim();
+    
+                fragment.appendChild(quote);
+                i = contentEnd;
+                continue;
+            }
+    
+            // Image
+            const imageMatch = text
+                .slice(i)
+                .match(
+                    /^!\[([^\]]*)\]\(([^)]+)\)/
+                );
+    
+            if (imageMatch) {
+                const imageUrl =
+                    safeUrl(imageMatch[2]);
+    
+                if (imageUrl) {
+                    const image =
+                        document.createElement('img');
+    
+                    image.alt = imageMatch[1];
+                    image.src = imageUrl;
+                    image.style.maxWidth = '100%';
+    
+                    fragment.appendChild(image);
+                } else {
+                    appendText(imageMatch[1]);
+                }
+    
+                i += imageMatch[0].length;
+                continue;
+            }
+    
+            // Link
+            const linkMatch = text
+                .slice(i)
+                .match(
+                    /^\[([^\]]+)\]\(([^)]+)\)/
+                );
+    
+            if (linkMatch) {
+                const linkUrl =
+                    safeUrl(linkMatch[2], true);
+    
+                if (linkUrl) {
+                    const link =
+                        document.createElement('a');
+    
+                    link.textContent = linkMatch[1];
+                    link.href = linkUrl;
+                    link.target = '_blank';
+                    link.rel = 'noopener noreferrer';
+    
+                    fragment.appendChild(link);
+                } else {
+                    appendText(linkMatch[1]);
+                }
+    
+                i += linkMatch[0].length;
+                continue;
+            }
+    
+            // Horizontal rule
+            if (
+                atLineStart &&
+                text.startsWith('---', i)
+            ) {
+                fragment.appendChild(
+                    document.createElement('hr')
+                );
+    
+                i += 3;
+                continue;
+            }
+    
+            // Line break
+            if (text.charAt(i) === '\n') {
+                fragment.appendChild(
+                    document.createElement('br')
+                );
+    
+                i += 1;
+                continue;
+            }
+    
+            // 一次添加一段普通文本，不再逐字添加
+            const specialCharacters = new Set([
+                '*',
+                '`',
+                '~',
+                '>',
+                '#',
+                '[',
+                '!',
+                '\n',
+                '-'
+            ]);
+    
+            let end = i + 1;
+    
+            while (
+                end < text.length &&
+                !specialCharacters.has(
+                    text.charAt(end)
+                )
+            ) {
+                end += 1;
+            }
+    
+            appendText(text.slice(i, end));
+            i = end;
+        }
+    
+        // 所有内容一次性添加到页面
+        element.appendChild(fragment);
+        scrollToBottom();
+    
+        if (callback) {
+            callback();
+        }
     }
 
     // Add messages to chat
