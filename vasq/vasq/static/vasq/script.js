@@ -411,15 +411,99 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     function parseQuestionQueue(rawText) {
-        return rawText
-            .split(/\r?\n/)
-            .map(function(line) {
-                return line
-                    .trim()
-                    .replace(/^(?:\d+[.)]|[-*\u2022])\s+/, '')
-                    .trim();
-            })
-            .filter(Boolean);
+        const lines = rawText.split(/\r?\n/);
+        const itemPattern = /^\s*(?:\d+[.)]|[-*\u2022])\s+(.+)$/;
+        const hasMarkedItems = lines.some(function(line) {
+            return itemPattern.test(line);
+        });
+
+        // Without numbering/bullets, every non-empty line is one question.
+        if (!hasMarkedItems) {
+            return lines.map(function(line) {
+                return line.trim();
+            }).filter(Boolean);
+        }
+
+        // A numbered/bulleted question may continue onto following lines.
+        const questions = [];
+        let currentQuestion = '';
+
+        lines.forEach(function(line) {
+            const match = line.match(itemPattern);
+
+            if (match) {
+                if (currentQuestion) questions.push(currentQuestion);
+                currentQuestion = match[1].trim();
+                return;
+            }
+
+            const continuation = line.trim();
+            if (continuation && currentQuestion) {
+                currentQuestion += ` ${continuation}`;
+            }
+        });
+
+        if (currentQuestion) questions.push(currentQuestion);
+        return questions;
+    }
+
+    function secondsSince(startedAt) {
+        return Math.round((performance.now() - startedAt) / 100) / 10;
+    }
+
+    function downloadBatchResults(results, requestedCount, wasStopped) {
+        const successful = results.filter(function(result) {
+            return result.success;
+        }).length;
+        const failed = results.length - successful;
+        const lines = [
+            'VasQ Batch Test Results',
+            'Generated: ' + new Date().toISOString(),
+            'Questions requested: ' + requestedCount,
+            'Questions processed: ' + results.length,
+            'Successful: ' + successful,
+            'Failed: ' + failed,
+            'Stopped early: ' + (wasStopped ? 'yes' : 'no'),
+            ''
+        ];
+
+        results.forEach(function(result, index) {
+            lines.push('='.repeat(78));
+            lines.push(`Question ${index + 1}`);
+            lines.push('='.repeat(78));
+            lines.push('Question:');
+            lines.push(result.question);
+            lines.push('');
+            lines.push('Status: ' + (result.success ? 'SUCCESS' : 'FAILED'));
+            lines.push('Elapsed seconds: ' + result.elapsedSeconds.toFixed(1));
+            lines.push('Graph returned: ' + (result.hasGraph ? 'yes' : 'no'));
+            lines.push('');
+            lines.push('Answer:');
+            lines.push(result.answer || '(No answer returned)');
+            lines.push('');
+        });
+
+        // UTF-8 BOM keeps Chinese text readable in Windows Notepad and Excel.
+        const blob = new Blob(
+            ['\uFEFF' + lines.join('\n')],
+            { type: 'text/plain;charset=utf-8' }
+        );
+        const url = window.URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        const timestamp = new Date()
+            .toISOString()
+            .replace(/[-:]/g, '')
+            .replace(/\..+$/, '')
+            .replace('T', '_');
+        const filename = `vasq_batch_results_${timestamp}.txt`;
+
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(url);
+        return filename;
     }
 
     function setQueueControls(isRunning) {
@@ -473,6 +557,7 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     async function sendQuestion(message, options = {}) {
+        const startedAt = performance.now();
         const queueIndex = options.queueIndex || null;
         const queueTotal = options.queueTotal || null;
         const resetHistory = options.resetHistory === true;
@@ -510,21 +595,29 @@ document.addEventListener("DOMContentLoaded", function() {
                 );
             }
 
-            if (data.response) {
-                addChatMessage(data.response, false);
-            } else {
-                addChatMessage('I could not generate a response.', false);
-            }
+            const answerText = data.response || 'I could not generate a response.';
+            addChatMessage(answerText, false);
 
             renderGraph(data.graph_json);
-            return true;
+            return {
+                success: true,
+                answer: answerText,
+                hasGraph: Boolean(data.graph_json),
+                elapsedSeconds: secondsSince(startedAt)
+            };
         } catch (error) {
             console.error('Error:', error);
+            const errorText = error.message || 'Could not send this question.';
             addChatMessage(
-                `${prefix}Failed: ${error.message || 'Could not send this question.'}`,
+                `${prefix}Failed: ${errorText}`,
                 false
             );
-            return false;
+            return {
+                success: false,
+                answer: errorText,
+                hasGraph: false,
+                elapsedSeconds: secondsSince(startedAt)
+            };
         } finally {
             thinkingMessage.remove();
             scrollToBottom();
@@ -581,30 +674,47 @@ document.addEventListener("DOMContentLoaded", function() {
 
             let completed = 0;
             let failed = 0;
+            const results = [];
 
             for (let index = 0; index < questions.length; index += 1) {
                 if (stopQueueRequested) break;
 
-                const succeeded = await sendQuestion(questions[index], {
+                const result = await sendQuestion(questions[index], {
                     queueIndex: index + 1,
                     queueTotal: questions.length,
                     resetHistory: true
                 });
+                results.push({
+                    question: questions[index],
+                    success: result.success,
+                    answer: result.answer,
+                    hasGraph: result.hasGraph,
+                    elapsedSeconds: result.elapsedSeconds
+                });
 
-                if (succeeded) {
+                if (result.success) {
                     completed += 1;
                 } else {
                     failed += 1;
                 }
             }
 
-            if (stopQueueRequested) {
+            const wasStopped = stopQueueRequested;
+            const resultFilename = downloadBatchResults(
+                results,
+                questions.length,
+                wasStopped
+            );
+
+            if (wasStopped) {
                 addQueueStatus(
-                    `Queue stopped. Completed: ${completed}; failed: ${failed}.`
+                    `Queue stopped. Completed: ${completed}; failed: ${failed}. ` +
+                    `Results downloaded: ${resultFilename}`
                 );
             } else {
                 addQueueStatus(
-                    `Queue finished. Completed: ${completed}; failed: ${failed}.`
+                    `Queue finished. Completed: ${completed}; failed: ${failed}. ` +
+                    `Results downloaded: ${resultFilename}`
                 );
             }
 
