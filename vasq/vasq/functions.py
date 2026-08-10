@@ -1788,7 +1788,7 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
                 "x": 0.02,
                 "xanchor": "left",
             },
-            "height": max(440, 170 + 32 * len(gene_order)),
+            "height": max(400, 170 + 32 * len(gene_order)),
             "autosize": True,
             "paper_bgcolor": "rgba(0,0,0,0)",
             "plot_bgcolor": "#ffffff",
