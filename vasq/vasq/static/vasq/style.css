@@ -155,7 +155,7 @@ img.header-logo {
   padding: 15px;
   border-radius: 15px;
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
-  line-height: 1.0;
+  line-height: 1.5;
 }
 
 .user-message {
@@ -204,4 +204,59 @@ img.header-logo {
 .footer-flex-container label {
   margin-right: 10px;
   cursor: pointer;
+}
+/* Scientific answer formatting */
+.system-message {
+  max-width: 92%;
+  line-height: 1.55;
+  font-size: 16px;
+}
+
+/* Paragraph spacing */
+.system-message p {
+  margin: 0 0 14px;
+}
+
+/* List spacing */
+.system-message li {
+  margin: 6px 0;
+  line-height: 1.5;
+}
+
+/* Table layout */
+.system-message table {
+  width: 100%;
+  margin: 16px 0;
+  border-collapse: collapse;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* Table cells */
+.system-message th,
+.system-message td {
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: top;
+  border: 1px solid rgba(50, 23, 90, 0.15);
+}
+
+/* Table header */
+.system-message th {
+  background-color: rgba(138, 180, 196, 0.20);
+  color: #32175a;
+  font-weight: 700;
+}
+
+/* Keep gene names on one line */
+.system-message th:first-child,
+.system-message td:first-child {
+  width: 80px;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+/* Alternating table rows */
+.system-message tbody tr:nth-child(even) {
+  background-color: rgba(238, 246, 248, 0.55);
 }
