@@ -1701,7 +1701,7 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
         return "<br>".join(lines)
 
     region_labels = {
-        region: wrap_axis_label(region)
+        region: region
         for region in region_order
     }
     x_values = [region_labels[region] for region in plot_df["brain_region"]]
@@ -1812,8 +1812,8 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
                     region_labels[r]
                     for r in region_order
                 ],
-                "tickangle": 0,
-                "tickfont": {"size": 14},
+                "tickangle": -90,
+                "tickfont": {"size": 13},
             
                 "showticklabels": True,
                 "showline": True,
@@ -1854,7 +1854,7 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
                 "zeroline": False,
                 "automargin": True,
             },
-            "margin": {"l": 90, "r": 100, "t": 90, "b": 125},
+            "margin": {"l": 90, "r": 100, "t": 90, "b": 230},
         },
     }
 
