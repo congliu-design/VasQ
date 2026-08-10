@@ -4,7 +4,7 @@
   <head>
     <meta charset="UTF-8" />
     <title>Chat Interface</title>
-    <link rel="stylesheet" href="{% static 'vasq/style.css' %}?v=1" />
+    <link rel="stylesheet" href="{% static 'vasq/style.css' %}?v=2" />
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
     <link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&display=swap" rel="stylesheet">
 
@@ -48,20 +48,24 @@
         <form id="chat-form" method="post" enctype="multipart/form-data">
           <div class="footer-flex-container">
             <!-- Input Box -->
-            <input
-              type="text"
+            <textarea
               id="message-input"
               name="message"
-              placeholder="Ask VasQ about brain vasculature..."
+              rows="3"
+              placeholder="Ask one question, or paste one question per line for Queue..."
               autocomplete="off"
-            />
-            <!-- Submit Button -->
-            <button type="submit" id="send-message">Send</button>
+            ></textarea>
+            <div class="send-button-group">
+              <!-- Submit one question while preserving normal chat history. -->
+              <button type="submit" id="send-message">Send</button>
+              <!-- Run one independent VasQ request per non-empty line. -->
+              <button type="button" id="run-queue">Run Queue</button>
+            </div>
           </div>
         </form>
       </footer>
     </div>
     
-    <script src="{% static 'vasq/script.js' %}"></script>
+    <script src="{% static 'vasq/script.js' %}?v=2"></script>
   </body>
 </html>
