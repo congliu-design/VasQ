@@ -2153,7 +2153,7 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
         },
     }
 
-    return json.dumps(fig)
+    return json.dumps(fig, allow_nan=False)
 
 
 ### Search Functions ###
