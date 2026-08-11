@@ -101,19 +101,68 @@ document.addEventListener("DOMContentLoaded", function() {
     async function clonePlotForPdf(plotElement, targetWidth) {
         const fallbackClone = plotElement.cloneNode(true);
         fallbackClone.classList.add('vasq-pdf-plot');
+        let renderTarget = null;
 
         try {
-            const sourceWidth = Math.max(plotElement.clientWidth, 720);
-            const sourceHeight = Math.max(plotElement.clientHeight, 420);
-            const width = Math.max(targetWidth, 720);
-            const height = Math.min(
-                650,
-                Math.max(
-                    420,
-                    Math.round(sourceHeight * width / sourceWidth)
-                )
+            const width = Math.max(Math.round(targetWidth), 720);
+            const sourceLayout = JSON.parse(JSON.stringify(
+                plotElement.layout || {}
+            ));
+            const sourceData = JSON.parse(JSON.stringify(
+                plotElement.data || []
+            ));
+            const requestedHeight = Number(sourceLayout.height) ||
+                plotElement.clientHeight || 520;
+            const height = Math.min(680, Math.max(520, requestedHeight));
+            const margin = Object.assign({}, sourceLayout.margin || {});
+
+            // A Plotly colorbar sits outside the plotting domain. Reusing the
+            // responsive browser layout in a narrower PDF image can therefore
+            // cut off the colorbar title even when the <img> itself fits. Give
+            // the PDF render a fixed canvas and reserve a safe right gutter.
+            margin.l = Math.max(Number(margin.l) || 0, 80);
+            margin.r = Math.max(Number(margin.r) || 0, 180);
+            margin.t = Math.max(Number(margin.t) || 0, 80);
+            margin.b = Math.max(Number(margin.b) || 0, 80);
+            margin.pad = Math.max(Number(margin.pad) || 0, 8);
+
+            sourceLayout.width = width;
+            sourceLayout.height = height;
+            sourceLayout.autosize = false;
+            sourceLayout.margin = margin;
+
+            sourceData.forEach(function(trace) {
+                if (!trace.marker || !trace.marker.colorbar) return;
+
+                trace.marker.colorbar.x = 1.015;
+                trace.marker.colorbar.xanchor = 'left';
+                trace.marker.colorbar.xpad = 8;
+            });
+
+            renderTarget = document.createElement('div');
+            renderTarget.setAttribute('aria-hidden', 'true');
+            renderTarget.style.position = 'fixed';
+            renderTarget.style.left = '0';
+            renderTarget.style.top = '0';
+            renderTarget.style.width = width + 'px';
+            renderTarget.style.height = height + 'px';
+            renderTarget.style.pointerEvents = 'none';
+            renderTarget.style.zIndex = '-2147483647';
+            document.body.appendChild(renderTarget);
+
+            await Plotly.newPlot(
+                renderTarget,
+                sourceData,
+                sourceLayout,
+                {
+                    staticPlot: true,
+                    responsive: false,
+                    displayModeBar: false,
+                    displaylogo: false
+                }
             );
-            const dataUrl = await Plotly.toImage(plotElement, {
+
+            const dataUrl = await Plotly.toImage(renderTarget, {
                 format: 'png',
                 width: width,
                 height: height,
@@ -126,11 +175,21 @@ document.addEventListener("DOMContentLoaded", function() {
             image.style.display = 'block';
             image.style.width = '100%';
             image.style.height = 'auto';
+            image.style.objectFit = 'contain';
             image.style.background = '#ffffff';
             return image;
         } catch (error) {
             console.warn('Could not convert Plotly graph to an image:', error);
             return fallbackClone;
+        } finally {
+            if (renderTarget) {
+                try {
+                    Plotly.purge(renderTarget);
+                } catch (error) {
+                    console.warn('Could not purge the PDF Plotly clone:', error);
+                }
+                renderTarget.remove();
+            }
         }
     }
 
