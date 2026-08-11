@@ -98,12 +98,21 @@ document.addEventListener("DOMContentLoaded", function() {
         }));
     }
 
-    async function clonePlotForPdf(plotElement) {
+    async function clonePlotForPdf(plotElement, targetWidth) {
         const fallbackClone = plotElement.cloneNode(true);
+        fallbackClone.classList.add('vasq-pdf-plot');
 
         try {
-            const width = Math.max(plotElement.clientWidth, 720);
-            const height = Math.max(plotElement.clientHeight, 420);
+            const sourceWidth = Math.max(plotElement.clientWidth, 720);
+            const sourceHeight = Math.max(plotElement.clientHeight, 420);
+            const width = Math.max(targetWidth, 720);
+            const height = Math.min(
+                650,
+                Math.max(
+                    420,
+                    Math.round(sourceHeight * width / sourceWidth)
+                )
+            );
             const dataUrl = await Plotly.toImage(plotElement, {
                 format: 'png',
                 width: width,
@@ -113,6 +122,7 @@ document.addEventListener("DOMContentLoaded", function() {
             const image = document.createElement('img');
             image.src = dataUrl;
             image.alt = plotElement.getAttribute('aria-label') || 'VasQ plot';
+            image.className = 'vasq-pdf-plot';
             image.style.display = 'block';
             image.style.width = '100%';
             image.style.height = 'auto';
@@ -122,6 +132,62 @@ document.addEventListener("DOMContentLoaded", function() {
             console.warn('Could not convert Plotly graph to an image:', error);
             return fallbackClone;
         }
+    }
+
+    function rangeContainsWideContent(startNode, endNode) {
+        let currentNode = startNode;
+
+        while (currentNode) {
+            if (
+                currentNode.classList.contains('vasq-plot-card') ||
+                currentNode.querySelector('table')
+            ) {
+                return true;
+            }
+
+            if (currentNode === endNode) break;
+            currentNode = currentNode.nextElementSibling;
+        }
+
+        return false;
+    }
+
+    function groupPdfTables(exportDocument) {
+        exportDocument.querySelectorAll(
+            '.system-message table'
+        ).forEach(function(table) {
+            let heading = table.previousElementSibling;
+
+            while (heading && heading.tagName === 'BR') {
+                const lineBreak = heading;
+                heading = heading.previousElementSibling;
+                lineBreak.remove();
+            }
+
+            const block = document.createElement('div');
+            block.className = 'vasq-pdf-table-block';
+
+            if (heading && /^H[1-6]$/.test(heading.tagName)) {
+                heading.parentNode.insertBefore(block, heading);
+                block.appendChild(heading);
+            } else {
+                table.parentNode.insertBefore(block, table);
+            }
+
+            block.appendChild(table);
+        });
+    }
+
+    function markCompactPdfMessages(exportDocument, useLandscape) {
+        const maximumHeight = useLandscape ? 650 : 980;
+
+        exportDocument.querySelectorAll(
+            '.system-message'
+        ).forEach(function(message) {
+            if (message.scrollHeight <= maximumHeight) {
+                message.classList.add('vasq-pdf-keep-together');
+            }
+        });
     }
 
     async function downloadMessageRangeAsPdf(startNode, endNode, filename) {
@@ -134,10 +200,16 @@ document.addEventListener("DOMContentLoaded", function() {
 
         const exportDocument = document.createElement('div');
         exportDocument.className = 'vasq-pdf-document';
-        exportDocument.style.width = Math.max(
-            720,
-            Math.min(messagesContainer.clientWidth || 900, 1000)
-        ) + 'px';
+        const useLandscape = rangeContainsWideContent(startNode, endNode);
+        const exportWidth = useLandscape ? 1040 : 720;
+        const plotWidth = exportWidth - 48;
+
+        exportDocument.classList.add(
+            useLandscape
+                ? 'vasq-pdf-landscape'
+                : 'vasq-pdf-portrait'
+        );
+        exportDocument.style.width = exportWidth + 'px';
         exportHost.appendChild(exportDocument);
 
         let currentNode = startNode;
@@ -146,7 +218,7 @@ document.addEventListener("DOMContentLoaded", function() {
         while (currentNode) {
             if (currentNode.classList.contains('vasq-plot-card')) {
                 exportDocument.appendChild(
-                    await clonePlotForPdf(currentNode)
+                    await clonePlotForPdf(currentNode, plotWidth)
                 );
             } else {
                 exportDocument.appendChild(currentNode.cloneNode(true));
@@ -163,7 +235,10 @@ document.addEventListener("DOMContentLoaded", function() {
             throw new Error('Could not identify the messages for this export.');
         }
 
+        groupPdfTables(exportDocument);
+
         document.body.appendChild(exportHost);
+        markCompactPdfMessages(exportDocument, useLandscape);
 
         try {
             if (document.fonts && document.fonts.ready) {
@@ -199,17 +274,63 @@ document.addEventListener("DOMContentLoaded", function() {
                     useCORS: true,
                     backgroundColor: '#ffffff',
                     logging: false,
+                    x: 0,
+                    y: 0,
+                    scrollX: 0,
+                    scrollY: 0,
                     windowWidth: exportDocument.scrollWidth,
-                    windowHeight: exportDocument.scrollHeight
+                    windowHeight: exportDocument.scrollHeight,
+                    onclone: function(clonedDocument) {
+                        // The live app centers <body> with flexbox. Reset that
+                        // in html2canvas's private clone or wide PDF content is
+                        // centered outside the capture area and loses columns.
+                        const clonedHtml = clonedDocument.documentElement;
+                        const clonedBody = clonedDocument.body;
+
+                        [clonedHtml, clonedBody].forEach(function(element) {
+                            element.style.setProperty(
+                                'display',
+                                'block',
+                                'important'
+                            );
+                            element.style.setProperty(
+                                'width',
+                                'auto',
+                                'important'
+                            );
+                            element.style.setProperty(
+                                'height',
+                                'auto',
+                                'important'
+                            );
+                            element.style.setProperty(
+                                'justify-content',
+                                'initial',
+                                'important'
+                            );
+                            element.style.setProperty(
+                                'align-items',
+                                'initial',
+                                'important'
+                            );
+                        });
+                    }
                 },
                 jsPDF: {
                     unit: 'mm',
                     format: 'a4',
-                    orientation: 'portrait'
+                    orientation: useLandscape ? 'landscape' : 'portrait'
                 },
                 pagebreak: {
                     mode: ['css', 'legacy'],
-                    avoid: ['.user-message', '.queue-status-message', '.vasq-plot-card']
+                    avoid: [
+                        '.user-message',
+                        '.queue-status-message',
+                        '.vasq-pdf-keep-together',
+                        '.vasq-pdf-plot',
+                        '.vasq-pdf-table-block',
+                        '.vasq-pdf-document tr'
+                    ]
                 }
             };
 
