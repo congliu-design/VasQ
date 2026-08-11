@@ -3216,7 +3216,7 @@ def _chat_impl(user_input, history, should_stop=None):
             drug_result=drug_result,
         )
     _raise_if_cancelled(should_stop)
-    logger.info("Final message returned to UI: %r", final_message)
+    logger.info("Final message generated: %r", final_message)
     update_history(history, "assistant", final_message)
 
     return final_message, history, graph_json
