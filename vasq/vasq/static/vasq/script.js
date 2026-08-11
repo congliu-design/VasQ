@@ -91,12 +91,16 @@ document.addEventListener("DOMContentLoaded", function() {
             throw new Error('There are no messages to export.');
         }
 
+        const exportHost = document.createElement('div');
+        exportHost.className = 'vasq-pdf-host';
+
         const exportDocument = document.createElement('div');
         exportDocument.className = 'vasq-pdf-document';
         exportDocument.style.width = Math.max(
             720,
             Math.min(messagesContainer.clientWidth || 900, 1000)
         ) + 'px';
+        exportHost.appendChild(exportDocument);
 
         let currentNode = startNode;
         let reachedEnd = false;
@@ -121,7 +125,7 @@ document.addEventListener("DOMContentLoaded", function() {
             throw new Error('Could not identify the messages for this export.');
         }
 
-        document.body.appendChild(exportDocument);
+        document.body.appendChild(exportHost);
 
         try {
             if (document.fonts && document.fonts.ready) {
@@ -129,15 +133,36 @@ document.addEventListener("DOMContentLoaded", function() {
             }
             await waitForImages(exportDocument);
 
+            // Give the off-screen document two paint frames before html2canvas
+            // clones it. The document itself remains in normal flow so the
+            // html2pdf clone receives its full width and height.
+            await new Promise(function(resolve) {
+                requestAnimationFrame(function() {
+                    requestAnimationFrame(resolve);
+                });
+            });
+
+            if (!exportDocument.offsetWidth || !exportDocument.offsetHeight) {
+                throw new Error('The PDF document did not render.');
+            }
+
+            const longestSide = Math.max(
+                exportDocument.scrollWidth,
+                exportDocument.scrollHeight
+            );
+            const canvasScale = Math.min(2, 28000 / longestSide);
+
             const opt = {
                 margin: [10, 10, 10, 10],
                 filename: filename,
                 image: { type: 'jpeg', quality: 0.98 },
                 html2canvas: {
-                    scale: 2,
+                    scale: Math.max(0.5, canvasScale),
                     useCORS: true,
                     backgroundColor: '#ffffff',
-                    logging: false
+                    logging: false,
+                    windowWidth: exportDocument.scrollWidth,
+                    windowHeight: exportDocument.scrollHeight
                 },
                 jsPDF: {
                     unit: 'mm',
@@ -152,7 +177,7 @@ document.addEventListener("DOMContentLoaded", function() {
 
             await html2pdf().set(opt).from(exportDocument).save();
         } finally {
-            exportDocument.remove();
+            exportHost.remove();
         }
 
         return filename;

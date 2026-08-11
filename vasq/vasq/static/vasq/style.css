@@ -226,13 +226,19 @@ img.header-logo {
   text-align: center;
 }
 
-/* Off-screen document used by html2pdf. It mirrors the message column while
-   allowing the full queue to be rendered instead of only the scroll viewport. */
-.vasq-pdf-document {
+/* Keep the live export preview outside the viewport. The document itself must
+   stay in normal flow or html2pdf will clone it with zero height. */
+.vasq-pdf-host {
   position: absolute;
   left: -10000px;
   top: 0;
-  z-index: 0;
+  pointer-events: none;
+}
+
+/* Off-screen document used by html2pdf. It mirrors the message column while
+   allowing the full queue to be rendered instead of only the scroll viewport. */
+.vasq-pdf-document {
+  position: static;
   display: flex;
   flex-direction: column;
   gap: 15px;
