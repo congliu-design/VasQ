@@ -249,12 +249,16 @@ img.header-logo {
   text-align: center;
 }
 
-/* Keep the live export preview outside the viewport. The document itself must
-   stay in normal flow or html2pdf will clone it with zero height. */
+/* Render the temporary PDF document behind the live app at page coordinate 0.
+   A large negative left offset can be copied by html2canvas and crop columns. */
 .vasq-pdf-host {
-  position: absolute;
-  left: -10000px;
+  position: fixed;
+  left: 0;
   top: 0;
+  width: 0;
+  height: 0;
+  overflow: visible;
+  z-index: -2147483647;
   pointer-events: none;
 }
 
@@ -273,12 +277,102 @@ img.header-logo {
   word-wrap: break-word;
 }
 
-.vasq-pdf-document > img,
-.vasq-pdf-document > .vasq-plot-card {
-  align-self: stretch;
-  max-width: 100%;
+.vasq-pdf-document > * {
+  box-sizing: border-box;
+  flex: 0 0 auto;
+}
+
+.vasq-pdf-document .system-message,
+.vasq-pdf-document .user-message,
+.vasq-pdf-document .queue-status-message {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: none;
+  overflow: visible;
+  font-size: 14px;
+}
+
+.vasq-pdf-document .system-message table {
+  width: 100%;
+  min-width: 0;
+  table-layout: fixed;
+  margin: 12px 0 18px;
+  font-size: 11px;
+  line-height: 1.3;
   break-inside: avoid;
   page-break-inside: avoid;
+}
+
+.vasq-pdf-document .vasq-pdf-table-block {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.vasq-pdf-document .vasq-pdf-keep-together {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.vasq-pdf-document .vasq-pdf-table-block > h1,
+.vasq-pdf-document .vasq-pdf-table-block > h2,
+.vasq-pdf-document .vasq-pdf-table-block > h3,
+.vasq-pdf-document .vasq-pdf-table-block > h4,
+.vasq-pdf-document .vasq-pdf-table-block > h5,
+.vasq-pdf-document .vasq-pdf-table-block > h6 {
+  margin-bottom: 8px;
+}
+
+.vasq-pdf-document .vasq-pdf-table-block > table {
+  margin-top: 0;
+}
+
+.vasq-pdf-document .system-message th,
+.vasq-pdf-document .system-message td {
+  min-width: 0;
+  padding: 6px 7px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.vasq-pdf-document .system-message th:first-child,
+.vasq-pdf-document .system-message td:first-child {
+  width: 22%;
+  min-width: 0;
+}
+
+.vasq-pdf-document .system-message th:nth-child(2),
+.vasq-pdf-document .system-message td:nth-child(2) {
+  width: 26%;
+  min-width: 0;
+}
+
+.vasq-pdf-document .system-message th:nth-child(n+3),
+.vasq-pdf-document .system-message td:nth-child(n+3) {
+  white-space: normal;
+}
+
+.vasq-pdf-document .system-message tr {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.vasq-pdf-document .vasq-pdf-plot {
+  display: block;
+  align-self: stretch;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  object-fit: contain;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.vasq-pdf-document .vasq-pdf-plot .plot-container,
+.vasq-pdf-document .vasq-pdf-plot .svg-container,
+.vasq-pdf-document .vasq-pdf-plot svg {
+  width: 100% !important;
+  max-width: 100% !important;
 }
 
 /* FOOTER */
