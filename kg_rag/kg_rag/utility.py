@@ -185,7 +185,7 @@ def get_GPT_response(instruction, system_prompt, chat_model_id, chat_deployment_
     return fetch_GPT_response(instruction, system_prompt, chat_model_id, chat_deployment_id, temperature)
 
 def stream_out(output):
-    CHUNK_SIZE = int(round(len(output)/50))
+    CHUNK_SIZE = max(1, int(round(len(output)/50)))
     SLEEP_TIME = 0.1
     for i in range(0, len(output), CHUNK_SIZE):
         print(output[i:i+CHUNK_SIZE], end='')
@@ -277,6 +277,61 @@ def load_sentence_transformer(sentence_embedding_model):
 def load_chroma(vector_db_path, sentence_embedding_model):
     embedding_function = load_sentence_transformer(sentence_embedding_model)
     return Chroma(persist_directory=vector_db_path, embedding_function=embedding_function)
+
+
+def select_balanced_neighbor_rows(
+    context_table,
+    neighbor_node_types,
+    max_per_type,
+):
+    """Keep a small, balanced set of direct SPOKE relationships."""
+    if context_table is None or context_table.empty:
+        return pd.DataFrame()
+
+    selected_parts = []
+    source_names = context_table["source"].fillna("").astype(str)
+    target_names = context_table["target"].fillna("").astype(str)
+
+    for neighbor_type in neighbor_node_types or []:
+        prefix = f"{neighbor_type} "
+        type_rows = context_table[
+            source_names.str.startswith(prefix)
+            | target_names.str.startswith(prefix)
+        ].drop_duplicates(subset=["source", "edge_type", "target"])
+
+        if type_rows.empty:
+            continue
+
+        # Preserve several edge types instead of allowing a single dense
+        # relationship class to consume the whole quota.
+        edge_groups = [
+            group
+            for _edge_type, group in type_rows.groupby("edge_type", sort=True)
+        ]
+        chosen_indices = []
+        row_offset = 0
+        while len(chosen_indices) < max_per_type:
+            added_row = False
+            for group in edge_groups:
+                if row_offset < len(group):
+                    chosen_indices.append(group.index[row_offset])
+                    added_row = True
+                    if len(chosen_indices) >= max_per_type:
+                        break
+            if not added_row:
+                break
+            row_offset += 1
+
+        selected_parts.append(context_table.loc[chosen_indices])
+
+    if not selected_parts:
+        return context_table.head(max_per_type).copy()
+
+    return (
+        pd.concat(selected_parts, ignore_index=False)
+        .drop_duplicates(subset=["source", "edge_type", "target"])
+        .copy()
+    )
 
 def retrieve_context(
     question,
@@ -407,7 +462,7 @@ def retrieve_context(
         )
     )
 
-    question_embedding = embedding_function.embed_query(question)
+    question_embedding = None
     max_context_per_node = max(1, int(context_volume / len(deduplicated_lookups)))
     extracted_context_parts = []
 
@@ -449,31 +504,80 @@ def retrieve_context(
             print(f"No SPOKE relationships returned for {lookup['node_type']} {lookup['value']}")
             continue
 
-        node_context_embeddings = embedding_function.embed_documents(node_context_list)
-        similarities = [
-            float(
-                cosine_similarity(
-                    np.array(question_embedding).reshape(1, -1),
-                    np.array(node_context_embedding).reshape(1, -1),
-                )[0][0]
+        selected_table = pd.DataFrame()
+
+        if (
+            lookup["source"] == "direct gene lookup"
+            and context_table is not None
+            and not context_table.empty
+        ):
+            max_per_type = max(
+                1,
+                int(os.environ.get("SPOKE_MAX_RELATIONSHIPS_PER_TYPE", "20")),
             )
-            for node_context_embedding in node_context_embeddings
-        ]
+            selected_table = select_balanced_neighbor_rows(
+                context_table,
+                lookup["neighbor_node_types"],
+                max_per_type,
+            )
+            selected_context = (
+                selected_table["context"].dropna().astype(str).tolist()
+            )
+            selected_counts = {
+                neighbor_type: int(
+                    selected_table["source"].fillna("").astype(str).str.startswith(
+                        f"{neighbor_type} "
+                    ).sum()
+                    + selected_table["target"].fillna("").astype(str).str.startswith(
+                        f"{neighbor_type} "
+                    ).sum()
+                )
+                for neighbor_type in lookup["neighbor_node_types"]
+            }
+            print(
+                f"Direct Gene context selected for {lookup['value']}: "
+                f"{selected_counts}"
+            )
+        else:
+            if question_embedding is None:
+                question_embedding = embedding_function.embed_query(question)
 
-        ranked_similarities = sorted(
-            [(score, index) for index, score in enumerate(similarities)],
-            reverse=True,
-        )
-        percentile_threshold = float(
-            np.percentile(similarities, context_sim_threshold)
-        )
-        selected_indices = [
-            index
-            for score, index in ranked_similarities
-            if score >= percentile_threshold and score >= context_sim_min_threshold
-        ][:max_context_per_node]
+            node_context_embeddings = embedding_function.embed_documents(
+                node_context_list
+            )
+            similarities = [
+                float(
+                    cosine_similarity(
+                        np.array(question_embedding).reshape(1, -1),
+                        np.array(node_context_embedding).reshape(1, -1),
+                    )[0][0]
+                )
+                for node_context_embedding in node_context_embeddings
+            ]
 
-        selected_context = [node_context_list[index] for index in selected_indices]
+            ranked_similarities = sorted(
+                [(score, index) for index, score in enumerate(similarities)],
+                reverse=True,
+            )
+            percentile_threshold = float(
+                np.percentile(similarities, context_sim_threshold)
+            )
+            selected_indices = [
+                index
+                for score, index in ranked_similarities
+                if score >= percentile_threshold
+                and score >= context_sim_min_threshold
+            ][:max_context_per_node]
+
+            selected_context = [
+                node_context_list[index]
+                for index in selected_indices
+            ]
+            if context_table is not None and not context_table.empty:
+                selected_table = context_table[
+                    context_table.context.isin(selected_context)
+                ].copy()
+
         if not selected_context:
             print(
                 f"No relationships passed the similarity threshold for "
@@ -481,10 +585,7 @@ def retrieve_context(
             )
             continue
 
-        if edge_evidence and context_table is not None and not context_table.empty:
-            selected_table = context_table[
-                context_table.context.isin(selected_context)
-            ].copy()
+        if edge_evidence and not selected_table.empty:
             selected_table.loc[:, "context"] = (
                 selected_table.source
                 + " "
