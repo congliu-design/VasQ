@@ -226,6 +226,32 @@ img.header-logo {
   text-align: center;
 }
 
+/* Off-screen document used by html2pdf. It mirrors the message column while
+   allowing the full queue to be rendered instead of only the scroll viewport. */
+.vasq-pdf-document {
+  position: absolute;
+  left: -10000px;
+  top: 0;
+  z-index: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  box-sizing: border-box;
+  padding: 24px;
+  overflow: visible;
+  background: var(--background);
+  font-family: var(--ff-all);
+  word-wrap: break-word;
+}
+
+.vasq-pdf-document > img,
+.vasq-pdf-document > .vasq-plot-card {
+  align-self: stretch;
+  max-width: 100%;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
 /* FOOTER */
 
 .footer-flex-container {

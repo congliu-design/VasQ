@@ -39,25 +39,142 @@ document.addEventListener("DOMContentLoaded", function() {
     
     // A new ID is generated every time a chat page is opened.
     const tabChatId = createChatId();
-    // Export chat as PDF
-    document.getElementById('export-pdf').addEventListener('click', function() {
-        const element = document.getElementById('messages-container');
-        const opt = {
-            margin: [0, 0, 0, 0],
-            filename: 'chat_history.pdf',
-            image: { type: 'jpeg', quality: 1.0 },
-            html2canvas: {
-                scale: 2,
-                windowWidth: element.scrollWidth,
-                windowHeight: element.scrollHeight,
-            },
-            jsPDF: {
-                unit: 'px',
-                format: [element.scrollWidth, element.scrollHeight],
-                orientation: 'portrait',
+    function exportTimestamp() {
+        return new Date()
+            .toISOString()
+            .replace(/[-:]/g, '')
+            .replace(/\..+$/, '')
+            .replace('T', '_');
+    }
+
+    function waitForImages(element) {
+        const images = Array.from(element.querySelectorAll('img'));
+
+        return Promise.all(images.map(function(image) {
+            if (image.complete) return Promise.resolve();
+
+            return new Promise(function(resolve) {
+                image.addEventListener('load', resolve, { once: true });
+                image.addEventListener('error', resolve, { once: true });
+            });
+        }));
+    }
+
+    async function clonePlotForPdf(plotElement) {
+        const fallbackClone = plotElement.cloneNode(true);
+
+        try {
+            const width = Math.max(plotElement.clientWidth, 720);
+            const height = Math.max(plotElement.clientHeight, 420);
+            const dataUrl = await Plotly.toImage(plotElement, {
+                format: 'png',
+                width: width,
+                height: height,
+                scale: 2
+            });
+            const image = document.createElement('img');
+            image.src = dataUrl;
+            image.alt = plotElement.getAttribute('aria-label') || 'VasQ plot';
+            image.style.display = 'block';
+            image.style.width = '100%';
+            image.style.height = 'auto';
+            image.style.background = '#ffffff';
+            return image;
+        } catch (error) {
+            console.warn('Could not convert Plotly graph to an image:', error);
+            return fallbackClone;
+        }
+    }
+
+    async function downloadMessageRangeAsPdf(startNode, endNode, filename) {
+        if (!startNode || !endNode) {
+            throw new Error('There are no messages to export.');
+        }
+
+        const exportDocument = document.createElement('div');
+        exportDocument.className = 'vasq-pdf-document';
+        exportDocument.style.width = Math.max(
+            720,
+            Math.min(messagesContainer.clientWidth || 900, 1000)
+        ) + 'px';
+
+        let currentNode = startNode;
+        let reachedEnd = false;
+
+        while (currentNode) {
+            if (currentNode.classList.contains('vasq-plot-card')) {
+                exportDocument.appendChild(
+                    await clonePlotForPdf(currentNode)
+                );
+            } else {
+                exportDocument.appendChild(currentNode.cloneNode(true));
             }
-        };
-        html2pdf().set(opt).from(element).save();
+
+            if (currentNode === endNode) {
+                reachedEnd = true;
+                break;
+            }
+            currentNode = currentNode.nextElementSibling;
+        }
+
+        if (!reachedEnd) {
+            throw new Error('Could not identify the messages for this export.');
+        }
+
+        document.body.appendChild(exportDocument);
+
+        try {
+            if (document.fonts && document.fonts.ready) {
+                await document.fonts.ready;
+            }
+            await waitForImages(exportDocument);
+
+            const opt = {
+                margin: [10, 10, 10, 10],
+                filename: filename,
+                image: { type: 'jpeg', quality: 0.98 },
+                html2canvas: {
+                    scale: 2,
+                    useCORS: true,
+                    backgroundColor: '#ffffff',
+                    logging: false
+                },
+                jsPDF: {
+                    unit: 'mm',
+                    format: 'a4',
+                    orientation: 'portrait'
+                },
+                pagebreak: {
+                    mode: ['css', 'legacy'],
+                    avoid: ['.user-message', '.queue-status-message', '.vasq-plot-card']
+                }
+            };
+
+            await html2pdf().set(opt).from(exportDocument).save();
+        } finally {
+            exportDocument.remove();
+        }
+
+        return filename;
+    }
+
+    // Export all currently displayed messages as a PDF.
+    document.getElementById('export-pdf').addEventListener('click', async function() {
+        const firstMessage = messagesContainer.firstElementChild;
+        const lastMessage = messagesContainer.lastElementChild;
+
+        if (!firstMessage || !lastMessage) return;
+
+        try {
+            await downloadMessageRangeAsPdf(
+                firstMessage,
+                lastMessage,
+                'chat_history.pdf'
+            );
+        } catch (error) {
+            console.error('Could not export chat PDF:', error);
+            addQueueStatus('The PDF could not be generated. Please try again.');
+        }
     });
 
     // Export chat as text file
@@ -521,11 +638,7 @@ document.addEventListener("DOMContentLoaded", function() {
         );
         const url = window.URL.createObjectURL(blob);
         const link = document.createElement('a');
-        const timestamp = new Date()
-            .toISOString()
-            .replace(/[-:]/g, '')
-            .replace(/\..+$/, '')
-            .replace('T', '_');
+        const timestamp = exportTimestamp();
         const filename = `vasq_batch_results_${timestamp}.txt`;
 
         link.href = url;
@@ -702,7 +815,9 @@ document.addEventListener("DOMContentLoaded", function() {
             messageInput.value = '';
             stopQueueRequested = false;
             setQueueControls(true);
-            addQueueStatus(`Queue started: ${questions.length} question(s).`);
+            const queueStartMessage = addQueueStatus(
+                `Queue started: ${questions.length} question(s).`
+            );
 
             let completed = 0;
             let failed = 0;
@@ -733,22 +848,31 @@ document.addEventListener("DOMContentLoaded", function() {
             }
 
             const wasStopped = stopQueueRequested;
-            const resultFilename = downloadBatchResults(
-                results,
-                questions.length,
-                wasStopped
+            const pdfFilename =
+                `vasq_batch_results_${exportTimestamp()}.pdf`;
+            const completionText = wasStopped
+                ? `Queue stopped. Completed: ${completed}; failed: ${failed}. `
+                : `Queue finished. Completed: ${completed}; failed: ${failed}. `;
+            const queueEndMessage = addQueueStatus(
+                completionText + `PDF: ${pdfFilename}`
             );
 
-            if (wasStopped) {
-                addQueueStatus(
-                    `Queue stopped. Completed: ${completed}; failed: ${failed}. ` +
-                    `Results downloaded: ${resultFilename}`
+            try {
+                await downloadMessageRangeAsPdf(
+                    queueStartMessage,
+                    queueEndMessage,
+                    pdfFilename
                 );
-            } else {
-                addQueueStatus(
-                    `Queue finished. Completed: ${completed}; failed: ${failed}. ` +
-                    `Results downloaded: ${resultFilename}`
+            } catch (error) {
+                console.error('Could not export queue PDF:', error);
+                const fallbackFilename = downloadBatchResults(
+                    results,
+                    questions.length,
+                    wasStopped
                 );
+                queueEndMessage.textContent =
+                    completionText +
+                    `PDF export failed; text fallback downloaded: ${fallbackFilename}`;
             }
 
             stopQueueRequested = false;
