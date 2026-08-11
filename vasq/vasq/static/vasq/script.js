@@ -551,7 +551,7 @@ document.addEventListener("DOMContentLoaded", function() {
         }
     }
 
-    function renderGraph(graphJsonValue) {
+    async function renderGraph(graphJsonValue) {
         if (!graphJsonValue) return;
 
         try {
@@ -565,7 +565,7 @@ document.addEventListener("DOMContentLoaded", function() {
                 'VasQ gene expression across brain regions'
             );
             messagesContainer.appendChild(graphDiv);
-            Plotly.react(
+            await Plotly.newPlot(
                 graphDiv,
                 graphJson.data,
                 graphJson.layout,
@@ -630,7 +630,7 @@ document.addEventListener("DOMContentLoaded", function() {
             const answerText = data.response || 'I could not generate a response.';
             addChatMessage(answerText, false);
 
-            renderGraph(data.graph_json);
+            await renderGraph(data.graph_json);
             return {
                 success: true,
                 answer: answerText,
