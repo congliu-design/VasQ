@@ -313,7 +313,23 @@ def search_scientific_web(user_input, kg_context=None, kg_assessment=None):
             "OPENAI_SCIENTIFIC_SEARCH_CONTEXT_SIZE", "high"
         ),
     )
+    
+def search_gene_fallback(user_input):
+    """Focused fallback when the main scientific search returns no genes."""
 
+    return run_openai_web_search(
+        (
+            "Identify up to 10 well-established human genes associated with "
+            "the disease or biological condition in the question below. "
+            "Prioritize causal genes and strongly supported risk genes. "
+            "Use official human gene symbols. Provide concise supporting "
+            "evidence and citations from authoritative genetics resources "
+            "or peer-reviewed literature. Do not invent associations.\n\n"
+            f"Question: {user_input}"
+        ),
+        stage_name="gene_fallback_web_search",
+        search_context_size="low",
+    )
 
 def search_drugs_and_small_molecules(user_input, genes=None, diseases=None):
     """Search current drug/small-molecule evidence for genes or diseases."""
@@ -2873,10 +2889,83 @@ def _chat_impl(user_input, history):
     genes = derive_genes_from_first_search(
         resolved_question,
         scientific_web_result,
-        kg_result=kg_result if kg_assessment.get("relevant") else None,
+        kg_result=(
+            kg_result
+            if kg_assessment.get("relevant")
+            else None
+        ),
         existing_genes=genes,
     )
-    logger.info("Gene list after first search: %s", genes)
+    
+    logger.info(
+        "Gene list after primary scientific search: %s",
+        genes,
+    )
+    
+    # Run a smaller, focused Web Search when a matrix-expression question
+    # needs genes but the primary search did not resolve any.
+    needs_gene_fallback = (
+        intent.get("asks_expression")
+        and not intent.get("asks_markers")
+        and not user_supplied_genes
+        and not genes
+    )
+    
+    if needs_gene_fallback:
+        logger.warning(
+            "Primary evidence resolved no genes; "
+            "starting focused gene fallback search"
+        )
+    
+        try:
+            fallback_web_result = search_gene_fallback(
+                resolved_question
+            )
+        except Exception:
+            logger.exception(
+                "Focused gene fallback search failed"
+            )
+            fallback_web_result = None
+    
+        if fallback_web_result:
+            fallback_genes = derive_genes_from_first_search(
+                resolved_question,
+                fallback_web_result,
+                kg_result=None,
+                existing_genes=[],
+            )
+
+            genes = list(
+                dict.fromkeys(
+                    genes + fallback_genes
+                )
+            )[:20]
+    
+            # Preserve fallback evidence for final synthesis and citations.
+            evidence_parts = [
+                part
+                for part in [
+                    scientific_web_result,
+                    (
+                        "Focused fallback gene evidence:\n"
+                        + fallback_web_result
+                    ),
+                ]
+                if part
+            ]
+    
+            scientific_web_result = "\n\n".join(
+                evidence_parts
+            )
+    
+            logger.info(
+                "Gene list after fallback search: %s",
+                genes,
+            )
+        else:
+            logger.warning(
+                "Focused gene fallback search returned no evidence"
+            )
 
     # Branch B: calculate expression for the explicit or first-search-derived
     # gene list. Marker/rank questions use the ranked marker table; measured
