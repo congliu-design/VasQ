@@ -151,6 +151,13 @@ img.header-logo {
   word-wrap: break-word;
 }
 
+/* Keep Plotly charts readable on ultra-wide screens. */
+.vasq-plot-card {
+  align-self: center;
+  width: 100%;
+  max-width: 1400px;
+}
+
 .system-message, .user-message {
   word-wrap: break-word;
   overflow-wrap: break-word;
