@@ -27,20 +27,38 @@ B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
 
 def get_spoke_api_resp(base_uri, end_point, params=None):
     uri = base_uri + end_point
-    if params:
-        return requests.get(uri, params=params)
-    else:
-        return requests.get(uri)
+    timeout_seconds = float(os.environ.get("SPOKE_API_TIMEOUT_SECONDS", "20"))
+    return requests.get(uri, params=params, timeout=timeout_seconds)
 
-@retry(wait=wait_random_exponential(min=10, max=30), stop=stop_after_attempt(5))
-def get_context_using_spoke_api(node_value):
+@retry(wait=wait_random_exponential(min=1, max=4), stop=stop_after_attempt(2))
+def get_context_using_spoke_api(
+    node_value,
+    node_type="Disease",
+    attribute="name",
+    neighbor_node_types=None,
+):
+    """Fetch one-hop SPOKE context for a typed node.
+
+    ``neighbor_node_types`` limits the returned neighborhood.  For example,
+    a Gene query can request only Disease, Pathway, and Compound neighbors.
+    """
     type_end_point = "/api/v1/types"
     result = get_spoke_api_resp(config_data['BASE_URI'], type_end_point)
+    result.raise_for_status()
     data_spoke_types = result.json()
     node_types = list(data_spoke_types["nodes"].keys())
     edge_types = list(data_spoke_types["edges"].keys())
     node_types_to_remove = ["DatabaseTimestamp", "Version"]
     filtered_node_types = [node_type for node_type in node_types if node_type not in node_types_to_remove]
+
+    if neighbor_node_types:
+        requested_neighbor_types = set(neighbor_node_types)
+        filtered_node_types = [
+            candidate
+            for candidate in filtered_node_types
+            if candidate in requested_neighbor_types
+        ]
+
     api_params = {
         'node_filters' : filtered_node_types,
         'edge_filters': edge_types,
@@ -54,38 +72,51 @@ def get_context_using_spoke_api(node_value):
         'cutoff_DpL_average_prevalence': config_data['cutoff_DpL_average_prevalence'],
         'depth' : config_data['depth']
     }
-    node_type = "Disease"
-    attribute = "name"
     nbr_end_point = "/api/v1/neighborhood/{}/{}/{}".format(node_type, attribute, node_value)
     result = get_spoke_api_resp(config_data['BASE_URI'], nbr_end_point, params=api_params)
+    result.raise_for_status()
     node_context = result.json()
+
+    if not isinstance(node_context, list) or not node_context:
+        return "", pd.DataFrame(
+            columns=["source", "edge_type", "target", "provenance", "evidence", "predicate", "context"]
+        )
+
     nbr_nodes = []
     nbr_edges = []
+    root_data = None
+
     for item in node_context:
-        if "_" not in item["data"]["neo4j_type"]:
+        item_data = item.get("data", {})
+        neo4j_type = item_data.get("neo4j_type", "")
+
+        if item_data.get("neo4j_root") == 1:
+            root_data = item_data
+
+        if "_" not in neo4j_type:
             try:
-                if item["data"]["neo4j_type"] == "Protein":
-                    nbr_nodes.append((item["data"]["neo4j_type"], item["data"]["id"], item["data"]["properties"]["description"]))
+                if neo4j_type == "Protein":
+                    nbr_nodes.append((neo4j_type, item_data["id"], item_data["properties"]["description"]))
                 else:
-                    nbr_nodes.append((item["data"]["neo4j_type"], item["data"]["id"], item["data"]["properties"]["name"]))
+                    nbr_nodes.append((neo4j_type, item_data["id"], item_data["properties"]["name"]))
             except:
-                nbr_nodes.append((item["data"]["neo4j_type"], item["data"]["id"], item["data"]["properties"]["identifier"]))
-        elif "_" in item["data"]["neo4j_type"]:
+                nbr_nodes.append((neo4j_type, item_data["id"], item_data["properties"]["identifier"]))
+        elif "_" in neo4j_type:
             try:
-                provenance = ", ".join(item["data"]["properties"]["sources"])
+                provenance = ", ".join(item_data["properties"]["sources"])
             except:
                 try:
-                    provenance = item["data"]["properties"]["source"]
+                    provenance = item_data["properties"]["source"]
                     if isinstance(provenance, list):
                         provenance = ", ".join(provenance)                    
                 except:
                     try:                    
-                        preprint_list = ast.literal_eval(item["data"]["properties"]["preprint_list"])
+                        preprint_list = ast.literal_eval(item_data["properties"]["preprint_list"])
                         if len(preprint_list) > 0:                                                    
                             provenance = ", ".join(preprint_list)
                         else:
-                            pmid_list = ast.literal_eval(item["data"]["properties"]["pmid_list"])
-                            pmid_list = map(lambda x:"pubmedId:"+x, pmid_list)
+                            pmid_list = ast.literal_eval(item_data["properties"]["pmid_list"])
+                            pmid_list = ["pubmedId:" + str(x) for x in pmid_list]
                             if len(pmid_list) > 0:
                                 provenance = ", ".join(pmid_list)
                             else:
@@ -93,10 +124,16 @@ def get_context_using_spoke_api(node_value):
                     except:                                
                         provenance = "SPOKE-KG"     
             try:
-                evidence = item["data"]["properties"]
+                evidence = item_data["properties"]
             except:
                 evidence = None
-            nbr_edges.append((item["data"]["source"], item["data"]["neo4j_type"], item["data"]["target"], provenance, evidence))
+            nbr_edges.append((item_data["source"], neo4j_type, item_data["target"], provenance, evidence))
+
+    if not nbr_nodes or not nbr_edges:
+        return "", pd.DataFrame(
+            columns=["source", "edge_type", "target", "provenance", "evidence", "predicate", "context"]
+        )
+
     nbr_nodes_df = pd.DataFrame(nbr_nodes, columns=["node_type", "node_id", "node_name"])
     nbr_edges_df = pd.DataFrame(nbr_edges, columns=["source", "edge_type", "target", "provenance", "evidence"])
     merge_1 = pd.merge(nbr_edges_df, nbr_nodes_df, left_on="source", right_on="node_id").drop("node_id", axis=1)
@@ -111,7 +148,18 @@ def get_context_using_spoke_api(node_value):
     merge_2.loc[:, "predicate"] = merge_2.edge_type.apply(lambda x:x.split("_")[0])
     merge_2.loc[:, "context"] =  merge_2.source + " " + merge_2.predicate.str.lower() + " " + merge_2.target + " and Provenance of this association is " + merge_2.provenance + "."
     context = merge_2.context.str.cat(sep=' ')
-    context += node_value + " has a " + node_context[0]["data"]["properties"]["source"] + " identifier of " + node_context[0]["data"]["properties"]["identifier"] + " and Provenance of this is from " + node_context[0]["data"]["properties"]["source"] + "."
+
+    if root_data:
+        root_properties = root_data.get("properties", {})
+        root_source = root_properties.get("source") or root_properties.get("sources") or "SPOKE-KG"
+        if isinstance(root_source, list):
+            root_source = ", ".join(dict.fromkeys(map(str, root_source)))
+        root_identifier = root_properties.get("identifier", node_value)
+        context += (
+            f" {node_type} {node_value} has identifier {root_identifier} "
+            f"and provenance {root_source}."
+        )
+
     return context, merge_2
 
 @retry(wait=wait_random_exponential(min=10, max=30), stop=stop_after_attempt(5))
@@ -241,187 +289,221 @@ def retrieve_context(
     edge_evidence,
     api=True
 ):
-    
     entity_dict = biomedical_entity_extractor(question)
+    extracted_entities = {
+        key: [str(item).strip() for item in entity_dict.get(key, []) if str(item).strip()]
+        for key in ["Genes_Proteins", "Diseases", "Drugs", "Pathways"]
+    }
+    print(f"Biomedical entities extracted by type: {extracted_entities}")
 
-    entities = []
-    for key in ["Genes_Proteins", "Diseases", "Drugs", "Pathways"]:
-        for item in entity_dict.get(key, []):
-            if item and item not in entities:
-                entities.append(item)
+    # Each lookup keeps the SPOKE node type.  Only Diseases use the existing
+    # disease-only CSV/Chroma store for exact and fuzzy resolution.
+    spoke_lookups = []
 
-    print(f"Biomedical entities extracted: {entities}")
-    node_hits = []
+    for entity in extracted_entities["Genes_Proteins"]:
+        spoke_lookups.append(
+            {
+                "value": entity,
+                "node_type": "Gene",
+                "attribute": "name",
+                "neighbor_node_types": ["Disease", "Pathway", "Compound"],
+                "source": "direct gene lookup",
+            }
+        )
 
-    if entities:
-        max_number_of_high_similarity_context_per_node = int(context_volume / max(1, len(entities)))
-       
-        for entity in entities:
-            exact_matches = find_exact_node_matches(entity, node_context_df)
+    for entity in extracted_entities["Diseases"]:
+        disease_names = find_exact_node_matches(entity, node_context_df)
 
-            if exact_matches:
-                print(f"Exact node match for entity {entity}: {exact_matches[:3]}")
-                node_hits.extend(exact_matches[:3])
+        if not disease_names:
+            disease_hits = vectorstore.similarity_search_with_score(entity, k=3)
+            disease_names = [
+                doc.page_content
+                for doc, _score in disease_hits
+                if getattr(doc, "page_content", None)
+            ]
+            if disease_names:
+                print(f"Fuzzy disease vectorstore matches for {entity}: {disease_names[:3]}")
+
+        if not disease_names:
+            # An exact disease name may exist in SPOKE even when it is absent
+            # from the local disease-only vectorstore.
+            disease_names = [entity]
+
+        for disease_name in disease_names[:3]:
+            spoke_lookups.append(
+                {
+                    "value": disease_name,
+                    "node_type": "Disease",
+                    "attribute": "name",
+                    "neighbor_node_types": None,
+                    "source": "disease exact/fuzzy lookup",
+                }
+            )
+
+    # These direct lookups avoid incorrectly sending drugs and pathways to the
+    # disease-only vectorstore.  Some SPOKE Compound nodes require an identifier;
+    # failures are logged and skipped rather than broadened to an unrelated disease.
+    for entity in extracted_entities["Drugs"]:
+        spoke_lookups.append(
+            {
+                "value": entity,
+                "node_type": "Compound",
+                "attribute": "name",
+                "neighbor_node_types": None,
+                "source": "direct compound lookup",
+            }
+        )
+
+    for entity in extracted_entities["Pathways"]:
+        spoke_lookups.append(
+            {
+                "value": entity,
+                "node_type": "Pathway",
+                "attribute": "name",
+                "neighbor_node_types": None,
+                "source": "direct pathway lookup",
+            }
+        )
+
+    # If GPT extracted no explicit entity, the question-level fallback remains
+    # disease-only because that is what the bundled Chroma collection contains.
+    if not spoke_lookups:
+        print("No explicit entity found; using disease question-level vectorstore fallback")
+        question_hits = vectorstore.similarity_search_with_score(question, k=5)
+        for doc, _score in question_hits:
+            if getattr(doc, "page_content", None):
+                spoke_lookups.append(
+                    {
+                        "value": doc.page_content,
+                        "node_type": "Disease",
+                        "attribute": "name",
+                        "neighbor_node_types": None,
+                        "source": "question-level disease fallback",
+                    }
+                )
+
+    deduplicated_lookups = []
+    seen_lookups = set()
+    for lookup in spoke_lookups:
+        lookup_key = (
+            lookup["node_type"],
+            lookup["attribute"],
+            str(lookup["value"]).strip().lower(),
+        )
+        if lookup_key not in seen_lookups:
+            seen_lookups.add(lookup_key)
+            deduplicated_lookups.append(lookup)
+
+    if not deduplicated_lookups:
+        return "No relevant knowledge graph context found."
+
+    print(
+        "Typed SPOKE lookups: "
+        + str(
+            [
+                f"{item['node_type']}/{item['attribute']}/{item['value']}"
+                for item in deduplicated_lookups
+            ]
+        )
+    )
+
+    question_embedding = embedding_function.embed_query(question)
+    max_context_per_node = max(1, int(context_volume / len(deduplicated_lookups)))
+    extracted_context_parts = []
+
+    for lookup in deduplicated_lookups:
+        if not api and lookup["node_type"] == "Disease":
+            matches = node_context_df[
+                node_context_df.node_name == lookup["value"]
+            ]
+            if matches.empty:
+                print(f"No local disease context match for node: {lookup['value']}")
+                continue
+            node_context = matches.node_context.values[0]
+            context_table = pd.DataFrame()
+        else:
+            try:
+                node_context, context_table = get_context_using_spoke_api(
+                    lookup["value"],
+                    node_type=lookup["node_type"],
+                    attribute=lookup["attribute"],
+                    neighbor_node_types=lookup["neighbor_node_types"],
+                )
+            except Exception as exc:
+                print(
+                    f"SPOKE lookup failed for {lookup['node_type']} "
+                    f"{lookup['value']}: {exc}"
+                )
                 continue
 
-            node_search_result = vectorstore.similarity_search_with_score(entity, k=3)
-
-            if not node_search_result:
-                print(f"No vectorstore hit for entity: {entity}")
-                continue
-
-            for doc, score in node_search_result:
-                if getattr(doc, "page_content", None):
-                     node_hits.append(doc.page_content)
-
-        if not node_hits:
-            print("No entity-level hits found, falling back to question-level search")
-            node_search_results = vectorstore.similarity_search_with_score(question, k=5)
-            node_hits = [
-                node[0].page_content
-                for node in node_search_results
-                if getattr(node[0], "page_content", None)
+        if context_table is not None and not context_table.empty and "context" in context_table.columns:
+            node_context_list = context_table["context"].dropna().astype(str).tolist()
+        else:
+            node_context_list = [
+                item.strip()
+                for item in str(node_context).split(". ")
+                if item.strip()
             ]
 
-        node_hits = list(dict.fromkeys(node_hits))
-        if not node_hits:
-            return "No relevant knowledge graph context found."
+        if not node_context_list:
+            print(f"No SPOKE relationships returned for {lookup['node_type']} {lookup['value']}")
+            continue
 
-        question_embedding = embedding_function.embed_query(question)
-        node_context_extracted = ""
-
-        for node_name in node_hits:
-            if not api:
-                matches = node_context_df[node_context_df.node_name == node_name]
-                if matches.empty:
-                    print(f"No node_context_df match for node: {node_name}")
-                    continue
-                node_context = matches.node_context.values[0]
-            else:
-                node_context, context_table = get_context_using_spoke_api(node_name)
-
-
-            node_context_list = [x.strip() for x in node_context.split(". ") if x.strip()]
-            if not node_context_list:
-                continue
-            node_context_embeddings = embedding_function.embed_documents(node_context_list)
-
-            similarities = [
+        node_context_embeddings = embedding_function.embed_documents(node_context_list)
+        similarities = [
+            float(
                 cosine_similarity(
                     np.array(question_embedding).reshape(1, -1),
-                    np.array(node_context_embedding).reshape(1, -1)
-                )
-                for node_context_embedding in node_context_embeddings
-            ]
+                    np.array(node_context_embedding).reshape(1, -1),
+                )[0][0]
+            )
+            for node_context_embedding in node_context_embeddings
+        ]
 
-            similarities = sorted([(e, i) for i, e in enumerate(similarities)], reverse=True)
-            percentile_threshold = np.percentile([s[0] for s in similarities], context_sim_threshold)
+        ranked_similarities = sorted(
+            [(score, index) for index, score in enumerate(similarities)],
+            reverse=True,
+        )
+        percentile_threshold = float(
+            np.percentile(similarities, context_sim_threshold)
+        )
+        selected_indices = [
+            index
+            for score, index in ranked_similarities
+            if score >= percentile_threshold and score >= context_sim_min_threshold
+        ][:max_context_per_node]
 
-            high_similarity_indices = [
-                s[1]
-                for s in similarities
-                if s[0] > percentile_threshold and s[0] > context_sim_min_threshold
-            ]
+        selected_context = [node_context_list[index] for index in selected_indices]
+        if not selected_context:
+            print(
+                f"No relationships passed the similarity threshold for "
+                f"{lookup['node_type']} {lookup['value']}"
+            )
+            continue
 
-            if len(high_similarity_indices) > max_number_of_high_similarity_context_per_node:
-                high_similarity_indices = high_similarity_indices[:max_number_of_high_similarity_context_per_node]
+        if edge_evidence and context_table is not None and not context_table.empty:
+            selected_table = context_table[
+                context_table.context.isin(selected_context)
+            ].copy()
+            selected_table.loc[:, "context"] = (
+                selected_table.source
+                + " "
+                + selected_table.predicate.str.lower()
+                + " "
+                + selected_table.target
+                + " and Provenance of this association is "
+                + selected_table.provenance
+                + " and attributes associated with this association is in the following JSON format:\n "
+                + selected_table.evidence.astype("str")
+                + "\n\n"
+            )
+            extracted_context_parts.append(
+                selected_table.context.str.cat(sep=" ")
+            )
+        else:
+            extracted_context_parts.append(" ".join(selected_context))
 
-            high_similarity_context = [node_context_list[index] for index in high_similarity_indices]
-
-            if edge_evidence:
-                high_similarity_context = list(map(lambda x: x + '.', high_similarity_context))
-                context_table = context_table[context_table.context.isin(high_similarity_context)]
-                context_table.loc[:, "context"] = (
-                    context_table.source
-                    + " "
-                    + context_table.predicate.str.lower()
-                    + " "
-                    + context_table.target
-                    + " and Provenance of this association is "
-                    + context_table.provenance
-                    + " and attributes associated with this association is in the following JSON format:\n "
-                    + context_table.evidence.astype("str")
-                    + "\n\n"
-                )
-                node_context_extracted += context_table.context.str.cat(sep=' ')
-            else:
-                node_context_extracted += ". ".join(high_similarity_context)
-                node_context_extracted += ". "
-
-        if not node_context_extracted.strip():
-            return "No relevant knowledge graph context found."
-
-        return node_context_extracted
-
-    else:
-        node_hits = vectorstore.similarity_search_with_score(question, k=5)
-        max_number_of_high_similarity_context_per_node = int(context_volume / 5)
-        question_embedding = embedding_function.embed_query(question)
-        node_context_extracted = ""
-
-        for node in node_hits:
-            node_name = node[0].page_content
-            if not api:
-                matches = node_context_df[node_context_df.node_name == node_name]
-                if matches.empty:
-                    print(f"No node_context_df match for node: {node_name}")
-                    continue
-                node_context = matches.node_context.values[0]
-            else:
-                node_context, context_table = get_context_using_spoke_api(node_name)
-
-            node_context_list = [x.strip() for x in node_context.split(". ") if x.strip()]
-            if not node_context_list:
-                continue
-            node_context_embeddings = embedding_function.embed_documents(node_context_list)
-            
-
-            similarities = [
-                float(
-                    cosine_similarity(
-                        np.array(question_embedding).reshape(1, -1),
-                        np.array(node_context_embedding).reshape(1, -1)
-                    )[0][0]
-                )
-                for node_context_embedding in node_context_embeddings
-            ]
-
-            similarities = sorted([(e, i) for i, e in enumerate(similarities)], reverse=True)
-            percentile_threshold = np.percentile([s[0] for s in similarities], context_sim_threshold)
-
-            high_similarity_indices = [
-                s[1]
-                for s in similarities
-                if s[0] > percentile_threshold and s[0] > context_sim_min_threshold
-            ]
-
-            if len(high_similarity_indices) > max_number_of_high_similarity_context_per_node:
-                high_similarity_indices = high_similarity_indices[:max_number_of_high_similarity_context_per_node]
-
-            high_similarity_context = [node_context_list[index] for index in high_similarity_indices]
-
-            if edge_evidence:
-                high_similarity_context = list(map(lambda x: x + '.', high_similarity_context))
-                context_table = context_table[context_table.context.isin(high_similarity_context)]
-                context_table.loc[:, "context"] = (
-                    context_table.source
-                    + " "
-                    + context_table.predicate.str.lower()
-                    + " "
-                    + context_table.target
-                    + " and Provenance of this association is "
-                    + context_table.provenance
-                    + " and attributes associated with this association is in the following JSON format:\n "
-                    + context_table.evidence.astype("str")
-                    + "\n\n"
-                )
-                node_context_extracted += context_table.context.str.cat(sep=' ')
-            else:
-                node_context_extracted += ". ".join(high_similarity_context)
-                node_context_extracted += ". "
-
-        if not node_context_extracted.strip():
-            return "No relevant knowledge graph context found."
-
-        return node_context_extracted
-
+    final_context = " ".join(
+        part for part in extracted_context_parts if str(part).strip()
+    ).strip()
+    return final_context or "No relevant knowledge graph context found."
