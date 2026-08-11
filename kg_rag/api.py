@@ -1,44 +1,72 @@
-from flask import Flask, request, jsonify
-import subprocess
-import traceback
 import logging
+import threading
+import time
+import traceback
+
+from flask import Flask, jsonify, request
+
+from kg_rag.generation.text_generation import generate_answer
+
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
+_inflight_queries = set()
+_inflight_lock = threading.Lock()
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
+
+
 @app.route("/query", methods=["POST"])
 def query_kg_rag():
-    user_input = request.json.get("query", "")
+    payload = request.get_json(silent=True) or {}
+    user_input = str(payload.get("query", "")).strip()
+    if not user_input:
+        return jsonify({"error": "A non-empty query is required."}), 400
 
-    base_dir = "/app"
-    script_path = "kg_rag.generation.text_generation"
+    query_key = " ".join(user_input.lower().split())
+    with _inflight_lock:
+        if query_key in _inflight_queries:
+            app.logger.warning(
+                "Duplicate KG query rejected while first request is running: %s",
+                user_input,
+            )
+            return jsonify(
+                {"error": "An identical KG query is already running."}
+            ), 409
+        _inflight_queries.add(query_key)
 
-    command = [
-        "python", "-m", script_path,
-        "-g", "gpt-4o",
-        "--query", user_input
-    ]
-
+    started_at = time.monotonic()
     app.logger.info("KG query received: %s", user_input)
-    app.logger.info("Running command: %s", " ".join(command))
 
     try:
-        result = subprocess.check_output(
-            command,
-            cwd=base_dir,
-            stderr=subprocess.STDOUT
+        output = generate_answer(
+            user_input,
+            chat_model_id="gpt-4o",
+            edge_evidence=False,
         )
-        output = result.decode("utf-8", errors="replace")
-        app.logger.info("KG success output:\n%s", output)
+        elapsed = time.monotonic() - started_at
+        app.logger.info(
+            "KG query succeeded elapsed=%.1fs output_length=%s output_tail:\n%s",
+            elapsed,
+            len(output),
+            output[-4000:],
+        )
         return jsonify({"result": output})
 
-    except subprocess.CalledProcessError as e:
-        output = e.output.decode("utf-8", errors="replace")
-        app.logger.error("KG subprocess failed:\n%s", output)
-        return jsonify({"error": output}), 500
-
     except Exception:
-        err = traceback.format_exc()
-        app.logger.error("KG unexpected failure:\n%s", err)
-        return jsonify({"error": err}), 500
+        elapsed = time.monotonic() - started_at
+        error_text = traceback.format_exc()
+        app.logger.error(
+            "KG query failed elapsed=%.1fs:\n%s",
+            elapsed,
+            error_text,
+        )
+        return jsonify({"error": error_text}), 500
 
+    finally:
+        with _inflight_lock:
+            _inflight_queries.discard(query_key)
