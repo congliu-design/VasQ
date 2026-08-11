@@ -282,6 +282,7 @@ img.header-logo {
   max-width: 92%;
   line-height: 1.55;
   font-size: 16px;
+  overflow-x: auto;
 }
 
 /* Paragraph spacing */
@@ -298,6 +299,7 @@ img.header-logo {
 /* Table layout */
 .system-message table {
   width: 100%;
+  min-width: 760px;
   margin: 16px 0;
   border-collapse: collapse;
   font-size: 14px;
@@ -320,12 +322,23 @@ img.header-logo {
   font-weight: 700;
 }
 
-/* Keep gene names on one line */
+/* Give descriptive columns enough room while keeping numeric values aligned. */
 .system-message th:first-child,
 .system-message td:first-child {
-  width: 80px;
-  white-space: nowrap;
+  min-width: 170px;
   font-weight: 600;
+}
+
+.system-message th:nth-child(2),
+.system-message td:nth-child(2) {
+  min-width: 230px;
+}
+
+.system-message th:nth-child(n+3),
+.system-message td:nth-child(n+3) {
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Alternating table rows */
