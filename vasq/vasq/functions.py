@@ -813,19 +813,39 @@ def format_matrix_expression_summary(stats_df, gene, max_rows=5):
         ascending=[False, False, False]
     ).head(max_rows)
 
-    lines = [f"Top expression contexts for {gene} (log-normalized mean expression):"]
+    lines = [
+        (
+            f"Top measured contexts for {gene}, ranked by average "
+            "log-normalized expression:"
+        ),
+        "",
+        (
+            "| Brain region | Cell type | Mean expression "
+            "(log-normalized) | Expressing cells | Cells analyzed (n) |"
+        ),
+        "| --- | --- | ---: | ---: | ---: |",
+    ]
 
     for _, row in work.iterrows():
-        parts = []
-        for col in ["brain_region", "region_layer", "cell_class", "cell_type"]:
-            if col in work.columns and pd.notna(row.get(col)):
-                parts.append(str(row[col]))
-
-        label = " | ".join(parts) if parts else "all matched cells"
+        brain_region = str(row.get("brain_region", "All matched regions"))
+        cell_type = str(row.get("cell_type", "All matched cell types"))
+        brain_region = brain_region.replace("|", "/")
+        cell_type = cell_type.replace("|", "/")
         lines.append(
-            f"- {label}: mean_expr {row['mean_expr']:.3f}, "
-            f"pct_expr {row['pct_expr']:.3f}, n {int(row['n_cells'])}"
+            f"| {brain_region} | {cell_type} | "
+            f"{row['mean_expr']:.3f} | "
+            f"{100.0 * row['pct_expr']:.1f}% | "
+            f"{int(row['n_cells'])} |"
         )
+
+    lines.extend([
+        "",
+        (
+            "Mean expression is averaged across all cells in the group, "
+            "including zero values. Expressing cells is the percentage with "
+            "nonzero expression; Cells analyzed (n) is the total group size."
+        ),
+    ])
 
     return "\n".join(lines)
 
@@ -3112,7 +3132,15 @@ def _chat_impl(user_input, history):
             "expression, organize the answer into two explicit sections: "
             "(1) associated genes and supporting knowledge and (2) VasQ "
             "matrix expression by brain region/cell type with the supplied "
-            "measured values. Cover every analyzed gene when evidence is "
+            "measured values. For every VasQ matrix-expression table, use "
+            "reader-facing columns named Brain region, Cell type, Mean "
+            "expression (log-normalized), Expressing cells, and Cells "
+            "analyzed (n). Convert pct_expr fractions to percentages (for "
+            "example, 0.15 becomes 15.0%); never expose pct_expr or n as "
+            "unexplained technical headers. Briefly state that mean "
+            "expression includes zero-valued cells, Expressing cells is the "
+            "nonzero-expression percentage, and Cells analyzed (n) is the "
+            "group size. Cover every analyzed gene when evidence is "
             "available. When the user explicitly asks for drugs or "
             "therapeutics, add a third section for compounds related to those "
             "genes; otherwise "
