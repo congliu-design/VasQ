@@ -152,10 +152,50 @@ document.addEventListener("DOMContentLoaded", function() {
         return false;
     }
 
+    function pdfColumnWeight(headerText) {
+        const header = headerText.trim().toLowerCase();
+
+        if (header === 'rank') return 7;
+        if (header === 'gene') return 15;
+        if (header.includes('brain region')) return 22;
+        if (header.includes('cell type')) return 26;
+        if (header.includes('mean expression')) return 20;
+        if (header.includes('marker score')) return 16;
+        if (header === 'logfc' || header.includes('fold-change')) return 12;
+        if (header.includes('expressing cells')) return 18;
+        if (header.includes('cells analyzed')) return 14;
+        return 16;
+    }
+
+    function configurePdfTableColumns(table) {
+        const headers = Array.from(table.querySelectorAll('thead th'));
+        if (!headers.length) return;
+
+        const weights = headers.map(function(header) {
+            return pdfColumnWeight(header.textContent || '');
+        });
+        const totalWeight = weights.reduce(function(total, weight) {
+            return total + weight;
+        }, 0);
+        const columnGroup = document.createElement('colgroup');
+
+        weights.forEach(function(weight) {
+            const column = document.createElement('col');
+            column.style.width = (100 * weight / totalWeight) + '%';
+            columnGroup.appendChild(column);
+        });
+
+        const existingColumnGroup = table.querySelector(':scope > colgroup');
+        if (existingColumnGroup) existingColumnGroup.remove();
+        table.insertBefore(columnGroup, table.firstChild);
+        table.dataset.pdfColumns = String(headers.length);
+    }
+
     function groupPdfTables(exportDocument) {
         exportDocument.querySelectorAll(
             '.system-message table'
         ).forEach(function(table) {
+            configurePdfTableColumns(table);
             let heading = table.previousElementSibling;
 
             while (heading && heading.tagName === 'BR') {
