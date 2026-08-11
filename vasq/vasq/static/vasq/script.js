@@ -77,6 +77,92 @@ document.addEventListener("DOMContentLoaded", function() {
         return true;
     }
 
+    function waitForNextStatusCheck(milliseconds, signal) {
+        return new Promise(function(resolve, reject) {
+            if (signal.aborted) {
+                const error = new Error('Stopped by user.');
+                error.name = 'AbortError';
+                reject(error);
+                return;
+            }
+
+            let timer = null;
+            const onAbort = function() {
+                if (timer !== null) window.clearTimeout(timer);
+                const error = new Error('Stopped by user.');
+                error.name = 'AbortError';
+                reject(error);
+            };
+
+            signal.addEventListener('abort', onAbort, { once: true });
+            timer = window.setTimeout(function() {
+                signal.removeEventListener('abort', onAbort);
+                resolve();
+            }, milliseconds);
+        });
+    }
+
+    async function pollChatJob(statusUrl, requestState, thinkingMessage) {
+        while (true) {
+            await waitForNextStatusCheck(
+                2000,
+                requestState.controller.signal
+            );
+
+            const response = await fetch(statusUrl, {
+                method: 'GET',
+                headers: {
+                    'Accept': 'application/json'
+                },
+                cache: 'no-store',
+                signal: requestState.controller.signal
+            });
+            const data = await response.json().catch(function() {
+                return {};
+            });
+
+            if (!response.ok) {
+                throw new Error(
+                    data.response ||
+                    `Status check returned HTTP ${response.status}`
+                );
+            }
+
+            if (data.status === 'completed') return data;
+
+            if (data.status === 'failed') {
+                throw new Error(
+                    data.response || 'The background request failed.'
+                );
+            }
+
+            if (data.status === 'stopped' || data.stopped) {
+                const stoppedError = new Error('Stopped by user.');
+                stoppedError.name = 'AbortError';
+                throw stoppedError;
+            }
+
+            if (
+                !['queued', 'running', 'stopping'].includes(data.status)
+            ) {
+                throw new Error('The server returned an unknown job status.');
+            }
+
+            if (thinkingMessage) {
+                if (data.status === 'queued') {
+                    thinkingMessage.textContent = 'Queued...';
+                } else if (data.status === 'stopping') {
+                    thinkingMessage.textContent = 'Stopping...';
+                } else if (Number.isFinite(data.elapsed_seconds)) {
+                    thinkingMessage.textContent =
+                        `Working... ${Math.round(data.elapsed_seconds)}s elapsed`;
+                } else {
+                    thinkingMessage.textContent = 'Working...';
+                }
+            }
+        }
+    }
+
     function exportTimestamp() {
         return new Date()
             .toISOString()
@@ -1125,7 +1211,7 @@ document.addEventListener("DOMContentLoaded", function() {
                 signal: controller.signal
             });
 
-            const data = await response.json().catch(function() {
+            let data = await response.json().catch(function() {
                 return {};
             });
 
@@ -1139,6 +1225,33 @@ document.addEventListener("DOMContentLoaded", function() {
                 throw new Error(
                     data.response || `Server returned HTTP ${response.status}`
                 );
+            }
+
+            if (
+                ['queued', 'running', 'stopping'].includes(data.status)
+            ) {
+                if (!data.status_url) {
+                    throw new Error(
+                        'The server did not return a job status URL.'
+                    );
+                }
+                data = await pollChatJob(
+                    data.status_url,
+                    requestState,
+                    thinkingMessage
+                );
+            }
+
+            if (data.status === 'failed') {
+                throw new Error(
+                    data.response || 'The background request failed.'
+                );
+            }
+
+            if (data.status === 'stopped' || data.stopped) {
+                const stoppedError = new Error('Stopped by user.');
+                stoppedError.name = 'AbortError';
+                throw stoppedError;
             }
 
             const answerText = data.response || 'I could not generate a response.';
