@@ -278,9 +278,106 @@ document.addEventListener("DOMContentLoaded", function() {
             }
         }
 
+        function splitMarkdownTableRow(line) {
+            let value = line.trim();
+
+            if (value.startsWith('|')) value = value.slice(1);
+            if (value.endsWith('|')) value = value.slice(0, -1);
+
+            return value.split('|').map(function(cell) {
+                return cell.trim().replace(/\\_/g, '_');
+            });
+        }
+
+        function readLine(startIndex) {
+            const lineEnd = text.indexOf('\n', startIndex);
+            const end = lineEnd === -1 ? text.length : lineEnd;
+
+            return {
+                value: text.slice(startIndex, end),
+                nextIndex: lineEnd === -1 ? text.length : lineEnd + 1
+            };
+        }
+
+        function parseMarkdownTable(startIndex) {
+            const headerLine = readLine(startIndex);
+            if (!headerLine.value.includes('|')) return null;
+            if (headerLine.nextIndex >= text.length) return null;
+
+            const dividerLine = readLine(headerLine.nextIndex);
+            const headers = splitMarkdownTableRow(headerLine.value);
+            const dividers = splitMarkdownTableRow(dividerLine.value);
+            const dividerPattern = /^:?-{3,}:?$/;
+
+            if (
+                headers.length < 2 ||
+                dividers.length !== headers.length ||
+                !dividers.every(function(value) {
+                    return dividerPattern.test(value);
+                })
+            ) {
+                return null;
+            }
+
+            const alignments = dividers.map(function(value) {
+                if (value.startsWith(':') && value.endsWith(':')) {
+                    return 'center';
+                }
+                if (value.endsWith(':')) return 'right';
+                return 'left';
+            });
+            const table = document.createElement('table');
+            const thead = document.createElement('thead');
+            const headerRow = document.createElement('tr');
+
+            headers.forEach(function(value, columnIndex) {
+                const cell = document.createElement('th');
+                cell.textContent = value;
+                cell.style.textAlign = alignments[columnIndex];
+                headerRow.appendChild(cell);
+            });
+            thead.appendChild(headerRow);
+            table.appendChild(thead);
+
+            const tbody = document.createElement('tbody');
+            let cursor = dividerLine.nextIndex;
+
+            while (cursor < text.length) {
+                const dataLine = readLine(cursor);
+                const trimmedLine = dataLine.value.trim();
+
+                if (!trimmedLine || !trimmedLine.includes('|')) break;
+
+                const values = splitMarkdownTableRow(dataLine.value);
+                if (values.length !== headers.length) break;
+
+                const row = document.createElement('tr');
+                values.forEach(function(value, columnIndex) {
+                    const cell = document.createElement('td');
+                    cell.textContent = value;
+                    cell.style.textAlign = alignments[columnIndex];
+                    row.appendChild(cell);
+                });
+                tbody.appendChild(row);
+                cursor = dataLine.nextIndex;
+            }
+
+            table.appendChild(tbody);
+            return { element: table, nextIndex: cursor };
+        }
+
         while (i < text.length) {
             const atLineStart =
                 i === 0 || text.charAt(i - 1) === '\n';
+
+            if (atLineStart) {
+                const parsedTable = parseMarkdownTable(i);
+                if (parsedTable) {
+                    fragment.appendChild(parsedTable.element);
+                    i = parsedTable.nextIndex;
+                    continue;
+                }
+            }
     
             // Code block：必须放在 inline code 前面
             if (text.startsWith('```', i)) {
