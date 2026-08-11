@@ -4,9 +4,11 @@ document.addEventListener("DOMContentLoaded", function() {
     const form = document.getElementById("chat-form");
     const fileInput = document.getElementById("file-upload");
     const sendButton = document.getElementById("send-message");
+    const stopButton = document.getElementById("stop-request");
     const queueButton = document.getElementById("run-queue");
     let queueRunning = false;
     let stopQueueRequested = false;
+    let activeRequest = null;
 
     function createChatId() {
         if (
@@ -39,6 +41,42 @@ document.addEventListener("DOMContentLoaded", function() {
     
     // A new ID is generated every time a chat page is opened.
     const tabChatId = createChatId();
+
+    function setStopControl(isActive) {
+        if (!stopButton) return;
+
+        stopButton.hidden = !isActive;
+        stopButton.disabled = false;
+        stopButton.textContent = 'Stop';
+    }
+
+    function notifyServerCancellation(requestState) {
+        return fetch(chatUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': csrfToken
+            },
+            body: JSON.stringify({
+                cancel_request: true,
+                request_id: requestState.requestId,
+                chat_id: requestState.chatId
+            }),
+            keepalive: true
+        }).catch(function(error) {
+            console.warn('Could not notify the server about cancellation:', error);
+        });
+    }
+
+    function abortActiveRequest() {
+        if (!activeRequest || activeRequest.stopping) return false;
+
+        activeRequest.stopping = true;
+        activeRequest.controller.abort();
+        void notifyServerCancellation(activeRequest);
+        return true;
+    }
+
     function exportTimestamp() {
         return new Date()
             .toISOString()
@@ -778,7 +816,7 @@ document.addEventListener("DOMContentLoaded", function() {
         sendButton.disabled = isRunning;
 
         if (isRunning) {
-            queueButton.textContent = 'Stop after current';
+            queueButton.textContent = 'Stop Queue';
             queueButton.disabled = false;
         } else {
             queueButton.textContent = 'Run Queue';
@@ -827,9 +865,22 @@ document.addEventListener("DOMContentLoaded", function() {
         const queueIndex = options.queueIndex || null;
         const queueTotal = options.queueTotal || null;
         const resetHistory = options.resetHistory === true;
+        const isQueueRequest = Boolean(queueIndex && queueTotal);
+        const requestId = createChatId();
+        const requestChatId = options.chatId || tabChatId;
+        const controller = new AbortController();
+        const requestState = {
+            controller: controller,
+            requestId: requestId,
+            chatId: requestChatId,
+            stopping: false
+        };
         const prefix = queueIndex && queueTotal
             ? `[${queueIndex}/${queueTotal}] `
             : '';
+
+        activeRequest = requestState;
+        if (!isQueueRequest) setStopControl(true);
 
         addChatMessage(prefix + message, true);
         const thinkingMessage = addTemporaryMessage(
@@ -848,13 +899,21 @@ document.addEventListener("DOMContentLoaded", function() {
                 body: JSON.stringify({
                     message: message,
                     reset_history: resetHistory,
-                    chat_id: options.chatId || tabChatId
-                })
+                    request_id: requestId,
+                    chat_id: requestChatId
+                }),
+                signal: controller.signal
             });
 
             const data = await response.json().catch(function() {
                 return {};
             });
+
+            if (data.stopped) {
+                const stoppedError = new Error('Stopped by user.');
+                stoppedError.name = 'AbortError';
+                throw stoppedError;
+            }
 
             if (!response.ok) {
                 throw new Error(
@@ -868,11 +927,23 @@ document.addEventListener("DOMContentLoaded", function() {
             await renderGraph(data.graph_json);
             return {
                 success: true,
+                stopped: false,
                 answer: answerText,
                 hasGraph: Boolean(data.graph_json),
                 elapsedSeconds: secondsSince(startedAt)
             };
         } catch (error) {
+            if (error.name === 'AbortError') {
+                addChatMessage(`${prefix}Stopped.`, false);
+                return {
+                    success: false,
+                    stopped: true,
+                    answer: 'Stopped by user.',
+                    hasGraph: false,
+                    elapsedSeconds: secondsSince(startedAt)
+                };
+            }
+
             console.error('Error:', error);
             const errorText = error.message || 'Could not send this question.';
             addChatMessage(
@@ -881,11 +952,16 @@ document.addEventListener("DOMContentLoaded", function() {
             );
             return {
                 success: false,
+                stopped: false,
                 answer: errorText,
                 hasGraph: false,
                 elapsedSeconds: secondsSince(startedAt)
             };
         } finally {
+            if (activeRequest === requestState) {
+                activeRequest = null;
+            }
+            if (!isQueueRequest) setStopControl(false);
             thinkingMessage.remove();
             scrollToBottom();
         }
@@ -897,8 +973,16 @@ document.addEventListener("DOMContentLoaded", function() {
         messageInput &&
         messagesContainer &&
         sendButton &&
+        stopButton &&
         queueButton
     ) {
+        stopButton.addEventListener('click', function() {
+            if (!abortActiveRequest()) return;
+
+            stopButton.textContent = 'Stopping...';
+            stopButton.disabled = true;
+        });
+
         form.onsubmit = async function(e) {
             e.preventDefault();
             if (queueRunning) return;
@@ -918,6 +1002,7 @@ document.addEventListener("DOMContentLoaded", function() {
         queueButton.addEventListener('click', async function() {
             if (queueRunning) {
                 stopQueueRequested = true;
+                abortActiveRequest();
                 queueButton.textContent = 'Stopping...';
                 queueButton.disabled = true;
                 return;
@@ -954,6 +1039,12 @@ document.addEventListener("DOMContentLoaded", function() {
                     resetHistory: true,
                     chatId: createChatId()
                 });
+
+                if (result.stopped) {
+                    stopQueueRequested = true;
+                    break;
+                }
+
                 results.push({
                     question: questions[index],
                     success: result.success,
