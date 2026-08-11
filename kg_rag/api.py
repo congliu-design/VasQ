@@ -29,7 +29,7 @@ def query_kg_rag():
             stderr=subprocess.STDOUT
         )
         output = result.decode("utf-8", errors="replace")
-        app.logger.info("KG success output:\n%s", output[:4000])
+        app.logger.info("KG success output:\n%s", output)
         return jsonify({"result": output})
 
     except subprocess.CalledProcessError as e:
