@@ -68,5 +68,15 @@ def query_kg_rag():
         return jsonify({"error": error_text}), 500
 
     finally:
+        elapsed = time.monotonic() - started_at
+    
         with _inflight_lock:
             _inflight_queries.discard(query_key)
+            active_count = len(_inflight_queries)
+    
+        app.logger.info(
+            "KG query fully finished elapsed=%.1fs active_queries=%d query=%s",
+            elapsed,
+            active_count,
+            user_input,
+        )
