@@ -2867,8 +2867,19 @@ def looks_like_expression_query(user_input):
 ### new chat
 
 
+class ChatCancelled(Exception):
+    """Stop a chat turn without converting it into an error response."""
 
-def _chat_impl(user_input, history):
+
+def _raise_if_cancelled(should_stop):
+    if should_stop is not None and should_stop():
+        raise ChatCancelled("Chat request stopped by user.")
+
+
+
+def _chat_impl(user_input, history, should_stop=None):
+    _raise_if_cancelled(should_stop)
+
     if history is None:
         history = []
 
@@ -2876,15 +2887,18 @@ def _chat_impl(user_input, history):
 
     # Resolve the current turn against prior context before adding it to history.
     intent = analyze_query_intent(user_input, history)
+    _raise_if_cancelled(should_stop)
     update_history(history, "user", user_input)
 
     # Greetings, thanks, casual conversation, and meta questions do not search.
     if not intent.get("is_scientific"):
+        _raise_if_cancelled(should_stop)
         direct_message = call_api(
             history,
             stage_name="direct_answer",
             timeout_seconds=_env_float("OPENAI_SYNTHESIS_TIMEOUT_SECONDS", 45),
         )
+        _raise_if_cancelled(should_stop)
         final_message = getattr(direct_message, "content", None) or (
             "I'm sorry, but I couldn't generate a response."
         )
@@ -2899,14 +2913,17 @@ def _chat_impl(user_input, history):
     # Branch A: every scientific question goes through KG-RAG, followed by a
     # function/pathway-oriented Web Search. If KG-RAG is empty or irrelevant,
     # the Web Search uses the resolved original question instead.
+    _raise_if_cancelled(should_stop)
     try:
         kg_result = query_kg_rag(resolved_question)
     except Exception:
         logger.exception("KG-RAG branch failed")
         kg_result = None
 
+    _raise_if_cancelled(should_stop)
     kg_assessment = assess_kg_relevance(resolved_question, kg_result)
 
+    _raise_if_cancelled(should_stop)
     try:
         logger.info("Web Search stage 1/2: scientific knowledge and genes")
         scientific_web_result = search_scientific_web(
@@ -2917,6 +2934,8 @@ def _chat_impl(user_input, history):
     except Exception:
         logger.exception("Scientific Web Search branch failed")
         scientific_web_result = None
+
+    _raise_if_cancelled(should_stop)
 
     # The first search can discover genes that were not explicitly written in
     # the user's question (for example, an Alzheimer's disease question). Use
@@ -2949,6 +2968,7 @@ def _chat_impl(user_input, history):
     )
     
     if needs_gene_fallback:
+        _raise_if_cancelled(should_stop)
         logger.warning(
             "Primary evidence resolved no genes; "
             "starting focused gene fallback search"
@@ -2963,6 +2983,8 @@ def _chat_impl(user_input, history):
                 "Focused gene fallback search failed"
             )
             fallback_web_result = None
+
+        _raise_if_cancelled(should_stop)
     
         if fallback_web_result:
             fallback_genes = derive_genes_from_first_search(
@@ -3012,6 +3034,7 @@ def _chat_impl(user_input, history):
     graph_json = None
 
     if intent.get("asks_expression") and intent.get("use_vasq"):
+        _raise_if_cancelled(should_stop)
         if genes or intent.get("asks_markers"):
             try:
                 if intent.get("asks_markers"):
@@ -3039,6 +3062,7 @@ def _chat_impl(user_input, history):
                 "was not queried."
             )
 
+    _raise_if_cancelled(should_stop)
     vasq_text, graph_json = retrieved_text_and_graph(vasq_result)
 
     # Branch C: optional second Web Search. Only run it when the user actually
@@ -3046,6 +3070,7 @@ def _chat_impl(user_input, history):
     drug_result = None
     asks_drugs = bool(intent.get("asks_drugs"))
     if asks_drugs and (genes or diseases):
+        _raise_if_cancelled(should_stop)
         try:
             logger.info(
                 "Web Search stage 2/2: drugs for genes=%s diseases=%s",
@@ -3060,6 +3085,8 @@ def _chat_impl(user_input, history):
         except Exception:
             logger.exception("Drug/small-molecule Web Search branch failed")
             drug_result = None
+
+    _raise_if_cancelled(should_stop)
 
     # Cap each source independently so a long Web result cannot erase VasQ data.
     evidence_parts = []
@@ -3167,6 +3194,7 @@ def _chat_impl(user_input, history):
         ),
     })
 
+    _raise_if_cancelled(should_stop)
     try:
         final_message_obj = call_api(
             synthesis_messages,
@@ -3187,13 +3215,14 @@ def _chat_impl(user_input, history):
             scientific_web_result,
             drug_result=drug_result,
         )
+    _raise_if_cancelled(should_stop)
     logger.info("Final message returned to UI: %r", final_message)
     update_history(history, "assistant", final_message)
 
     return final_message, history, graph_json
 
 
-def chat(user_input, history):
+def chat(user_input, history, should_stop=None):
     """Run one synchronous chat turn inside a hard wall-clock budget."""
     budget_seconds = _env_float("VASQ_TURN_BUDGET_SECONDS", 240)
     started_at = time.monotonic()
@@ -3201,7 +3230,10 @@ def chat(user_input, history):
     logger.info("VasQ turn started budget=%.1fs", budget_seconds)
 
     try:
-        return _chat_impl(user_input, history)
+        return _chat_impl(user_input, history, should_stop=should_stop)
+    except ChatCancelled:
+        logger.info("VasQ turn stopped by user")
+        raise
     except Exception:
         logger.exception("VasQ turn failed before a normal response was produced")
         safe_history = history if history is not None else []
