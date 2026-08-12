@@ -1952,13 +1952,24 @@ def query_kg_rag(user_input):
             _env_float("KG_RAG_TIMEOUT_SECONDS", 35),
             reserve_seconds=_env_float("VASQ_RETRIEVAL_RESERVE_SECONDS", 110),
         )
+    
         logger.info("Calling KG-RAG timeout=%.1fs", timeout_seconds)
+
+        kg_started_at = time.monotonic()
+        
         response = requests.post(
             url,
             json={"query": user_input},
             timeout=timeout_seconds,
         )
         response.raise_for_status()
+        
+        logger.info(
+            "KG-RAG HTTP succeeded elapsed=%.1fs status=%s response_bytes=%s",
+            time.monotonic() - kg_started_at,
+            response.status_code,
+            len(response.content),
+        )
 
         payload = response.json()
         result = str(payload.get("result", "")).strip()
