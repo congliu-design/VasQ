@@ -450,6 +450,11 @@ MATRIX_CELL_CLASS_ALIAS_MAP = None
 MATRIX_REGION_ALIAS_MAP = None
 MATRIX_REGION_LAYER_ALIAS_MAP = None
 
+# Do not expose expression summaries for groups with fewer than 10 cells.
+# Keeping this threshold at the shared summarization layer ensures that the
+# text table and every plot enforce the same rule.
+MIN_CELLS_PER_GROUP = 10
+
 
 def build_simple_alias_map(values):
     alias_map = {}
@@ -653,14 +658,27 @@ def resolve_matrix_entities(user_input):
     region_matches = resolve_entities_from_text(user_input, MATRIX_REGION_ALIAS_MAP)
     region_layer_matches = resolve_entities_from_text(user_input, MATRIX_REGION_LAYER_ALIAS_MAP)
 
-    gpt_cell_type_matches, gpt_region_matches = resolve_dataset_entities_with_gpt(
+    (
+        gpt_cell_type_matches,
+        gpt_cell_class_matches,
+        gpt_region_matches,
+        gpt_region_layer_matches,
+    ) = resolve_dataset_entities_with_gpt(
         user_input,
         MATRIX_AVAILABLE_CELL_TYPES,
-        MATRIX_AVAILABLE_REGIONS
+        MATRIX_AVAILABLE_REGIONS,
+        available_cell_classes=MATRIX_AVAILABLE_CELL_CLASSES,
+        available_region_layers=MATRIX_AVAILABLE_REGION_LAYERS,
     )
 
     cell_type_matches = list(dict.fromkeys(cell_type_matches + gpt_cell_type_matches))
+    cell_class_matches = list(
+        dict.fromkeys(cell_class_matches + gpt_cell_class_matches)
+    )
     region_matches = list(dict.fromkeys(region_matches + gpt_region_matches))
+    region_layer_matches = list(
+        dict.fromkeys(region_layer_matches + gpt_region_layer_matches)
+    )
 
     return cell_type_matches, cell_class_matches, region_matches, region_layer_matches
 
@@ -674,6 +692,61 @@ def extract_sex_filters(user_input):
         out.append("m")
 
     return out
+
+
+def requested_matrix_group_columns(
+    user_input,
+    *,
+    cell_types=None,
+    cell_classes=None,
+    regions=None,
+    region_layers=None,
+):
+    """Choose dimensions that must remain separate in an expression result.
+
+    Explicitly resolved values always preserve their dimension. Generic
+    requests such as "compare cell types" or "across region layers" also
+    preserve that dimension even when the user did not enumerate labels.
+    """
+    text = normalize_text(user_input)
+    group_cols = []
+
+    asks_regions = bool(regions) or bool(
+        re.search(
+            r"\bbrain regions?\b|\bregions?\b|\bregion names?\b|"
+            r"\bregion name\b|\bregion_name\b",
+            text,
+        )
+    )
+    asks_region_layers = bool(region_layers) or bool(
+        re.search(
+            r"\bregion layers?\b|\bregion_layer\b|\bcortical layers?\b|"
+            r"\blayers?\b|\bl[1-6](?:\s*/\s*l?[1-6])?\b",
+            text,
+        )
+    )
+    asks_cell_classes = bool(cell_classes) or bool(
+        re.search(r"\bcell classes?\b|\bcell_class\b", text)
+    )
+    asks_cell_types = bool(cell_types) or bool(
+        re.search(r"\bcell types?\b|\bcell_type\b", text)
+    )
+
+    if asks_regions:
+        group_cols.append("brain_region")
+    if asks_region_layers:
+        group_cols.append("region_layer")
+    if asks_cell_classes:
+        group_cols.append("cell_class")
+    if asks_cell_types:
+        group_cols.append("cell_type")
+
+    # Preserve the previous useful default for an expression question that
+    # does not explicitly name a comparison dimension.
+    if not group_cols:
+        group_cols = ["brain_region", "cell_type"]
+
+    return group_cols
 
 
 def matrix_expression(user_input, genes_override=None):
@@ -693,6 +766,13 @@ def matrix_expression(user_input, genes_override=None):
         return "Please specify a gene for matrix-based expression queries."
 
     cell_types, cell_classes, regions, region_layers = resolve_matrix_entities(user_input)
+    group_cols = requested_matrix_group_columns(
+        user_input,
+        cell_types=cell_types,
+        cell_classes=cell_classes,
+        regions=regions,
+        region_layers=region_layers,
+    )
 
     present_genes = [g for g in genes if g in MATRIX_GENE_TO_IDX]
     missing_genes = [g for g in genes if g not in MATRIX_GENE_TO_IDX]
@@ -718,6 +798,12 @@ def matrix_expression(user_input, genes_override=None):
     if len(cell_indices) == 0 and present_genes:
         return "No matching cells found for the requested filters."
 
+    if 0 < len(cell_indices) < MIN_CELLS_PER_GROUP and present_genes:
+        return (
+            "No expression data are displayed because the requested subset "
+            f"contains fewer than {MIN_CELLS_PER_GROUP} cells."
+        )
+
     all_sections = []
     regional_plot_frames = []
 
@@ -727,25 +813,34 @@ def matrix_expression(user_input, genes_override=None):
         effective_cell_indices = MATRIX_META.index.to_numpy()
 
     for gene in present_genes:
-        # Keep the detailed region/cell-type table used by the text answer.
+        # Keep every requested comparison dimension separate. This prevents,
+        # for example, Layer 2 and Layer 3 from being pooled into one mean.
         stats = summarize_group_expression(
             gene,
             effective_cell_indices,
-            ["brain_region", "cell_class", "cell_type"]
+            group_cols,
+            min_cells=MIN_CELLS_PER_GROUP,
         )
 
-        all_sections.append(format_matrix_expression_summary(stats, gene, max_rows=5))
+        all_sections.append(
+            format_matrix_expression_summary(
+                stats,
+                gene,
+                group_cols=group_cols,
+                max_rows=20,
+            )
+        )
 
-        # Build a stable region-level summary for the visual. Aggregating at
-        # the region level prevents n=1 cell subgroups from dominating the
-        # chart and lets all requested genes appear in one figure.
-        region_stats = summarize_group_expression(
+        # Use the same grouping and cell threshold in the visual so its points
+        # correspond exactly to the rows that are eligible for the table.
+        comparison_stats = summarize_group_expression(
             gene,
             effective_cell_indices,
-            ["brain_region"]
+            group_cols,
+            min_cells=MIN_CELLS_PER_GROUP,
         )
-        if not region_stats.empty:
-            regional_plot_frames.append(region_stats)
+        if not comparison_stats.empty:
+            regional_plot_frames.append(comparison_stats)
 
     plot_json = None
     if regional_plot_frames:
@@ -753,7 +848,7 @@ def matrix_expression(user_input, genes_override=None):
         plot_json = build_matrix_expression_plot(
             plot_stats,
             gene_order=present_genes,
-            region_order=regions,
+            comparison_cols=group_cols,
         )
 
     return {
@@ -775,7 +870,12 @@ def get_gene_vector(cell_indices, gene):
     return values
 
 
-def summarize_group_expression(gene, cell_indices, group_cols):
+def summarize_group_expression(
+    gene,
+    cell_indices,
+    group_cols,
+    min_cells=MIN_CELLS_PER_GROUP,
+):
     if len(cell_indices) == 0:
         return pd.DataFrame()
 
@@ -786,6 +886,12 @@ def summarize_group_expression(gene, cell_indices, group_cols):
 
     for key, g in obs.groupby(groupby_arg):
         idx = g.index.to_numpy()
+
+        # Suppress small groups before reading or calculating their expression
+        # values. No row or plot point is created for an n < 10 group.
+        if len(idx) < min_cells:
+            continue
+
         vals = get_gene_vector(idx, gene)
 
         row = {
@@ -804,35 +910,77 @@ def summarize_group_expression(gene, cell_indices, group_cols):
     return pd.DataFrame(rows)
 
 
-def format_matrix_expression_summary(stats_df, gene, max_rows=5):
+def format_matrix_expression_summary(
+    stats_df,
+    gene,
+    group_cols=None,
+    max_rows=20,
+):
     if stats_df.empty:
-        return f"No matching cells found for {gene} after applying the requested filters."
+        return (
+            f"No data are displayed for {gene}: no matching comparison "
+            f"group contains at least {MIN_CELLS_PER_GROUP} cells."
+        )
+
+    group_cols = [
+        col
+        for col in (group_cols or ["brain_region", "cell_type"])
+        if col in stats_df.columns
+    ]
 
     work = stats_df.sort_values(
         ["mean_expr", "pct_expr", "n_cells"],
         ascending=[False, False, False]
     ).head(max_rows)
 
+    display_names = {
+        "brain_region": "Brain region",
+        "region_layer": "Region layer",
+        "cell_class": "Cell class",
+        "cell_type": "Cell type",
+    }
+    dimension_headers = [display_names.get(col, col) for col in group_cols]
+    header = (
+        "| "
+        + " | ".join(
+            dimension_headers
+            + [
+                "Mean expression (log-normalized)",
+                "Expressing cells",
+                "Cells analyzed (n)",
+            ]
+        )
+        + " |"
+    )
+    alignment = (
+        "| "
+        + " | ".join(
+            ["---"] * len(dimension_headers)
+            + ["---:", "---:", "---:"]
+        )
+        + " |"
+    )
+
     lines = [
         (
-            f"Top measured contexts for {gene}, ranked by average "
-            "log-normalized expression:"
+            f"Measured comparison groups for {gene}, ranked by average "
+            "log-normalized expression (groups with fewer than "
+            f"{MIN_CELLS_PER_GROUP} cells are not displayed):"
         ),
         "",
-        (
-            "| Brain region | Cell type | Mean expression "
-            "(log-normalized) | Expressing cells | Cells analyzed (n) |"
-        ),
-        "| --- | --- | ---: | ---: | ---: |",
+        header,
+        alignment,
     ]
 
     for _, row in work.iterrows():
-        brain_region = str(row.get("brain_region", "All matched regions"))
-        cell_type = str(row.get("cell_type", "All matched cell types"))
-        brain_region = brain_region.replace("|", "/")
-        cell_type = cell_type.replace("|", "/")
+        dimension_values = [
+            str(row.get(col, "All matched values")).replace("|", "/")
+            for col in group_cols
+        ]
         lines.append(
-            f"| {brain_region} | {cell_type} | "
+            "| "
+            + " | ".join(dimension_values)
+            + " | "
             f"{row['mean_expr']:.3f} | "
             f"{100.0 * row['pct_expr']:.1f}% | "
             f"{int(row['n_cells'])} |"
@@ -1352,7 +1500,17 @@ def ensure_expression_data_loaded():
     if AVAILABLE_REGIONS is None:
         AVAILABLE_REGIONS = sorted(EXPR_DF["region"].dropna().unique().tolist())
 
-def resolve_dataset_entities_with_gpt(user_input, available_cell_types, available_regions):
+def resolve_dataset_entities_with_gpt(
+    user_input,
+    available_cell_types,
+    available_regions,
+    available_cell_classes=None,
+    available_region_layers=None,
+):
+    available_cell_types = available_cell_types or []
+    available_regions = available_regions or []
+    available_cell_classes = available_cell_classes or []
+    available_region_layers = available_region_layers or []
     # system_prompt = (
      #   "You are helping map a biology question onto a fixed dataset schema. "
       #  "Choose the closest matching dataset labels from the provided lists. "
@@ -1362,22 +1520,24 @@ def resolve_dataset_entities_with_gpt(user_input, available_cell_types, availabl
         #"Do not invent labels."
    # )
     system_prompt = (
-        "Map each explicitly requested biological cell type to at most one best "
-        "matching dataset cell-type label. Prefer the most specific label that "
-        "preserves every qualifier in the user's wording. Do not return both a "
-        "general parent label and a more specific child label unless the user "
-        "explicitly asks to compare both. Return multiple labels only when the "
-        "user explicitly mentions multiple distinct cell types. If there is no "
-        "reliable match, return an empty cell_types list instead of broadening or "
-        "guessing. Return JSON only with keys: "
-        '{"cell_types": [], "regions": []}. '
-        "Only use labels from the supplied dataset lists."
+        "Map explicitly requested biological entities to labels from a fixed "
+        "dataset schema. Resolve cell types, cell classes, brain regions, and "
+        "region layers independently. Preserve qualifiers and prefer the most "
+        "specific reliable label. Return multiple labels in a dimension when "
+        "the user asks to compare multiple named values. Do not add every "
+        "available value merely because the user asks for an all-values "
+        "comparison; leave that dimension empty so downstream code can group "
+        "the complete dataset. Never invent labels. Return JSON only with keys: "
+        '{"cell_types": [], "cell_classes": [], "regions": [], '
+        '"region_layers": []}. Only use exact labels from the supplied lists.'
     )
 
     user_prompt = (
         f"User query: {user_input}\n\n"
         f"Available cell types: {available_cell_types}\n\n"
-        f"Available regions: {available_regions}"
+        f"Available cell classes: {available_cell_classes}\n\n"
+        f"Available regions: {available_regions}\n\n"
+        f"Available region layers: {available_region_layers}"
     )
 
     try:
@@ -1394,16 +1554,24 @@ def resolve_dataset_entities_with_gpt(user_input, available_cell_types, availabl
         parsed = json.loads(raw)
 
         cell_types = parsed.get("cell_types", [])
+        cell_classes = parsed.get("cell_classes", [])
         regions = parsed.get("regions", [])
+        region_layers = parsed.get("region_layers", [])
 
         cell_types = [x for x in cell_types if x in available_cell_types]
+        cell_classes = [
+            x for x in cell_classes if x in available_cell_classes
+        ]
         regions = [x for x in regions if x in available_regions]
+        region_layers = [
+            x for x in region_layers if x in available_region_layers
+        ]
 
-        return cell_types, regions
+        return cell_types, cell_classes, regions, region_layers
 
     except Exception as e:
         logger.exception("GPT dataset entity resolution failed: %s", e)
-        return [], []
+        return [], [], [], []
 
 
 
@@ -1442,7 +1610,12 @@ def extract_entities(user_input):
     )
 
     # GPT selects the best matching labels from the actual dataset schema.
-    gpt_cell_matches, gpt_region_matches = (
+    (
+        gpt_cell_matches,
+        _,
+        gpt_region_matches,
+        _,
+    ) = (
         resolve_dataset_entities_with_gpt(
             user_input,
             AVAILABLE_CELL_TYPES,
@@ -2004,70 +2177,98 @@ def query_kg_rag(user_input):
         return None
 
 
-def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
-    """Build a gene-by-region dot plot from region-level matrix summaries.
+def build_matrix_expression_plot(
+    stats_df,
+    gene_order=None,
+    comparison_cols=None,
+):
+    """Build a gene-by-comparison-group dot plot.
 
-    Marker color represents mean log-normalized expression, while marker size
-    represents the fraction of cells with non-zero expression.
+    The x-axis can represent any requested combination of brain region,
+    region layer, cell class, and cell type. Groups below the shared cell-count
+    threshold are removed defensively even if the caller already filtered them.
     """
-    required = {"gene", "brain_region", "mean_expr", "pct_expr", "n_cells"}
-    if stats_df.empty or not required.issubset(stats_df.columns):
+    base_required = {"gene", "mean_expr", "pct_expr", "n_cells"}
+    comparison_cols = [
+        col
+        for col in (
+            comparison_cols
+            or ["brain_region", "region_layer", "cell_type"]
+        )
+        if col in stats_df.columns
+    ]
+    required = base_required.union(comparison_cols)
+    if (
+        stats_df.empty
+        or not comparison_cols
+        or not required.issubset(stats_df.columns)
+    ):
         return None
 
-    plot_df = stats_df.dropna(subset=["gene", "brain_region"]).copy()
+    plot_df = stats_df.dropna(
+        subset=["gene"] + comparison_cols
+    ).copy()
+    plot_df["n_cells"] = pd.to_numeric(
+        plot_df["n_cells"], errors="coerce"
+    ).fillna(0).astype(int)
+    plot_df = plot_df[
+        plot_df["n_cells"] >= MIN_CELLS_PER_GROUP
+    ].copy()
     if plot_df.empty:
         return None
 
     plot_df["gene"] = plot_df["gene"].astype(str)
-    plot_df["brain_region"] = plot_df["brain_region"].astype(str)
+    for col in comparison_cols:
+        plot_df[col] = plot_df[col].astype(str)
     plot_df["mean_expr"] = pd.to_numeric(
         plot_df["mean_expr"], errors="coerce"
     ).fillna(0.0).clip(lower=0.0)
     plot_df["pct_expr"] = pd.to_numeric(
         plot_df["pct_expr"], errors="coerce"
     ).fillna(0.0).clip(lower=0.0, upper=1.0)
-    plot_df["n_cells"] = pd.to_numeric(
-        plot_df["n_cells"], errors="coerce"
-    ).fillna(0).astype(int)
+
+    display_names = {
+        "brain_region": "Brain region",
+        "region_layer": "Region layer",
+        "cell_class": "Cell class",
+        "cell_type": "Cell type",
+    }
+
+    def comparison_label(row):
+        values = []
+        for col in comparison_cols:
+            value = str(row[col])
+            if col == "brain_region":
+                value = pretty_region_name(value)
+            values.append(value)
+        return " · ".join(values)
+
+    plot_df["_comparison_label"] = plot_df.apply(
+        comparison_label,
+        axis=1,
+    )
 
     available_genes = plot_df["gene"].drop_duplicates().tolist()
     gene_order = [g for g in (gene_order or []) if g in available_genes]
     gene_order += [g for g in available_genes if g not in gene_order]
-
-    available_regions = plot_df["brain_region"].drop_duplicates().tolist()
-    region_order = [r for r in (region_order or []) if r in available_regions]
-    region_order += sorted(r for r in available_regions if r not in region_order)
+    comparison_order = sorted(
+        plot_df["_comparison_label"].drop_duplicates().tolist()
+    )
 
     gene_rank = {gene: i for i, gene in enumerate(gene_order)}
-    region_rank = {region: i for i, region in enumerate(region_order)}
-    plot_df["_gene_order"] = plot_df["gene"].map(gene_rank)
-    plot_df["_region_order"] = plot_df["brain_region"].map(region_rank)
-    plot_df = plot_df.sort_values(["_gene_order", "_region_order"])
-
-    def wrap_axis_label(value, width=18):
-        words = str(value).split()
-        lines = []
-        current = []
-        for word in words:
-            candidate = " ".join(current + [word])
-            if current and len(candidate) > width:
-                lines.append(" ".join(current))
-                current = [word]
-            else:
-                current.append(word)
-        if current:
-            lines.append(" ".join(current))
-        return "<br>".join(lines)
-
-    region_labels = {
-        region: region
-        for region in region_order
+    comparison_rank = {
+        label: i for i, label in enumerate(comparison_order)
     }
-    x_values = [region_labels[region] for region in plot_df["brain_region"]]
-    y_values = plot_df["gene"].tolist()
+    plot_df["_gene_order"] = plot_df["gene"].map(gene_rank)
+    plot_df["_comparison_order"] = plot_df["_comparison_label"].map(
+        comparison_rank
+    )
+    plot_df = plot_df.sort_values(
+        ["_gene_order", "_comparison_order"]
+    )
 
-    # Square-root scaling keeps low expressing fractions visible without
-    # letting highly expressed groups overwhelm the figure.
+    x_values = plot_df["_comparison_label"].tolist()
+    y_values = plot_df["gene"].tolist()
     marker_sizes = (
         6.0 + 18.0 * np.sqrt(plot_df["pct_expr"].to_numpy())
     ).round(1).tolist()
@@ -2077,7 +2278,10 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
     ]
 
     color_values = plot_df["mean_expr"].tolist()
-    positive_colors = plot_df.loc[plot_df["mean_expr"] > 0, "mean_expr"]
+    positive_colors = plot_df.loc[
+        plot_df["mean_expr"] > 0,
+        "mean_expr",
+    ]
     color_max = (
         float(positive_colors.quantile(0.95))
         if not positive_colors.empty
@@ -2085,17 +2289,25 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
     )
     color_max = max(color_max, 0.001)
 
-    customdata = [
-        [
-            row["gene"],
-            row["brain_region"],
-            float(row["mean_expr"]),
-            float(row["pct_expr"]) * 100.0,
-            int(row["n_cells"]),
-        ]
-        for _, row in plot_df.iterrows()
-    ]
+    hover_text = []
+    for _, row in plot_df.iterrows():
+        details = [f"<b>{row['gene']}</b>"]
+        for col in comparison_cols:
+            value = row[col]
+            if col == "brain_region":
+                value = pretty_region_name(value)
+            details.append(f"{display_names.get(col, col)}: {value}")
+        details.extend([
+            f"Mean expression: {float(row['mean_expr']):.3f}",
+            f"Expressing cells: {100.0 * float(row['pct_expr']):.1f}%",
+            f"Cells analyzed: {int(row['n_cells']):,}",
+        ])
+        hover_text.append("<br>".join(details))
 
+    dimension_title = " / ".join(
+        display_names.get(col, col)
+        for col in comparison_cols
+    )
     fig = {
         "data": [
             {
@@ -2103,15 +2315,8 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
                 "mode": "markers",
                 "x": x_values,
                 "y": y_values,
-                "customdata": customdata,
-                "hovertemplate": (
-                    "<b>%{customdata[0]}</b>"
-                    "<br>Brain region: %{customdata[1]}"
-                    "<br>Mean expression: %{customdata[2]:.3f}"
-                    "<br>Expressing cells: %{customdata[3]:.1f}%"
-                    "<br>Cells: %{customdata[4]:,}"
-                    "<extra></extra>"
-                ),
+                "hovertext": hover_text,
+                "hoverinfo": "text",
                 "marker": {
                     "size": marker_sizes,
                     "sizemode": "diameter",
@@ -2139,15 +2344,16 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
         "layout": {
             "title": {
                 "text": (
-                    "<b>VasQ expression across brain regions</b>"
+                    f"<b>VasQ expression by {dimension_title}</b>"
                     "<br><span style='font-size:12px;color:#64748b'>"
                     "Color = mean expression · Size = expressing-cell fraction"
+                    f" · Groups require ≥{MIN_CELLS_PER_GROUP} cells"
                     "</span>"
                 ),
                 "x": 0.02,
                 "xanchor": "left",
             },
-            "height": max(600, 35 + 35 * len(gene_order)),
+            "height": max(600, 120 + 35 * len(gene_order)),
             "autosize": True,
             "paper_bgcolor": "rgba(0,0,0,0)",
             "plot_bgcolor": "#ffffff",
@@ -2162,18 +2368,11 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
                 "font": {"color": "#32175a"},
             },
             "xaxis": {
-                "title": {
-                    "text": "Brain region",
-                    "standoff": 18
-                },
+                "title": {"text": dimension_title, "standoff": 18},
                 "categoryorder": "array",
-                "categoryarray": [
-                    region_labels[r]
-                    for r in region_order
-                ],
+                "categoryarray": comparison_order,
                 "tickangle": -90,
                 "tickfont": {"size": 13},
-            
                 "showticklabels": True,
                 "showline": True,
                 "linecolor": "#32175a",
@@ -2182,24 +2381,16 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
                 "ticklen": 6,
                 "tickwidth": 1,
                 "tickcolor": "#32175a",
-            
                 "showgrid": True,
                 "gridcolor": "#edf2f7",
                 "zeroline": False,
                 "automargin": True,
             },
             "yaxis": {
-                "title": {
-                    "text": "Gene",
-                    "standoff": 12
-                },
+                "title": {"text": "Gene", "standoff": 12},
                 "categoryorder": "array",
-                "categoryarray": list(
-                    reversed(gene_order)
-                ),
+                "categoryarray": list(reversed(gene_order)),
                 "showticklabels": True,
-            
-                # 显示 y 轴和刻度线
                 "showline": True,
                 "linecolor": "#32175a",
                 "linewidth": 1,
@@ -2207,7 +2398,6 @@ def build_matrix_expression_plot(stats_df, gene_order=None, region_order=None):
                 "ticklen": 6,
                 "tickwidth": 1,
                 "tickcolor": "#32175a",
-            
                 "showgrid": True,
                 "gridcolor": "#edf2f7",
                 "zeroline": False,
@@ -2730,8 +2920,9 @@ functions = [
         "name": "matrix_expression",
         "description": (
             "Returns log-normalized gene expression summaries from the sparse "
-            "HVG matrix, with optional filters for brain region, region layer, "
-            "cell class, cell type, age at death, and sex."
+            "HVG matrix. It can filter and compare brain regions, region layers, "
+            "cell classes, cell types, and sex while keeping requested dimensions "
+            "separate. Groups with fewer than 10 cells are not returned."
         ),
         "parameters": {
             "type": "object",
@@ -3169,11 +3360,16 @@ def _chat_impl(user_input, history, should_stop=None):
             "support. For disease questions that ask about genes and their "
             "expression, organize the answer into two explicit sections: "
             "(1) associated genes and supporting knowledge and (2) VasQ "
-            "matrix expression by brain region/cell type with the supplied "
-            "measured values. For every VasQ matrix-expression table, use "
-            "reader-facing columns named Brain region, Cell type, Mean "
-            "expression (log-normalized), Expressing cells, and Cells "
-            "analyzed (n). Convert pct_expr fractions to percentages (for "
+            "matrix expression by the requested brain region, region layer, "
+            "cell class, and/or cell type dimensions with the supplied measured "
+            "values. Preserve every comparison dimension present in the VasQ "
+            "table and never merge distinct region layers, cell types, or brain "
+            "regions. Use reader-facing dimension columns named Brain region, "
+            "Region layer, Cell class, and Cell type when each is present, "
+            "followed by Mean expression (log-normalized), Expressing cells, "
+            "and Cells analyzed (n). Never reconstruct, infer, or display a "
+            f"group with fewer than {MIN_CELLS_PER_GROUP} cells. Convert "
+            "pct_expr fractions to percentages (for "
             "example, 0.15 becomes 15.0%); never expose pct_expr or n as "
             "unexplained technical headers. Briefly state that mean "
             "expression includes zero-valued cells, Expressing cells is the "
