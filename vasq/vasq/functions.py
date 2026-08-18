@@ -2783,6 +2783,24 @@ def wants_web_search(user_input: str) -> bool:
     return any(term in lowered for term in web_terms)
 
 
+def explicitly_requests_vasq_matrix(user_input: str) -> bool:
+    """Return True when the user explicitly limits the answer to VasQ data."""
+    text = normalize_text(user_input)
+    vasq_only_terms = [
+        "using the vasq matrix",
+        "using only the vasq matrix",
+        "use the vasq matrix",
+        "use only the vasq matrix",
+        "from the vasq matrix",
+        "from the vasq matrix only",
+        "based on the vasq matrix",
+        "using vasq matrix data",
+        "using only vasq data",
+        "vasq matrix only",
+    ]
+    return any(term in text for term in vasq_only_terms)
+
+
 def parse_json_object(raw_text):
     """Parse a helper-model JSON object without trusting markdown fences."""
     if not raw_text:
@@ -3291,58 +3309,83 @@ def _chat_impl(user_input, history, should_stop=None):
     genes = user_supplied_genes[:]
     diseases = intent.get("diseases") or []
 
-    # Branch A: every scientific question goes through KG-RAG, followed by a
-    # function/pathway-oriented Web Search. If KG-RAG is empty or irrelevant,
-    # the Web Search uses the resolved original question instead.
-    _raise_if_cancelled(should_stop)
-    try:
-        kg_result = query_kg_rag(resolved_question)
-    except Exception:
-        logger.exception("KG-RAG branch failed")
-        kg_result = None
+    # An explicit VasQ-matrix-only request should not spend several minutes on
+    # KG-RAG or Web Search. An equally explicit request for web/literature
+    # search takes precedence and keeps the normal external-evidence route.
+    direct_vasq_only = (
+        explicitly_requests_vasq_matrix(user_input)
+        and not wants_web_search(user_input)
+    )
+    if direct_vasq_only:
+        # Do not let an intent-classifier miss undo the user's explicit source
+        # instruction. These flags ensure the request reaches Branch B.
+        intent["asks_expression"] = True
+        intent["use_vasq"] = True
+    logger.info("Direct VasQ-only routing=%s", direct_vasq_only)
 
-    _raise_if_cancelled(should_stop)
-    kg_assessment = assess_kg_relevance(resolved_question, kg_result)
+    kg_result = None
+    kg_assessment = {
+        "relevant": False,
+        "reason": "KG-RAG was not run for a VasQ-only request.",
+    }
+    scientific_web_result = None
 
-    _raise_if_cancelled(should_stop)
-    try:
-        logger.info("Web Search stage 1/2: scientific knowledge and genes")
-        scientific_web_result = search_scientific_web(
-            resolved_question,
-            kg_context=kg_result,
-            kg_assessment=kg_assessment,
+    # Branch A: unless this is a direct VasQ-only request, run KG-RAG followed
+    # by a function/pathway-oriented Web Search.
+    if direct_vasq_only:
+        logger.info(
+            "Direct VasQ matrix request detected; skipping KG-RAG and "
+            "OpenAI Web Search"
         )
-    except Exception:
-        logger.exception("Scientific Web Search branch failed")
-        scientific_web_result = None
+    else:
+        _raise_if_cancelled(should_stop)
+        try:
+            kg_result = query_kg_rag(resolved_question)
+        except Exception:
+            logger.exception("KG-RAG branch failed")
+            kg_result = None
 
-    _raise_if_cancelled(should_stop)
+        _raise_if_cancelled(should_stop)
+        kg_assessment = assess_kg_relevance(resolved_question, kg_result)
 
-    # The first search can discover genes that were not explicitly written in
-    # the user's question (for example, an Alzheimer's disease question). Use
-    # that evidence-derived list for matrix expression and drug searches. An
-    # open-ended top-marker request must still discover genes from the VasQ
-    # marker table rather than being restricted by Web Search suggestions.
-    genes = derive_genes_from_first_search(
-        resolved_question,
-        scientific_web_result,
-        kg_result=(
-            kg_result
-            if kg_assessment.get("relevant")
-            else None
-        ),
-        existing_genes=genes,
-    )
-    
-    logger.info(
-        "Gene list after primary scientific search: %s",
-        genes,
-    )
+        _raise_if_cancelled(should_stop)
+        try:
+            logger.info("Web Search stage 1/2: scientific knowledge and genes")
+            scientific_web_result = search_scientific_web(
+                resolved_question,
+                kg_context=kg_result,
+                kg_assessment=kg_assessment,
+            )
+        except Exception:
+            logger.exception("Scientific Web Search branch failed")
+            scientific_web_result = None
+
+        _raise_if_cancelled(should_stop)
+
+        # The first search can discover genes that were not explicitly written
+        # in the user's question. Use that evidence-derived list for matrix
+        # expression and drug searches.
+        genes = derive_genes_from_first_search(
+            resolved_question,
+            scientific_web_result,
+            kg_result=(
+                kg_result
+                if kg_assessment.get("relevant")
+                else None
+            ),
+            existing_genes=genes,
+        )
+
+        logger.info(
+            "Gene list after primary scientific search: %s",
+            genes,
+        )
     
     # Run a smaller, focused Web Search when a matrix-expression question
     # needs genes but the primary search did not resolve any.
     needs_gene_fallback = (
-        intent.get("asks_expression")
+        not direct_vasq_only
+        and intent.get("asks_expression")
         and not intent.get("asks_markers")
         and not user_supplied_genes
         and not genes
@@ -3450,7 +3493,7 @@ def _chat_impl(user_input, history, should_stop=None):
     # asked for drugs/therapeutics; a disease or gene alone is not sufficient.
     drug_result = None
     asks_drugs = bool(intent.get("asks_drugs"))
-    if asks_drugs and (genes or diseases):
+    if not direct_vasq_only and asks_drugs and (genes or diseases):
         _raise_if_cancelled(should_stop)
         try:
             logger.info(
@@ -3472,9 +3515,20 @@ def _chat_impl(user_input, history, should_stop=None):
     # Cap each source independently so a long Web result cannot erase VasQ data.
     evidence_parts = []
 
+    if direct_vasq_only:
+        evidence_parts.append(
+            "SOURCE SCOPE:\n"
+            "The user explicitly requested VasQ matrix data only. KG-RAG "
+            "and Web Search were not run."
+        )
+
     if genes:
         evidence_parts.append(
-            "GENE LIST DERIVED FROM THE FIRST SEARCH:\n"
+            (
+                "GENES USED FOR VASQ ANALYSIS:\n"
+                if direct_vasq_only
+                else "GENE LIST DERIVED FROM THE FIRST SEARCH:\n"
+            )
             + ", ".join(genes)
         )
 
@@ -3486,28 +3540,29 @@ def _chat_impl(user_input, history, should_stop=None):
     elif vasq_note:
         evidence_parts.append("VASQ STATUS:\n" + vasq_note)
 
-    if kg_result and kg_assessment.get("relevant"):
-        evidence_parts.append(
-            "RELEVANT BIOMEDICAL KNOWLEDGE-GRAPH CONTEXT:\n"
-            + cap_source_text(kg_result, 3000)
-        )
-    else:
-        evidence_parts.append(
-            "KNOWLEDGE-GRAPH STATUS:\n"
-            "No sufficiently relevant knowledge-graph content was available."
-        )
+    if not direct_vasq_only:
+        if kg_result and kg_assessment.get("relevant"):
+            evidence_parts.append(
+                "RELEVANT BIOMEDICAL KNOWLEDGE-GRAPH CONTEXT:\n"
+                + cap_source_text(kg_result, 3000)
+            )
+        else:
+            evidence_parts.append(
+                "KNOWLEDGE-GRAPH STATUS:\n"
+                "No sufficiently relevant knowledge-graph content was available."
+            )
 
-    if scientific_web_result:
-        evidence_parts.append(
-            "SCIENTIFIC WEB/LITERATURE EVIDENCE:\n"
-            + cap_source_text(scientific_web_result, 7000)
-        )
-    else:
-        evidence_parts.append(
-            "SCIENTIFIC WEB STATUS:\nNo usable web evidence was returned."
-        )
+        if scientific_web_result:
+            evidence_parts.append(
+                "SCIENTIFIC WEB/LITERATURE EVIDENCE:\n"
+                + cap_source_text(scientific_web_result, 7000)
+            )
+        else:
+            evidence_parts.append(
+                "SCIENTIFIC WEB STATUS:\nNo usable web evidence was returned."
+            )
 
-    if asks_drugs and (genes or diseases):
+    if not direct_vasq_only and asks_drugs and (genes or diseases):
         if drug_result:
             evidence_parts.append(
                 "DRUG AND SMALL-MOLECULE EVIDENCE:\n"
@@ -3526,7 +3581,10 @@ def _chat_impl(user_input, history, should_stop=None):
         "content": (
             "Answer the user's scientific question directly using the evidence "
             "package supplied after the conversation. Integrate only relevant "
-            "evidence. Treat knowledge-graph relationships as associations, "
+            "evidence. When SOURCE SCOPE says VasQ matrix data only, do not "
+            "introduce literature or knowledge-graph claims and do not imply "
+            "that external sources were searched. Treat knowledge-graph "
+            "relationships as associations, "
             "not proof of causality. Use web/literature evidence for current "
             "function, pathway, mechanism, clinical-stage, and regulatory "
             "claims, and preserve its citations. Use VasQ only for measured "
