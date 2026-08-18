@@ -463,6 +463,62 @@ def build_simple_alias_map(values):
     return alias_map
 
 
+def add_region_layer_semantic_aliases(alias_map, available_values):
+    """Add common user-facing names for canonical region_layer labels."""
+    available = set(str(value) for value in (available_values or []))
+    semantic_aliases = {
+        "Cortex": [
+            "cortex",
+            "cortical",
+            "cortical cortex",
+            "cortical gray matter",
+            "cortical grey matter",
+            "cortex gray matter",
+            "cortex grey matter",
+            "gray matter",
+            "grey matter",
+            "cerebral cortex",
+            "neocortex",
+        ],
+        "White Matter Tracts": [
+            "white matter",
+            "white matter tract",
+            "white matter tracts",
+            "white matter tissue",
+            "cerebral white matter",
+            "deep white matter",
+            "frontal white matter",
+            "periventricular white matter",
+            "wm",
+        ],
+        "Major Vessel": [
+            "major vessel",
+            "major vessels",
+            "large vessel",
+            "large vessels",
+        ],
+        "Watershed": [
+            "watershed",
+            "watershed region",
+            "watershed regions",
+            "border zone",
+            "borderzone",
+        ],
+        "Limbic": ["limbic", "limbic system", "limbic region"],
+        "Brainstem": ["brainstem", "brain stem"],
+        "Barrier": ["barrier", "barrier region"],
+        "Olfactory": ["olfactory", "olfactory region", "olfactory system"],
+        "Cerebellum": ["cerebellum", "cerebellar", "cerebellar region"],
+    }
+
+    for canonical, aliases in semantic_aliases.items():
+        if canonical not in available:
+            continue
+        for alias in aliases:
+            alias_map[normalize_text(alias)] = canonical
+    return alias_map
+
+
 def load_gene_names():
     genes_df = pd.read_csv(GENE_NAMES_PATH)
 
@@ -648,6 +704,10 @@ def ensure_matrix_expression_data_loaded():
 
     if MATRIX_REGION_LAYER_ALIAS_MAP is None:
         MATRIX_REGION_LAYER_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_REGION_LAYERS)
+        MATRIX_REGION_LAYER_ALIAS_MAP = add_region_layer_semantic_aliases(
+            MATRIX_REGION_LAYER_ALIAS_MAP,
+            MATRIX_AVAILABLE_REGION_LAYERS,
+        )
 
 
 def dimension_filter_is_disabled(user_input, dimension):
@@ -706,11 +766,11 @@ def resolve_matrix_entities(user_input):
         available_region_layers=MATRIX_AVAILABLE_REGION_LAYERS,
     )
 
-    # A valid GPT result, including a valid empty list, takes priority over
-    # substring matching. This prevents labels mentioned in negated clauses or
-    # as examples (for example "report DLPFC when present, but do not filter by
-    # region_name") from silently becoming filters. Local matching is used
-    # only if the helper request failed and returned None for the dimension.
+    # A valid GPT result, including a valid empty list, takes priority for cell
+    # type, cell class, and region_name. This prevents values in negated clauses
+    # or examples from silently becoming filters. Region-layer aliases are
+    # merged separately below because terms such as "white matter" and
+    # "cortical gray matter" must resolve deterministically.
     cell_type_matches = (
         gpt_cell_type_matches
         if gpt_cell_type_matches is not None
@@ -726,11 +786,16 @@ def resolve_matrix_entities(user_input):
         if gpt_region_matches is not None
         else local_region_matches
     )
-    region_layer_matches = (
-        gpt_region_layer_matches
-        if gpt_region_layer_matches is not None
-        else local_region_layer_matches
-    )
+    if gpt_region_layer_matches is None:
+        region_layer_matches = local_region_layer_matches
+    else:
+        # Deterministic semantic aliases supplement the helper result. This
+        # ensures that natural terms such as "white matter" and "cortical gray
+        # matter" resolve to the canonical layer labels even when the helper
+        # returns an empty or incomplete list.
+        region_layer_matches = list(dict.fromkeys(
+            list(gpt_region_layer_matches) + local_region_layer_matches
+        ))
 
     if dimension_filter_is_disabled(user_input, "cell_type"):
         cell_type_matches = []
