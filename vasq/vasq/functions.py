@@ -519,6 +519,122 @@ def add_region_layer_semantic_aliases(alias_map, available_values):
     return alias_map
 
 
+def add_brain_region_semantic_aliases(alias_map, available_values):
+    """Add deterministic aliases for the region_name controlled vocabulary."""
+    available = set(str(value) for value in (available_values or []))
+    semantic_aliases = {
+        "Middle Cerebral Artery": [
+            "middle cerebral arteries", "middle cerebral arterial", "mca",
+        ],
+        "Anterior Cerebral Artery": [
+            "anterior cerebral arteries", "anterior cerebral arterial", "aca",
+        ],
+        "Basilar Artery/Circle Of Willis": [
+            "basilar artery", "basilar arteries", "circle of willis",
+            "basilar artery and circle of willis", "willis circle",
+        ],
+        "Lateral Temporal Gyrus": [
+            "lateral temporal cortex", "lateral temporal gyri", "ltg",
+        ],
+        "Insula": ["insular cortex", "insular region", "insular"],
+        "Inferior Parietal Lobule": [
+            "inferior parietal cortex", "inferior parietal lobules", "ipl",
+        ],
+        "Midfrontal Anterior Watershed": [
+            "mid frontal anterior watershed", "middle frontal anterior watershed",
+            "midfrontal anterior border zone", "frontal anterior watershed",
+        ],
+        "Superior Parietal Lobule": [
+            "superior parietal cortex", "superior parietal lobules", "spl",
+        ],
+        "Cuneus": ["cuneal cortex", "cuneal region"],
+        "Posterior Watershed": [
+            "posterior watershed region", "posterior border zone",
+            "posterior borderzone",
+        ],
+        "Inferior Frontal Gyrus": [
+            "inferior frontal cortex", "inferior frontal gyri", "ifg",
+        ],
+        "White Matter Anterior Watershed": [
+            "anterior watershed white matter", "white matter anterior border zone",
+            "anterior white matter watershed",
+        ],
+        "Lateral Occipital Cortex": [
+            "lateral occipital", "lateral occipital region", "loc",
+        ],
+        "Dorsolateral Prefrontal Cortex": [
+            "dorsolateral prefrontal", "dorsolateral pfc",
+            "dorsal lateral prefrontal cortex", "dlpfc",
+        ],
+        "Inferior Temporal Gyrus": [
+            "inferior temporal cortex", "inferior temporal gyri", "itg",
+        ],
+        "Middle Temporal Gyrus": [
+            "middle temporal cortex", "middle temporal gyri", "mtg",
+        ],
+        "Midbrain": ["mid brain", "mesencephalon", "mesencephalic region"],
+        "Orbitofrontal Cortex": [
+            "orbitofrontal", "orbital frontal cortex", "orbital prefrontal cortex",
+            "ofc",
+        ],
+        "Periventricular White Matter": [
+            "periventricular wm", "periventricular white-matter", "pvwm",
+        ],
+        "Cingulum": ["cingulum bundle", "cingulate bundle", "cingulate fasciculus"],
+        "Lingual Gyrus": ["lingual cortex", "lingual gyri"],
+        "Anterior Cingulate Cortex": [
+            "anterior cingulate", "anterior cingulate region", "acc",
+        ],
+        "Parahippocampal Gyrus": [
+            "parahippocampal cortex", "parahippocampal gyri", "phg",
+        ],
+        "Posterior Cingulate Cortex": [
+            "posterior cingulate", "posterior cingulate region", "pcc",
+        ],
+        "Pons": ["pontine", "pontine region", "pons region"],
+        "Hippocampus": [
+            "hippocampal", "hippocampal formation", "hippocampal region",
+        ],
+        "Superior Temporal Gyrus": [
+            "superior temporal cortex", "superior temporal gyri", "stg",
+        ],
+        "Choroid Plexus": [
+            "choroidal plexus", "choroid plexuses", "choroid plexus tissue",
+        ],
+        "Superior Frontal Gyrus And Rostromedial": [
+            "superior frontal gyrus", "superior frontal gyri", "sfg",
+            "rostromedial superior frontal gyrus",
+            "superior frontal and rostromedial",
+        ],
+        "Precuneus": ["precuneal cortex", "precuneal region"],
+        "Supramarginal Gyrus": [
+            "supramarginal cortex", "supramarginal gyri", "smg",
+        ],
+        "Entorhinal Cortex": ["entorhinal", "entorhinal region"],
+        "Thalamus": ["thalamic", "thalamic region"],
+        "Corpus Callosum": [
+            "callosal", "callosal white matter", "corpus callosal",
+        ],
+        "Amygdala": ["amygdalar", "amygdaloid", "amygdaloid complex"],
+        "Fusiform Gyrus": ["fusiform cortex", "fusiform gyri"],
+        "Leptomeninges": [
+            "leptomeningeal", "leptomeningeal tissue", "pia arachnoid",
+            "pia-arachnoid",
+        ],
+        "Olfactory Bulb": ["olfactory bulbs", "olfactory bulb region"],
+        "Cerebellum": ["cerebellar", "cerebellar cortex", "cerebellar region"],
+        "Spinal Cord": ["spinal cord tissue", "spinal region", "spinal-cord"],
+        "Fornix": ["fornical", "fornical region", "fornix bundle"],
+    }
+
+    for canonical, aliases in semantic_aliases.items():
+        if canonical not in available:
+            continue
+        for alias in aliases:
+            alias_map[normalize_text(alias)] = canonical
+    return alias_map
+
+
 def load_gene_names():
     genes_df = pd.read_csv(GENE_NAMES_PATH)
 
@@ -701,6 +817,10 @@ def ensure_matrix_expression_data_loaded():
 
     if MATRIX_REGION_ALIAS_MAP is None:
         MATRIX_REGION_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_REGIONS)
+        MATRIX_REGION_ALIAS_MAP = add_brain_region_semantic_aliases(
+            MATRIX_REGION_ALIAS_MAP,
+            MATRIX_AVAILABLE_REGIONS,
+        )
 
     if MATRIX_REGION_LAYER_ALIAS_MAP is None:
         MATRIX_REGION_LAYER_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_REGION_LAYERS)
@@ -767,10 +887,10 @@ def resolve_matrix_entities(user_input):
     )
 
     # A valid GPT result, including a valid empty list, takes priority for cell
-    # type, cell class, and region_name. This prevents values in negated clauses
-    # or examples from silently becoming filters. Region-layer aliases are
-    # merged separately below because terms such as "white matter" and
-    # "cortical gray matter" must resolve deterministically.
+    # type and cell class. Deterministic region_name and region_layer aliases
+    # are merged separately below so abbreviations and semantic variants still
+    # resolve when the helper returns an empty or incomplete list. Explicit
+    # no-filter instructions are applied after merging and remain authoritative.
     cell_type_matches = (
         gpt_cell_type_matches
         if gpt_cell_type_matches is not None
@@ -781,11 +901,14 @@ def resolve_matrix_entities(user_input):
         if gpt_cell_class_matches is not None
         else local_cell_class_matches
     )
-    region_matches = (
-        gpt_region_matches
-        if gpt_region_matches is not None
-        else local_region_matches
-    )
+    if gpt_region_matches is None:
+        region_matches = local_region_matches
+    else:
+        # Supplement the helper with deterministic aliases for the complete
+        # region_name vocabulary (for example DLPFC, MCA, insular cortex).
+        region_matches = list(dict.fromkeys(
+            list(gpt_region_matches) + local_region_matches
+        ))
     if gpt_region_layer_matches is None:
         region_layer_matches = local_region_layer_matches
     else:
