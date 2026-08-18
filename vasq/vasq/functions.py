@@ -926,11 +926,41 @@ def matrix_expression(user_input, genes_override=None):
 
     plot_json = None
     if regional_plot_frames:
-        plot_stats = pd.concat(regional_plot_frames, ignore_index=True)
+        # Cell-type comparisons need a purpose-built plot table. Keep the
+        # requested filters, but always retain brain region on the x-axis and
+        # cell type on the y-axis/panel dimension. Do not force the text table
+        # to use this additional grouping.
+        plot_group_cols = list(group_cols)
+        if "cell_type" in group_cols and (
+            len(present_genes) == 1 or len(present_genes) > 2
+        ):
+            plot_group_cols = ["brain_region"]
+            if "region_layer" in group_cols:
+                plot_group_cols.append("region_layer")
+            plot_group_cols.append("cell_type")
+
+            plot_frames = []
+            for gene in present_genes:
+                gene_plot_stats = summarize_group_expression(
+                    gene,
+                    effective_cell_indices,
+                    plot_group_cols,
+                    min_cells=MIN_CELLS_PER_GROUP,
+                )
+                if not gene_plot_stats.empty:
+                    plot_frames.append(gene_plot_stats)
+            plot_stats = (
+                pd.concat(plot_frames, ignore_index=True)
+                if plot_frames
+                else pd.DataFrame()
+            )
+        else:
+            plot_stats = pd.concat(regional_plot_frames, ignore_index=True)
+
         plot_json = build_matrix_expression_plot(
             plot_stats,
             gene_order=present_genes,
-            comparison_cols=group_cols,
+            comparison_cols=plot_group_cols,
         )
 
     return {
@@ -2356,6 +2386,287 @@ def query_kg_rag(user_input):
         return None
 
 
+def wrap_plot_label(value, max_chars=22, max_lines=3):
+    """Wrap long categorical labels for Plotly without losing hover detail."""
+    words = str(value).replace("_", " ").split()
+    if not words:
+        return ""
+    lines = []
+    current = []
+    for word in words:
+        candidate = " ".join(current + [word])
+        if current and len(candidate) > max_chars:
+            lines.append(" ".join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        lines.append(" ".join(current))
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1][: max_chars - 1].rstrip() + "…"
+    return "<br>".join(lines)
+
+
+def matrix_plot_marker(plot_df, *, showscale=True, color_max=None):
+    """Shared dot-matrix encoding: color=mean, size=expressing fraction."""
+    if color_max is None:
+        positive = plot_df.loc[plot_df["mean_expr"] > 0, "mean_expr"]
+        color_max = float(positive.quantile(0.95)) if not positive.empty else 1.0
+    color_max = max(float(color_max), 0.001)
+    return {
+        "size": (
+            7.0 + 20.0 * np.sqrt(plot_df["pct_expr"].to_numpy())
+        ).round(1).tolist(),
+        "sizemode": "diameter",
+        "color": plot_df["mean_expr"].astype(float).tolist(),
+        "cmin": 0,
+        "cmax": color_max,
+        "colorscale": [
+            [0.00, "#eef6f8"],
+            [0.25, "#8ab4c4"],
+            [0.60, "#5b3d8b"],
+            [1.00, "#32175a"],
+        ],
+        "opacity": [
+            0.5 if int(n) < 20 else 0.92
+            for n in plot_df["n_cells"]
+        ],
+        "line": {"color": "#ffffff", "width": 1},
+        "showscale": showscale,
+        "colorbar": {
+            "title": {"text": "Mean<br>expression"},
+            "thickness": 14,
+            "len": 0.72,
+            "outlinewidth": 0,
+        },
+    }
+
+
+def matrix_plot_hover(plot_df, comparison_cols):
+    display_names = {
+        "brain_region": "Brain region",
+        "region_layer": "Region layer",
+        "cell_class": "Cell class",
+        "cell_type": "Cell type",
+    }
+    hover = []
+    for _, row in plot_df.iterrows():
+        details = [f"<b>{row['gene']}</b>"]
+        for col in comparison_cols:
+            value = row[col]
+            if col == "brain_region":
+                value = pretty_region_name(value)
+            details.append(f"{display_names.get(col, col)}: {value}")
+        details.extend([
+            f"Mean expression: {float(row['mean_expr']):.3f}",
+            f"Expressing cells: {100.0 * float(row['pct_expr']):.1f}%",
+            f"Cells analyzed: {int(row['n_cells']):,}",
+        ])
+        hover.append("<br>".join(details))
+    return hover
+
+
+def build_single_gene_cell_type_matrix(plot_df, comparison_cols):
+    """One gene: region columns by cell-type rows."""
+    region_cols = [
+        col for col in ["brain_region", "region_layer"]
+        if col in comparison_cols
+    ]
+    if not region_cols:
+        return None
+
+    def region_label(row):
+        values = []
+        for col in region_cols:
+            value = row[col]
+            if col == "brain_region":
+                value = pretty_region_name(value)
+            values.append(str(value))
+        return " · ".join(values)
+
+    plot_df = plot_df.copy()
+    plot_df["_region_full"] = plot_df.apply(region_label, axis=1)
+    region_order = sorted(plot_df["_region_full"].drop_duplicates())
+    cell_order = sorted(plot_df["cell_type"].drop_duplicates())
+    tick_text = [wrap_plot_label(value) for value in region_order]
+    gene = str(plot_df["gene"].iloc[0])
+
+    fig = {
+        "data": [{
+            "type": "scatter",
+            "mode": "markers",
+            "x": plot_df["_region_full"].tolist(),
+            "y": plot_df["cell_type"].tolist(),
+            "hovertext": matrix_plot_hover(plot_df, comparison_cols),
+            "hoverinfo": "text",
+            "marker": matrix_plot_marker(plot_df),
+            "showlegend": False,
+        }],
+        "layout": {
+            "title": {
+                "text": (
+                    f"<b>{gene} expression: region × cell type</b>"
+                    "<br><span style='font-size:12px;color:#64748b'>"
+                    "Color = mean expression · Size = expressing-cell fraction"
+                    f" · Groups require ≥{MIN_CELLS_PER_GROUP} cells</span>"
+                ),
+                "x": 0.02,
+                "xanchor": "left",
+            },
+            "height": max(650, 260 + 34 * len(cell_order)),
+            "autosize": True,
+            "paper_bgcolor": "rgba(0,0,0,0)",
+            "plot_bgcolor": "#ffffff",
+            "font": {"family": "Satoshi, Arial, sans-serif", "color": "#32175a", "size": 14},
+            "hoverlabel": {"bgcolor": "#ffffff", "bordercolor": "#8ab4c4", "font": {"color": "#32175a"}},
+            "xaxis": {
+                "title": {"text": "Region", "standoff": 20},
+                "categoryorder": "array",
+                "categoryarray": region_order,
+                "tickmode": "array",
+                "tickvals": region_order,
+                "ticktext": tick_text,
+                "tickangle": -40,
+                "tickfont": {"size": 11},
+                "showgrid": True,
+                "gridcolor": "#edf2f7",
+                "automargin": True,
+            },
+            "yaxis": {
+                "title": {"text": "Cell type", "standoff": 14},
+                "categoryorder": "array",
+                "categoryarray": list(reversed(cell_order)),
+                "tickfont": {"size": 12},
+                "showgrid": True,
+                "gridcolor": "#edf2f7",
+                "automargin": True,
+            },
+            "margin": {"l": 175, "r": 115, "t": 105, "b": 190},
+        },
+    }
+    return json.dumps(fig, allow_nan=False)
+
+
+def build_cell_type_gene_panels(plot_df, gene_order, comparison_cols):
+    """>2 genes: one vertically stacked region-by-gene panel per cell type."""
+    region_cols = [
+        col for col in ["brain_region", "region_layer"]
+        if col in comparison_cols
+    ]
+    if not region_cols:
+        return None
+
+    def region_label(row):
+        values = []
+        for col in region_cols:
+            value = row[col]
+            if col == "brain_region":
+                value = pretty_region_name(value)
+            values.append(str(value))
+        return " · ".join(values)
+
+    plot_df = plot_df.copy()
+    plot_df["_region_full"] = plot_df.apply(region_label, axis=1)
+    region_order = sorted(plot_df["_region_full"].drop_duplicates())
+    tick_text = [wrap_plot_label(value) for value in region_order]
+    cell_types = sorted(plot_df["cell_type"].drop_duplicates())
+    available_genes = plot_df["gene"].drop_duplicates().tolist()
+    gene_order = [g for g in gene_order if g in available_genes]
+    gene_order += [g for g in available_genes if g not in gene_order]
+    positive = plot_df.loc[plot_df["mean_expr"] > 0, "mean_expr"]
+    color_max = float(positive.quantile(0.95)) if not positive.empty else 1.0
+
+    traces = []
+    annotations = []
+    layout_axes = {}
+    panel_gap = 0.025
+    panel_height = (1.0 - panel_gap * (len(cell_types) - 1)) / len(cell_types)
+
+    for index, cell_type in enumerate(cell_types):
+        panel = plot_df[plot_df["cell_type"] == cell_type].copy()
+        axis_number = index + 1
+        axis_suffix = "" if axis_number == 1 else str(axis_number)
+        top = 1.0 - index * (panel_height + panel_gap)
+        bottom = max(0.0, top - panel_height)
+        traces.append({
+            "type": "scatter",
+            "mode": "markers",
+            "x": panel["_region_full"].tolist(),
+            "y": panel["gene"].tolist(),
+            "xaxis": f"x{axis_suffix}",
+            "yaxis": f"y{axis_suffix}",
+            "hovertext": matrix_plot_hover(panel, comparison_cols),
+            "hoverinfo": "text",
+            "marker": matrix_plot_marker(
+                panel,
+                showscale=index == 0,
+                color_max=color_max,
+            ),
+            "showlegend": False,
+        })
+        layout_axes[f"xaxis{axis_suffix}"] = {
+            "domain": [0.0, 1.0],
+            "anchor": f"y{axis_suffix}",
+            "categoryorder": "array",
+            "categoryarray": region_order,
+            "tickmode": "array",
+            "tickvals": region_order,
+            "ticktext": tick_text,
+            "tickangle": -40,
+            "tickfont": {"size": 10},
+            "showticklabels": index == len(cell_types) - 1,
+            "showgrid": True,
+            "gridcolor": "#edf2f7",
+            "automargin": True,
+        }
+        layout_axes[f"yaxis{axis_suffix}"] = {
+            "domain": [bottom, top],
+            "anchor": f"x{axis_suffix}",
+            "categoryorder": "array",
+            "categoryarray": list(reversed(gene_order)),
+            "tickfont": {"size": 11},
+            "showgrid": True,
+            "gridcolor": "#edf2f7",
+            "automargin": True,
+        }
+        annotations.append({
+            "text": f"<b>{cell_type}</b>",
+            "xref": "paper",
+            "yref": "paper",
+            "x": 0,
+            "y": min(1.0, top + 0.008),
+            "xanchor": "left",
+            "yanchor": "bottom",
+            "showarrow": False,
+            "font": {"size": 14, "color": "#32175a"},
+        })
+
+    layout = {
+        "title": {
+            "text": (
+                "<b>VasQ expression by cell type</b>"
+                "<br><span style='font-size:12px;color:#64748b'>"
+                "Each panel is one cell type · x = region · y = gene · "
+                "Color = mean expression · Size = expressing-cell fraction"
+                f" · Groups require ≥{MIN_CELLS_PER_GROUP} cells</span>"
+            ),
+            "x": 0.02,
+            "xanchor": "left",
+        },
+        "height": max(760, 180 + len(cell_types) * max(190, 34 * len(gene_order))),
+        "autosize": True,
+        "paper_bgcolor": "rgba(0,0,0,0)",
+        "plot_bgcolor": "#ffffff",
+        "font": {"family": "Satoshi, Arial, sans-serif", "color": "#32175a", "size": 13},
+        "hoverlabel": {"bgcolor": "#ffffff", "bordercolor": "#8ab4c4", "font": {"color": "#32175a"}},
+        "annotations": annotations,
+        "margin": {"l": 115, "r": 115, "t": 125, "b": 190},
+    }
+    layout.update(layout_axes)
+    return json.dumps({"data": traces, "layout": layout}, allow_nan=False)
+
+
 def build_matrix_expression_plot(
     stats_df,
     gene_order=None,
@@ -2406,6 +2717,29 @@ def build_matrix_expression_plot(
         plot_df["pct_expr"], errors="coerce"
     ).fillna(0.0).clip(lower=0.0, upper=1.0)
 
+    available_genes = plot_df["gene"].drop_duplicates().tolist()
+    gene_order = [g for g in (gene_order or []) if g in available_genes]
+    gene_order += [g for g in available_genes if g not in gene_order]
+
+    # Purpose-built cell-type layouts avoid the unreadable flattened x-axis
+    # produced by concatenating region, layer, and cell type into one label.
+    if "cell_type" in comparison_cols and len(gene_order) == 1:
+        specialized = build_single_gene_cell_type_matrix(
+            plot_df,
+            comparison_cols,
+        )
+        if specialized:
+            return specialized
+
+    if "cell_type" in comparison_cols and len(gene_order) > 2:
+        specialized = build_cell_type_gene_panels(
+            plot_df,
+            gene_order,
+            comparison_cols,
+        )
+        if specialized:
+            return specialized
+
     display_names = {
         "brain_region": "Brain region",
         "region_layer": "Region layer",
@@ -2420,16 +2754,13 @@ def build_matrix_expression_plot(
             if col == "brain_region":
                 value = pretty_region_name(value)
             values.append(value)
-        return " · ".join(values)
+        return "<br>".join(wrap_plot_label(value) for value in values)
 
     plot_df["_comparison_label"] = plot_df.apply(
         comparison_label,
         axis=1,
     )
 
-    available_genes = plot_df["gene"].drop_duplicates().tolist()
-    gene_order = [g for g in (gene_order or []) if g in available_genes]
-    gene_order += [g for g in available_genes if g not in gene_order]
     comparison_order = sorted(
         plot_df["_comparison_label"].drop_duplicates().tolist()
     )
@@ -2532,7 +2863,7 @@ def build_matrix_expression_plot(
                 "x": 0.02,
                 "xanchor": "left",
             },
-            "height": max(600, 120 + 35 * len(gene_order)),
+            "height": max(650, 220 + 42 * len(gene_order)),
             "autosize": True,
             "paper_bgcolor": "rgba(0,0,0,0)",
             "plot_bgcolor": "#ffffff",
@@ -2550,8 +2881,8 @@ def build_matrix_expression_plot(
                 "title": {"text": dimension_title, "standoff": 18},
                 "categoryorder": "array",
                 "categoryarray": comparison_order,
-                "tickangle": -90,
-                "tickfont": {"size": 13},
+                "tickangle": -40,
+                "tickfont": {"size": 11},
                 "showticklabels": True,
                 "showline": True,
                 "linecolor": "#32175a",
@@ -2582,7 +2913,7 @@ def build_matrix_expression_plot(
                 "zeroline": False,
                 "automargin": True,
             },
-            "margin": {"l": 90, "r": 100, "t": 90, "b": 230},
+            "margin": {"l": 110, "r": 115, "t": 105, "b": 190},
         },
     }
 
