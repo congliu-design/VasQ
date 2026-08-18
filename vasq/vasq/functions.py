@@ -2521,7 +2521,11 @@ def build_single_gene_cell_type_matrix(plot_df, comparison_cols):
                 "x": 0.02,
                 "xanchor": "left",
             },
-            "height": max(540, 170 + 22 * len(cell_order)),
+            # Leave enough vertical room for every cell-type tick. When this
+            # was compressed more aggressively, Plotly automatically skipped
+            # alternating y tick labels, making correctly positioned dots look
+            # as though they belonged to the wrong cell type.
+            "height": max(570, 190 + 24 * len(cell_order)),
             "autosize": True,
             "paper_bgcolor": "rgba(0,0,0,0)",
             "plot_bgcolor": "#ffffff",
@@ -2552,12 +2556,18 @@ def build_single_gene_cell_type_matrix(plot_df, comparison_cols):
                 },
                 "categoryorder": "array",
                 "categoryarray": list(reversed(cell_order)),
+                "tickmode": "array",
+                "tickvals": cell_order,
+                "ticktext": [
+                    str(cell_type).replace("_", " ")
+                    for cell_type in cell_order
+                ],
                 "tickfont": {"size": 14},
                 "showgrid": True,
                 "gridcolor": "#edf2f7",
                 "automargin": True,
             },
-            "margin": {"l": 190, "r": 125, "t": 95, "b": 210},
+            "margin": {"l": 205, "r": 125, "t": 95, "b": 210},
         },
     }
     return json.dumps(fig, allow_nan=False)
