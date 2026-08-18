@@ -2416,7 +2416,7 @@ def matrix_plot_marker(plot_df, *, showscale=True, color_max=None):
     color_max = max(float(color_max), 0.001)
     return {
         "size": (
-            6.0 + 17.0 * np.sqrt(plot_df["pct_expr"].to_numpy())
+            4.0 + 13.0 * np.sqrt(plot_df["pct_expr"].to_numpy())
         ).round(1).tolist(),
         "sizemode": "diameter",
         "color": plot_df["mean_expr"].astype(float).tolist(),
@@ -2525,7 +2525,7 @@ def build_single_gene_cell_type_matrix(plot_df, comparison_cols):
             # was compressed more aggressively, Plotly automatically skipped
             # alternating y tick labels, making correctly positioned dots look
             # as though they belonged to the wrong cell type.
-            "height": max(570, 190 + 24 * len(cell_order)),
+            "height": max(650, 210 + 30 * len(cell_order)),
             "autosize": True,
             "paper_bgcolor": "rgba(0,0,0,0)",
             "plot_bgcolor": "#ffffff",
