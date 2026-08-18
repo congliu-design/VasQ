@@ -650,13 +650,48 @@ def ensure_matrix_expression_data_loaded():
         MATRIX_REGION_LAYER_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_REGION_LAYERS)
 
 
+def dimension_filter_is_disabled(user_input, dimension):
+    """Detect explicit instructions not to filter a metadata dimension."""
+    text = normalize_text(user_input)
+    dimension_names = {
+        "cell_type": ["cell type"],
+        "cell_class": ["cell class"],
+        "brain_region": ["brain region", "region name", "region"],
+        "region_layer": ["region layer"],
+    }
+
+    for name in dimension_names.get(dimension, []):
+        escaped = re.escape(name)
+        patterns = [
+            rf"\bdo not apply (?:a |an )?{escaped} filter\b",
+            rf"\bdon't apply (?:a |an )?{escaped} filter\b",
+            rf"\bdo not filter (?:by|on) {escaped}\b",
+            rf"\bdon't filter (?:by|on) {escaped}\b",
+            rf"\bno {escaped} filter\b",
+            rf"\bwithout (?:a |an )?{escaped} filter\b",
+            rf"\bwithout filtering (?:by|on) {escaped}\b",
+        ]
+        if any(re.search(pattern, text) for pattern in patterns):
+            return True
+
+    return False
+
+
 def resolve_matrix_entities(user_input):
     ensure_matrix_expression_data_loaded()
 
-    cell_type_matches = resolve_entities_from_text(user_input, MATRIX_CELL_TYPE_ALIAS_MAP)
-    cell_class_matches = resolve_entities_from_text(user_input, MATRIX_CELL_CLASS_ALIAS_MAP)
-    region_matches = resolve_entities_from_text(user_input, MATRIX_REGION_ALIAS_MAP)
-    region_layer_matches = resolve_entities_from_text(user_input, MATRIX_REGION_LAYER_ALIAS_MAP)
+    local_cell_type_matches = resolve_entities_from_text(
+        user_input, MATRIX_CELL_TYPE_ALIAS_MAP
+    )
+    local_cell_class_matches = resolve_entities_from_text(
+        user_input, MATRIX_CELL_CLASS_ALIAS_MAP
+    )
+    local_region_matches = resolve_entities_from_text(
+        user_input, MATRIX_REGION_ALIAS_MAP
+    )
+    local_region_layer_matches = resolve_entities_from_text(
+        user_input, MATRIX_REGION_LAYER_ALIAS_MAP
+    )
 
     (
         gpt_cell_type_matches,
@@ -671,13 +706,53 @@ def resolve_matrix_entities(user_input):
         available_region_layers=MATRIX_AVAILABLE_REGION_LAYERS,
     )
 
-    cell_type_matches = list(dict.fromkeys(cell_type_matches + gpt_cell_type_matches))
-    cell_class_matches = list(
-        dict.fromkeys(cell_class_matches + gpt_cell_class_matches)
+    # A valid GPT result, including a valid empty list, takes priority over
+    # substring matching. This prevents labels mentioned in negated clauses or
+    # as examples (for example "report DLPFC when present, but do not filter by
+    # region_name") from silently becoming filters. Local matching is used
+    # only if the helper request failed and returned None for the dimension.
+    cell_type_matches = (
+        gpt_cell_type_matches
+        if gpt_cell_type_matches is not None
+        else local_cell_type_matches
     )
-    region_matches = list(dict.fromkeys(region_matches + gpt_region_matches))
-    region_layer_matches = list(
-        dict.fromkeys(region_layer_matches + gpt_region_layer_matches)
+    cell_class_matches = (
+        gpt_cell_class_matches
+        if gpt_cell_class_matches is not None
+        else local_cell_class_matches
+    )
+    region_matches = (
+        gpt_region_matches
+        if gpt_region_matches is not None
+        else local_region_matches
+    )
+    region_layer_matches = (
+        gpt_region_layer_matches
+        if gpt_region_layer_matches is not None
+        else local_region_layer_matches
+    )
+
+    if dimension_filter_is_disabled(user_input, "cell_type"):
+        cell_type_matches = []
+    if dimension_filter_is_disabled(user_input, "cell_class"):
+        cell_class_matches = []
+    if dimension_filter_is_disabled(user_input, "brain_region"):
+        region_matches = []
+    if dimension_filter_is_disabled(user_input, "region_layer"):
+        region_layer_matches = []
+
+    cell_type_matches = list(dict.fromkeys(cell_type_matches or []))
+    cell_class_matches = list(dict.fromkeys(cell_class_matches or []))
+    region_matches = list(dict.fromkeys(region_matches or []))
+    region_layer_matches = list(dict.fromkeys(region_layer_matches or []))
+
+    logger.info(
+        "Matrix filters resolved cell_types=%s cell_classes=%s "
+        "brain_regions=%s region_layers=%s",
+        cell_type_matches,
+        cell_class_matches,
+        region_matches,
+        region_layer_matches,
     )
 
     return cell_type_matches, cell_class_matches, region_matches, region_layer_matches
@@ -778,7 +853,14 @@ def matrix_expression(user_input, genes_override=None):
     missing_genes = [g for g in genes if g not in MATRIX_GENE_TO_IDX]
 
     notes = [
-        "This answer uses log-normalized values from the HVG-filtered expression matrix."
+        "This answer uses log-normalized values from the HVG-filtered expression matrix.",
+        (
+            "Applied matrix filters — "
+            f"Brain region: {', '.join(regions) if regions else 'ALL'}; "
+            f"Region layer: {', '.join(region_layers) if region_layers else 'ALL'}; "
+            f"Cell class: {', '.join(cell_classes) if cell_classes else 'ALL'}; "
+            f"Cell type: {', '.join(cell_types) if cell_types else 'ALL'}."
+        ),
     ]
 
     if missing_genes:
@@ -827,7 +909,7 @@ def matrix_expression(user_input, genes_override=None):
                 stats,
                 gene,
                 group_cols=group_cols,
-                max_rows=20,
+                max_rows=40,
             )
         )
 
@@ -910,11 +992,94 @@ def summarize_group_expression(
     return pd.DataFrame(rows)
 
 
+def select_balanced_expression_rows(
+    stats_df,
+    group_cols,
+    max_rows=40,
+):
+    """Keep requested comparison values represented in a capped table.
+
+    A global top-N by mean expression can accidentally retain only Cortex and
+    hide White Matter Tracts. Select at least one strong row per observed value
+    of each comparison dimension before filling remaining slots by rank.
+    """
+    ranked = stats_df.sort_values(
+        ["mean_expr", "pct_expr", "n_cells"],
+        ascending=[False, False, False],
+    )
+    if max_rows is None or len(ranked) <= max_rows:
+        return ranked
+
+    priority_cols = [
+        col
+        for col in [
+            "region_layer",
+            "brain_region",
+            "cell_type",
+            "cell_class",
+        ]
+        if col in group_cols and col in ranked.columns
+    ]
+    chosen = []
+    chosen_set = set()
+
+    for col in priority_cols:
+        for value in ranked[col].drop_duplicates().tolist():
+            candidates = ranked[ranked[col] == value]
+            for idx in candidates.index:
+                if idx not in chosen_set:
+                    chosen.append(idx)
+                    chosen_set.add(idx)
+                    break
+            if len(chosen) >= max_rows:
+                return ranked.loc[chosen]
+
+    for idx in ranked.index:
+        if idx not in chosen_set:
+            chosen.append(idx)
+            chosen_set.add(idx)
+        if len(chosen) >= max_rows:
+            break
+
+    return ranked.loc[chosen]
+
+
+def format_comparison_coverage(stats_df, group_cols, max_values=30):
+    """Describe all observed metadata values before detailed rows are capped."""
+    display_names = {
+        "brain_region": "Brain region",
+        "region_layer": "Region layer",
+        "cell_class": "Cell class",
+        "cell_type": "Cell type",
+    }
+    lines = [
+        "Observed comparison values after filtering and the minimum-cell rule:"
+    ]
+    for col in group_cols:
+        if col not in stats_df.columns:
+            continue
+        values = sorted(
+            stats_df[col].dropna().astype(str).drop_duplicates().tolist()
+        )
+        shown = values[:max_values]
+        suffix = (
+            f"; plus {len(values) - max_values} additional values"
+            if len(values) > max_values
+            else ""
+        )
+        lines.append(
+            f"- {display_names.get(col, col)}: "
+            + ", ".join(shown)
+            + suffix
+        )
+    return lines
+
+
 def format_matrix_expression_summary(
     stats_df,
     gene,
     group_cols=None,
-    max_rows=20,
+    max_rows=40,
 ):
     if stats_df.empty:
         return (
@@ -928,10 +1093,11 @@ def format_matrix_expression_summary(
         if col in stats_df.columns
     ]
 
-    work = stats_df.sort_values(
-        ["mean_expr", "pct_expr", "n_cells"],
-        ascending=[False, False, False]
-    ).head(max_rows)
+    work = select_balanced_expression_rows(
+        stats_df,
+        group_cols,
+        max_rows=max_rows,
+    )
 
     display_names = {
         "brain_region": "Brain region",
@@ -968,9 +1134,13 @@ def format_matrix_expression_summary(
             f"{MIN_CELLS_PER_GROUP} cells are not displayed):"
         ),
         "",
+    ]
+    lines.extend(format_comparison_coverage(stats_df, group_cols))
+    lines.extend([
+        "",
         header,
         alignment,
-    ]
+    ])
 
     for _, row in work.iterrows():
         dimension_values = [
@@ -1523,8 +1693,14 @@ def resolve_dataset_entities_with_gpt(
         "Map explicitly requested biological entities to labels from a fixed "
         "dataset schema. Resolve cell types, cell classes, brain regions, and "
         "region layers independently. Preserve qualifiers and prefer the most "
-        "specific reliable label. Return multiple labels in a dimension when "
-        "the user asks to compare multiple named values. Do not add every "
+        "specific reliable label. Return a label only when the user asks to "
+        "include or filter on that value. A value mentioned only as an example "
+        "to report when present, in a negated clause, in an exclusion, or in a "
+        "question about dataset availability is not a filter. In particular, "
+        "obey phrases such as 'do not filter', 'no filter', 'without filtering', "
+        "'report when present', and 'whether the data are limited to'. Return "
+        "multiple labels in a dimension when the user asks to compare multiple "
+        "named values. Do not add every "
         "available value merely because the user asks for an all-values "
         "comparison; leave that dimension empty so downstream code can group "
         "the complete dataset. Never invent labels. Return JSON only with keys: "
@@ -1571,7 +1747,9 @@ def resolve_dataset_entities_with_gpt(
 
     except Exception as e:
         logger.exception("GPT dataset entity resolution failed: %s", e)
-        return [], [], [], []
+        # None means the helper failed and allows the caller to use local
+        # matching. A successful helper response can intentionally return [].
+        return None, None, None, None
 
 
 
@@ -1624,16 +1802,17 @@ def extract_entities(user_input):
     )
 
     # GPT's more specific result takes priority.
-    # Local alias matching is used only if GPT returned no match.
+    # Local alias matching is used only if the GPT helper failed. A valid
+    # empty GPT list means that the dimension was not requested as a filter.
     selected_cell_matches = (
         gpt_cell_matches
-        if gpt_cell_matches
+        if gpt_cell_matches is not None
         else alias_cell_matches
     )
 
     selected_region_matches = (
         gpt_region_matches
-        if gpt_region_matches
+        if gpt_region_matches is not None
         else alias_region_matches
     )
 
@@ -3364,7 +3543,12 @@ def _chat_impl(user_input, history, should_stop=None):
             "cell class, and/or cell type dimensions with the supplied measured "
             "values. Preserve every comparison dimension present in the VasQ "
             "table and never merge distinct region layers, cell types, or brain "
-            "regions. Use reader-facing dimension columns named Brain region, "
+            "regions. Treat the supplied 'Applied matrix filters' line as the "
+            "authoritative record of which filters were actually used. Treat "
+            "the supplied 'Observed comparison values' list as authoritative "
+            "coverage: never claim that a value such as White Matter Tracts is "
+            "absent when it appears in that list, even if a capped detail table "
+            "shows only some rows. Use reader-facing dimension columns named Brain region, "
             "Region layer, Cell class, and Cell type when each is present, "
             "followed by Mean expression (log-normalized), Expressing cells, "
             "and Cells analyzed (n). Never reconstruct, infer, or display a "
