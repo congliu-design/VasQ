@@ -3090,8 +3090,37 @@ def search_vertex_ai(query):
     return "\n\n".join(formatted_results).strip()
 
 
+def explicitly_disables_web_search(user_input: str) -> bool:
+    """Detect an instruction to skip external Web/literature retrieval."""
+    text = normalize_text(user_input)
+    patterns = [
+        r"\bdo not use(?: kg rag,?)? (?:openai )?web search\b",
+        r"\bdon't use(?: kg rag,?)? (?:openai )?web search\b",
+        r"\bdont use(?: kg rag,?)? (?:openai )?web search\b",
+        r"\bdo not (?:search|browse) (?:the )?web\b",
+        r"\bdon't (?:search|browse) (?:the )?web\b",
+        r"\b(?:no|without|skip|avoid) (?:openai )?web search\b",
+        r"\bdo not use (?:external |web |literature )?(?:evidence|sources)\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
 def wants_web_search(user_input: str) -> bool:
-    lowered = user_input.lower()
+    # Remove explicitly negated search phrases before looking for positive
+    # search requests. Previously, "Do not use Web Search" matched the bare
+    # term "web search" and incorrectly enabled external retrieval.
+    lowered = normalize_text(user_input)
+    negated_patterns = [
+        r"\bdo not use(?: kg rag,?)? (?:openai )?web search\b",
+        r"\bdon't use(?: kg rag,?)? (?:openai )?web search\b",
+        r"\bdont use(?: kg rag,?)? (?:openai )?web search\b",
+        r"\bdo not (?:search|browse) (?:the )?web\b",
+        r"\bdon't (?:search|browse) (?:the )?web\b",
+        r"\b(?:no|without|skip|avoid) (?:openai )?web search\b",
+    ]
+    for pattern in negated_patterns:
+        lowered = re.sub(pattern, " ", lowered)
+
     web_terms = [
         "search google",
         "google",
@@ -3129,7 +3158,23 @@ def explicitly_requests_vasq_matrix(user_input: str) -> bool:
         "using only vasq data",
         "vasq matrix only",
     ]
-    return any(term in text for term in vasq_only_terms)
+    if any(term in text for term in vasq_only_terms):
+        return True
+
+    # Accept natural variants such as "based only on the retrieved VasQ
+    # matrix measurements" instead of depending on one exact word order.
+    if "vasq matrix" in text and re.search(
+        r"\b(?:only|solely|exclusively)\b",
+        text,
+    ):
+        return True
+
+    # An explicit VasQ matrix request paired with a no-Web-Search instruction
+    # is also unambiguously matrix-only.
+    return (
+        "vasq matrix" in text
+        and explicitly_disables_web_search(user_input)
+    )
 
 
 def parse_json_object(raw_text):
