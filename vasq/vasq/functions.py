@@ -2416,7 +2416,7 @@ def matrix_plot_marker(plot_df, *, showscale=True, color_max=None):
     color_max = max(float(color_max), 0.001)
     return {
         "size": (
-            7.0 + 20.0 * np.sqrt(plot_df["pct_expr"].to_numpy())
+            6.0 + 17.0 * np.sqrt(plot_df["pct_expr"].to_numpy())
         ).round(1).tolist(),
         "sizemode": "diameter",
         "color": plot_df["mean_expr"].astype(float).tolist(),
@@ -2435,7 +2435,11 @@ def matrix_plot_marker(plot_df, *, showscale=True, color_max=None):
         "line": {"color": "#ffffff", "width": 1},
         "showscale": showscale,
         "colorbar": {
-            "title": {"text": "Mean<br>expression"},
+            "title": {
+                "text": "Mean<br>expression",
+                "font": {"size": 16},
+            },
+            "tickfont": {"size": 14},
             "thickness": 14,
             "len": 0.72,
             "outlinewidth": 0,
@@ -2489,7 +2493,10 @@ def build_single_gene_cell_type_matrix(plot_df, comparison_cols):
     plot_df["_region_full"] = plot_df.apply(region_label, axis=1)
     region_order = sorted(plot_df["_region_full"].drop_duplicates())
     cell_order = sorted(plot_df["cell_type"].drop_duplicates())
-    tick_text = [wrap_plot_label(value) for value in region_order]
+    tick_text = [
+        wrap_plot_label(value, max_chars=28, max_lines=2)
+        for value in region_order
+    ]
     gene = str(plot_df["gene"].iloc[0])
 
     fig = {
@@ -2514,35 +2521,43 @@ def build_single_gene_cell_type_matrix(plot_df, comparison_cols):
                 "x": 0.02,
                 "xanchor": "left",
             },
-            "height": max(650, 260 + 34 * len(cell_order)),
+            "height": max(540, 170 + 22 * len(cell_order)),
             "autosize": True,
             "paper_bgcolor": "rgba(0,0,0,0)",
             "plot_bgcolor": "#ffffff",
-            "font": {"family": "Satoshi, Arial, sans-serif", "color": "#32175a", "size": 14},
+            "font": {"family": "Satoshi, Arial, sans-serif", "color": "#32175a", "size": 16},
             "hoverlabel": {"bgcolor": "#ffffff", "bordercolor": "#8ab4c4", "font": {"color": "#32175a"}},
             "xaxis": {
-                "title": {"text": "Region", "standoff": 20},
+                "title": {
+                    "text": "Region",
+                    "standoff": 18,
+                    "font": {"size": 20},
+                },
                 "categoryorder": "array",
                 "categoryarray": region_order,
                 "tickmode": "array",
                 "tickvals": region_order,
                 "ticktext": tick_text,
-                "tickangle": -40,
-                "tickfont": {"size": 11},
+                "tickangle": -90,
+                "tickfont": {"size": 14},
                 "showgrid": True,
                 "gridcolor": "#edf2f7",
                 "automargin": True,
             },
             "yaxis": {
-                "title": {"text": "Cell type", "standoff": 14},
+                "title": {
+                    "text": "Cell type",
+                    "standoff": 14,
+                    "font": {"size": 20},
+                },
                 "categoryorder": "array",
                 "categoryarray": list(reversed(cell_order)),
-                "tickfont": {"size": 12},
+                "tickfont": {"size": 14},
                 "showgrid": True,
                 "gridcolor": "#edf2f7",
                 "automargin": True,
             },
-            "margin": {"l": 175, "r": 115, "t": 105, "b": 190},
+            "margin": {"l": 190, "r": 125, "t": 95, "b": 210},
         },
     }
     return json.dumps(fig, allow_nan=False)
