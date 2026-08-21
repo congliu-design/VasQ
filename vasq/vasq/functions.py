@@ -1,23 +1,18 @@
 import difflib
 import contextvars
 import json
+import threading
 import openai
 import os
 import pandas as pd
 import re
 import requests
 import time
-import difflib
 import ast
 import logging
 import numpy as np
 from scipy import sparse
 
-# Set gloabl variables
-global func_flag
-global init_flag
-func_flag = False
-init_flag = True
 from openai import OpenAI
 
 
@@ -75,18 +70,6 @@ def _stage_timeout(stage_name, requested_seconds, reserve_seconds=5.0):
         reserve_seconds,
     )
     return effective
-
-#def query_kg_rag(user_input):
-#    url = os.getenv("KG_RAG_URL", "http://kg-rag.railway.internal:8080/query")
-#    logger.info("Calling KG_RAG_URL=%s", url)
-#    response = requests.post(url, json={"query": user_input}, timeout=120)
-#    logger.info("kg-rag status=%s body=%s", response.status_code, response.text[:500])
-#    response.raise_for_status()
-#    return response.json()
-
-
-# Set API key
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Disable the SDK's long default retry chain at the shared-client level.
 # Individual calls opt into a small, bounded retry count below.
@@ -375,7 +358,6 @@ def update_history(history, role, content):
 
 # Initialize chat
 def initialize(history):
-    global init_flag
     system_prompt = (
         "You are a neuroscience and biomedical research assistant. Maintain "
         "context across follow-up questions and answer at a professional "
@@ -394,7 +376,6 @@ def initialize(history):
     )
 
     update_history(history, "system", system_prompt)
-    init_flag = False
 
 # Call function from chat
 
@@ -403,8 +384,6 @@ def func_call(user_input, chat_message, history):
         logger.info("func_call override: explicit web/literature intent -> Google")
         return search_openai_web(user_input)
 
-    global func_flag
-    func_flag = True
     content = None
 
     func_name = chat_message.function_call.name
@@ -423,7 +402,6 @@ def func_call(user_input, chat_message, history):
     args = {"user_input": user_input}
     content = globals()[func_name](**args)
 
-    func_flag = False
     return content
 
 
@@ -434,6 +412,10 @@ REGION_META_PATH = os.path.join(DATA_DIR, "region_metadata.csv")
 MATRIX_NPZ_PATH = os.path.join(DATA_DIR, "VasQ_adata_X_sparse.npz")
 CELL_META_PATH = os.path.join(DATA_DIR, "VasQ_cell_meta_table.csv")
 GENE_NAMES_PATH = os.path.join(DATA_DIR, "VasQ_gene_names.csv")
+
+# Guards the lazy-load below so two concurrent requests hitting a cold
+# cache at the same time can't both start loading the (large) matrix data.
+_MATRIX_LOAD_LOCK = threading.Lock()
 
 MATRIX_EXPR = None
 MATRIX_META = None
@@ -765,69 +747,70 @@ def ensure_matrix_expression_data_loaded():
     global MATRIX_CELL_TYPE_ALIAS_MAP, MATRIX_CELL_CLASS_ALIAS_MAP
     global MATRIX_REGION_ALIAS_MAP, MATRIX_REGION_LAYER_ALIAS_MAP
 
-    if MATRIX_EXPR is None or MATRIX_META is None or MATRIX_GENES is None:
-        MATRIX_EXPR, MATRIX_META, MATRIX_GENES = load_matrix_expression_data()
-        MATRIX_GENE_TO_IDX = {g: i for i, g in enumerate(MATRIX_GENES)}
+    with _MATRIX_LOAD_LOCK:
+        if MATRIX_EXPR is None or MATRIX_META is None or MATRIX_GENES is None:
+            MATRIX_EXPR, MATRIX_META, MATRIX_GENES = load_matrix_expression_data()
+            MATRIX_GENE_TO_IDX = {g: i for i, g in enumerate(MATRIX_GENES)}
 
-    if MATRIX_AVAILABLE_CELL_TYPES is None:
-        MATRIX_AVAILABLE_CELL_TYPES = sorted(
-            MATRIX_META["cell_type"].dropna().astype(str).unique().tolist()
-        )
+        if MATRIX_AVAILABLE_CELL_TYPES is None:
+            MATRIX_AVAILABLE_CELL_TYPES = sorted(
+                MATRIX_META["cell_type"].dropna().astype(str).unique().tolist()
+            )
 
-    if MATRIX_AVAILABLE_CELL_CLASSES is None:
-        MATRIX_AVAILABLE_CELL_CLASSES = sorted(
-            MATRIX_META["cell_class"].dropna().astype(str).unique().tolist()
-        )
+        if MATRIX_AVAILABLE_CELL_CLASSES is None:
+            MATRIX_AVAILABLE_CELL_CLASSES = sorted(
+                MATRIX_META["cell_class"].dropna().astype(str).unique().tolist()
+            )
 
-    if MATRIX_AVAILABLE_REGIONS is None:
-        MATRIX_AVAILABLE_REGIONS = sorted(
-            MATRIX_META["brain_region"].dropna().astype(str).unique().tolist()
-        )
+        if MATRIX_AVAILABLE_REGIONS is None:
+            MATRIX_AVAILABLE_REGIONS = sorted(
+                MATRIX_META["brain_region"].dropna().astype(str).unique().tolist()
+            )
 
-    if MATRIX_AVAILABLE_REGION_LAYERS is None:
-        MATRIX_AVAILABLE_REGION_LAYERS = sorted(
-            MATRIX_META["region_layer"].dropna().astype(str).unique().tolist()
-        )
+        if MATRIX_AVAILABLE_REGION_LAYERS is None:
+            MATRIX_AVAILABLE_REGION_LAYERS = sorted(
+                MATRIX_META["region_layer"].dropna().astype(str).unique().tolist()
+            )
 
-    if MATRIX_CELL_TYPE_ALIAS_MAP is None:
-        MATRIX_CELL_TYPE_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_CELL_TYPES)
-        MATRIX_CELL_TYPE_ALIAS_MAP.update({
-            "capillary": "Capillary",
-            "capillaries": "Capillary",
-            "arterial": "Arterial",
-            "arteriole": "Arterial",
-            "arterioles": "Arterial",
-            "venous": "Venous" if "Venous" in MATRIX_AVAILABLE_CELL_TYPES else "Vein",
-            "opc": "OPC",
-            "astrocyte": "Astrocyte",
-            "astrocytes": "Astrocyte",
-        })
+        if MATRIX_CELL_TYPE_ALIAS_MAP is None:
+            MATRIX_CELL_TYPE_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_CELL_TYPES)
+            MATRIX_CELL_TYPE_ALIAS_MAP.update({
+                "capillary": "Capillary",
+                "capillaries": "Capillary",
+                "arterial": "Arterial",
+                "arteriole": "Arterial",
+                "arterioles": "Arterial",
+                "venous": "Venous" if "Venous" in MATRIX_AVAILABLE_CELL_TYPES else "Vein",
+                "opc": "OPC",
+                "astrocyte": "Astrocyte",
+                "astrocytes": "Astrocyte",
+            })
 
-    if MATRIX_CELL_CLASS_ALIAS_MAP is None:
-        MATRIX_CELL_CLASS_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_CELL_CLASSES)
-        MATRIX_CELL_CLASS_ALIAS_MAP.update({
-            "endothelial": "Endothelial",
-            "endothelial cells": "Endothelial",
-            "astrocyte": "Astrocyte",
-            "astrocytes": "Astrocyte",
-            "fibroblast": "Fibroblast",
-            "fibroblasts": "Fibroblast",
-            "opc": "OPC",
-        })
+        if MATRIX_CELL_CLASS_ALIAS_MAP is None:
+            MATRIX_CELL_CLASS_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_CELL_CLASSES)
+            MATRIX_CELL_CLASS_ALIAS_MAP.update({
+                "endothelial": "Endothelial",
+                "endothelial cells": "Endothelial",
+                "astrocyte": "Astrocyte",
+                "astrocytes": "Astrocyte",
+                "fibroblast": "Fibroblast",
+                "fibroblasts": "Fibroblast",
+                "opc": "OPC",
+            })
 
-    if MATRIX_REGION_ALIAS_MAP is None:
-        MATRIX_REGION_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_REGIONS)
-        MATRIX_REGION_ALIAS_MAP = add_brain_region_semantic_aliases(
-            MATRIX_REGION_ALIAS_MAP,
-            MATRIX_AVAILABLE_REGIONS,
-        )
+        if MATRIX_REGION_ALIAS_MAP is None:
+            MATRIX_REGION_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_REGIONS)
+            MATRIX_REGION_ALIAS_MAP = add_brain_region_semantic_aliases(
+                MATRIX_REGION_ALIAS_MAP,
+                MATRIX_AVAILABLE_REGIONS,
+            )
 
-    if MATRIX_REGION_LAYER_ALIAS_MAP is None:
-        MATRIX_REGION_LAYER_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_REGION_LAYERS)
-        MATRIX_REGION_LAYER_ALIAS_MAP = add_region_layer_semantic_aliases(
-            MATRIX_REGION_LAYER_ALIAS_MAP,
-            MATRIX_AVAILABLE_REGION_LAYERS,
-        )
+        if MATRIX_REGION_LAYER_ALIAS_MAP is None:
+            MATRIX_REGION_LAYER_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_REGION_LAYERS)
+            MATRIX_REGION_LAYER_ALIAS_MAP = add_region_layer_semantic_aliases(
+                MATRIX_REGION_LAYER_ALIAS_MAP,
+                MATRIX_AVAILABLE_REGION_LAYERS,
+            )
 
 
 def dimension_filter_is_disabled(user_input, dimension):
@@ -1101,16 +1084,13 @@ def matrix_expression(user_input, genes_override=None):
             )
         )
 
-        # Use the same grouping and cell threshold in the visual so its points
-        # correspond exactly to the rows that are eligible for the table.
-        comparison_stats = summarize_group_expression(
-            gene,
-            effective_cell_indices,
-            group_cols,
-            min_cells=MIN_CELLS_PER_GROUP,
-        )
-        if not comparison_stats.empty:
-            regional_plot_frames.append(comparison_stats)
+        # `stats` already uses the same grouping and cell threshold, so reuse
+        # it for the visual instead of recomputing it with identical
+        # arguments. This keeps the plot points exactly aligned with the
+        # rows shown in the table while avoiding a second, redundant pass
+        # over the expression matrix for every gene.
+        if not stats.empty:
+            regional_plot_frames.append(stats)
 
     plot_json = None
     if regional_plot_frames:
@@ -1852,12 +1832,9 @@ def build_marker_bar_plot(marker_rows, title=None):
 
 
 # global cached objects
-#EXPR_DF = load_expression_data()
-#REGION_META_DF = load_region_metadata()
-#REGION_ALIAS_MAP = build_region_alias_map(REGION_META_DF)
-#CELL_TYPE_ALIAS_MAP = build_cell_type_alias_map(EXPR_DF)
-
 # global cached objects
+_EXPR_LOAD_LOCK = threading.Lock()
+
 EXPR_DF = None
 REGION_META_DF = None
 REGION_ALIAS_MAP = None
@@ -1870,23 +1847,49 @@ def ensure_expression_data_loaded():
     global EXPR_DF, REGION_META_DF, REGION_ALIAS_MAP, CELL_TYPE_ALIAS_MAP
     global AVAILABLE_CELL_TYPES, AVAILABLE_REGIONS
 
-    if EXPR_DF is None:
-        EXPR_DF = load_expression_data()
+    with _EXPR_LOAD_LOCK:
+        if EXPR_DF is None:
+            EXPR_DF = load_expression_data()
 
-    if REGION_META_DF is None:
-        REGION_META_DF = load_region_metadata()
+        if REGION_META_DF is None:
+            REGION_META_DF = load_region_metadata()
 
-    if REGION_ALIAS_MAP is None:
-        REGION_ALIAS_MAP = build_region_alias_map(REGION_META_DF)
+        if REGION_ALIAS_MAP is None:
+            REGION_ALIAS_MAP = build_region_alias_map(REGION_META_DF)
 
-    if CELL_TYPE_ALIAS_MAP is None:
-        CELL_TYPE_ALIAS_MAP = build_cell_type_alias_map(EXPR_DF)
+        if CELL_TYPE_ALIAS_MAP is None:
+            CELL_TYPE_ALIAS_MAP = build_cell_type_alias_map(EXPR_DF)
 
-    if AVAILABLE_CELL_TYPES is None:
-        AVAILABLE_CELL_TYPES = sorted(EXPR_DF["cell_type"].dropna().unique().tolist())
+        if AVAILABLE_CELL_TYPES is None:
+            AVAILABLE_CELL_TYPES = sorted(EXPR_DF["cell_type"].dropna().unique().tolist())
 
-    if AVAILABLE_REGIONS is None:
-        AVAILABLE_REGIONS = sorted(EXPR_DF["region"].dropna().unique().tolist())
+        if AVAILABLE_REGIONS is None:
+            AVAILABLE_REGIONS = sorted(EXPR_DF["region"].dropna().unique().tolist())
+
+def _match_available_labels(candidates, available, *, dimension_name):
+    """Keep only candidates that correspond to a label in `available`.
+
+    Matching is case/whitespace-insensitive so a minor casing difference in
+    the model's output doesn't silently get dropped and misread downstream
+    as "user did not request this filter". Any candidate that still can't
+    be matched is logged instead of disappearing without a trace.
+    """
+    lookup = {str(a).strip().casefold(): a for a in available}
+    matched = []
+    for candidate in candidates:
+        key = str(candidate).strip().casefold()
+        canonical = lookup.get(key)
+        if canonical is not None:
+            matched.append(canonical)
+        else:
+            logger.warning(
+                "resolve_dataset_entities_with_gpt: dropping unmatched %s "
+                "candidate %r (not in available labels)",
+                dimension_name,
+                candidate,
+            )
+    return matched
+
 
 def resolve_dataset_entities_with_gpt(
     user_input,
@@ -1899,14 +1902,6 @@ def resolve_dataset_entities_with_gpt(
     available_regions = available_regions or []
     available_cell_classes = available_cell_classes or []
     available_region_layers = available_region_layers or []
-    # system_prompt = (
-     #   "You are helping map a biology question onto a fixed dataset schema. "
-      #  "Choose the closest matching dataset labels from the provided lists. "
-       # "Return JSON only with keys: "
-        #'{"cell_types": [], "regions": []}. '
-        #"Only use labels that appear in the provided lists. "
-        #"Do not invent labels."
-   # )
     system_prompt = (
         "Map explicitly requested biological entities to labels from a fixed "
         "dataset schema. Resolve cell types, cell classes, brain regions, and "
@@ -1952,14 +1947,18 @@ def resolve_dataset_entities_with_gpt(
         regions = parsed.get("regions", [])
         region_layers = parsed.get("region_layers", [])
 
-        cell_types = [x for x in cell_types if x in available_cell_types]
-        cell_classes = [
-            x for x in cell_classes if x in available_cell_classes
-        ]
-        regions = [x for x in regions if x in available_regions]
-        region_layers = [
-            x for x in region_layers if x in available_region_layers
-        ]
+        cell_types = _match_available_labels(
+            cell_types, available_cell_types, dimension_name="cell_type"
+        )
+        cell_classes = _match_available_labels(
+            cell_classes, available_cell_classes, dimension_name="cell_class"
+        )
+        regions = _match_available_labels(
+            regions, available_regions, dimension_name="region"
+        )
+        region_layers = _match_available_labels(
+            region_layers, available_region_layers, dimension_name="region_layer"
+        )
 
         return cell_types, cell_classes, regions, region_layers
 
@@ -2069,16 +2068,23 @@ def extract_genes(user_input):
         "If no genes are explicitly mentioned, return []."
     )
 
-    response = call_helper_api(system_prompt, user_input)
-
-    raw_text = response.choices[0].message.content.strip()
+    try:
+        response = call_helper_api(system_prompt, user_input)
+        raw_text = response.choices[0].message.content.strip()
+    except Exception:
+        # Match the degrade-gracefully pattern used by the other helper/web
+        # calls: a slow or failed API call should skip gene extraction, not
+        # bubble up and cost the whole turn (which would otherwise only be
+        # caught by chat()'s top-level fallback).
+        logger.exception("extract_genes: call_helper_api failed")
+        return []
 
     try:
         genes = ast.literal_eval(raw_text)
         if isinstance(genes, list):
             return [str(g).upper().strip() for g in genes if str(g).strip()]
     except Exception:
-        pass
+        logger.warning("extract_genes: could not parse model output: %r", raw_text)
 
     return []
 
@@ -3161,176 +3167,6 @@ def build_matrix_expression_plot(
     return json.dumps(fig, allow_nan=False)
 
 
-### Search Functions ###
-
-# Search Google
-def search_google(query):
-    google_api_key = os.getenv("GOOGLE_API_KEY")
-    search_engine_id = os.getenv("SEARCH_ENGINE_ID")
-
-    if not google_api_key:
-        logger.error("Google search failed: GOOGLE_API_KEY is missing")
-        return ""
-
-    if not search_engine_id:
-        logger.error("Google search failed: SEARCH_ENGINE_ID is missing")
-        return ""
-
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {
-        "key": google_api_key,
-        "cx": search_engine_id,
-        "q": query,
-        "num": 5,
-    }
-
-    try:
-        response = requests.get(url, params=params, timeout=30)
-        logger.info("Google status: %s", response.status_code)
-        logger.info("Google body: %s", response.text[:1000])
-        response.raise_for_status()
-        data = response.json()
-    except Exception:
-        logger.exception("Google search request failed")
-        return ""
-
-    items = data.get("items", [])
-    if not items:
-        logger.warning("Google search returned no items")
-        return ""
-
-    formatted_results = ""
-    for idx, item in enumerate(items, start=1):
-        title = item.get("title", "No Title")
-        link = item.get("link", "No Link")
-        snippet = item.get("snippet", "")
-        formatted_results += f"{idx}. {title}\n{link}\n{snippet}\n\n"
-
-    return formatted_results
-
-import os
-from google.api_core.client_options import ClientOptions
-from google.cloud import discoveryengine_v1 as discoveryengine
-
-
-import json
-import os
-from google.api_core.client_options import ClientOptions
-from google.cloud import discoveryengine_v1 as discoveryengine
-from google.oauth2 import service_account
-
-
-
-from google.oauth2 import service_account
-
-def search_vertex_ai(query):
-    project_id = os.getenv("VERTEX_PROJECT_ID")
-    location = os.getenv("VERTEX_LOCATION", "global")
-    engine_id = os.getenv("VERTEX_ENGINE_ID")
-    serving_config_id = os.getenv("VERTEX_SERVING_CONFIG", "default_search")
-    sa_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
-
-    logger.info(
-        "Vertex config present? project=%s engine=%s sa_json_present=%s",
-        bool(project_id), bool(engine_id), bool(sa_json)
-    )
-
-    if not project_id or not engine_id:
-        logger.error("Missing Vertex config: VERTEX_PROJECT_ID or VERTEX_ENGINE_ID")
-        return ""
-
-    if not sa_json:
-        logger.error("Missing GCP_SERVICE_ACCOUNT_JSON")
-        return ""
-
-    try:
-        sa_info = json.loads(sa_json)
-        credentials = service_account.Credentials.from_service_account_info(sa_info)
-    except Exception as e:
-        logger.exception("Failed to parse GCP_SERVICE_ACCOUNT_JSON: %s", e)
-        return ""
-
-    client_options = ClientOptions(
-        api_endpoint=(
-            "discoveryengine.googleapis.com"
-            if location == "global"
-            else f"{location}-discoveryengine.googleapis.com"
-        )
-    )
-
-    try:
-        client = discoveryengine.SearchServiceClient(
-            credentials=credentials,
-            client_options=client_options,
-        )
-    except Exception as e:
-        logger.exception("Failed to create Vertex client: %s", e)
-        return ""
-
-    serving_config = (
-        f"projects/{project_id}/locations/{location}/collections/default_collection/"
-        f"engines/{engine_id}/servingConfigs/{serving_config_id}"
-    )
-
-    request = discoveryengine.SearchRequest(
-        serving_config=serving_config,
-        query=query,
-        page_size=5,
-    )
-
-    try:
-        response = client.search(request=request)
-        logger.info("Vertex result count=%d", len(response.results))
-        for i, result in enumerate(response.results, 1):
-            doc = result.document
-            logger.info("doc[%d].id=%r", i, getattr(doc, "id", None))
-            logger.info(
-                "doc[%d].derived_struct_data type=%s value=%r",
-                i,
-                type(getattr(doc, "derived_struct_data", None)),
-                getattr(doc, "derived_struct_data", None),
-            )
-    except Exception as e:
-        logger.exception("Vertex AI Search failed: %s", e)
-        return ""
-
-    formatted_results = []
-    for i, result in enumerate(response.results, start=1):
-        doc = result.document
-        derived = getattr(doc, "derived_struct_data", None)
-
-        title = ""
-        link = ""
-        snippet = ""
-
-        if derived:
-            try:
-                derived = dict(derived)
-            except Exception:
-                derived = {}
-
-        if isinstance(derived, dict):
-            title = derived.get("title", "") or ""
-            link = derived.get("link", "") or ""
-
-            snippets = derived.get("snippets", []) or []
-            if snippets:
-                first_snippet = snippets[0]
-                try:
-                    first_snippet = dict(first_snippet)
-                except Exception:
-                    pass
-                if isinstance(first_snippet, dict):
-                    snippet = first_snippet.get("snippet", "") or ""
-
-        if not title:
-            title = getattr(doc, "id", "No Title")
-
-        formatted_results.append(f"{i}. {title}\n{link}\n{snippet}")
-
-    return "\n\n".join(formatted_results).strip()
-
-
 def explicitly_disables_web_search(user_input: str) -> bool:
     """Detect an instruction to skip external Web/literature retrieval."""
     text = normalize_text(user_input)
@@ -3776,112 +3612,6 @@ def looks_like_expression_query(user_input):
 
 
 ### Main Chat Function ###
-
-# Chat between user and chatbot
-
-
-
-
-#def chat(user_input, history):
-#    global func_flag, init_flag
-#
-#    if init_flag:
-#        history.clear()
-#        initialize(history)
-#
-#    update_history(history, "user", user_input)
-#
-#    retrieved_info = None
-#    chat_message = call_api(history, functions)
-#    logger.info("First model content: %s", getattr(chat_message, "content", None))
-#    logger.info("Function call present: %s", bool(chat_message.function_call))
-#    
-#    if chat_message.function_call:
-#        try:
-#            retrieved_info = func_call(user_input, chat_message, history)
-#        except Exception as e:
-#            logger.exception("func_call failed: %s", e)
-#            retrieved_info = None
-
-#    # If function calling missed it or returned nothing useful, try local gene-expression data first
-#    if not retrieved_info and looks_like_expression_query(user_input):
-
-#        logger.info("Heuristic routing to gene_expression first")
-#        try:
-#            retrieved_info = gene_expression(user_input)
-#        except Exception as e:
-#            logger.exception("gene_expression heuristic failed: %s", e)
-#            retrieved_info = None
-#
-#    # KG-RAG before Google for graph-style biomedical questions
-#    if not retrieved_info:
-#        lowered = user_input.lower()
-#        kg_terms = [
-#            "drug", "drugs", "target", "targets", "disease",
-#            "association", "associated", "pathway", "pathways",
-#            "implicated", "implication"
-#        ]
-#        if any(term in lowered for term in kg_terms):
-#            try:
-#                retrieved_info = query_kg_rag(user_input)
-#            except Exception as e:
-#                logger.exception("KG query failed: %s", e)
-#                retrieved_info = None
-#
-#    if not retrieved_info:
-#        logger.info("Calling Google Vertex AI API...")
-#        try:
-#            retrieved_info = search_openai_web(user_input)
-#            if not retrieved_info:
-#                logger.warning("Google search returned no usable results")
-#        except Exception as e:
-#            logger.exception("Google search failed")
-#            retrieved_info = None
-    
-#    graph_json = None
-
-#    if not retrieved_info:
-#        retrieved_info = ""
-
-#    if isinstance(retrieved_info, dict):
-#        graph_json = retrieved_info.get("graph_json")
-#        retrieved_text = retrieved_info.get("text", "")
-#    else:
-#        retrieved_text = retrieved_info
-
-#    if not isinstance(retrieved_text, str):
-#        retrieved_text = str(retrieved_text)
-
-#    retrieved_text = retrieved_text[:4000]
-
-
-#    synthesis_messages = history[:] + [
-#        {
-#            "role": "system",
-#            "content": (
-#                "Answer the user's question directly using the retrieved information below. "
-#                "Do not mention search tools or internal routing."
-#
-#            )
-#        },
-#        {
-#            "role": "user",
-#            "content": f"Retrieved information:\n{retrieved_text}"
-#        }
-#    ]
-
-
-
-#    final_message = call_api(synthesis_messages).content
-#    logger.info("Final message returned to UI: %r", final_message)
-#    update_history(history, "assistant", final_message)
-
-#    logger.info("Retrieved text going into history: %s", retrieved_text)
-#    logger.info("Final message returned to UI: %s", final_message)
-#    return final_message, history, graph_json
-
-### new chat
-
 
 class ChatCancelled(Exception):
     """Stop a chat turn without converting it into an error response."""
