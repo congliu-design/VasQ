@@ -1,4 +1,3 @@
-import difflib
 import contextvars
 import json
 import threading
@@ -14,6 +13,17 @@ import numpy as np
 from scipy import sparse
 
 from openai import OpenAI
+
+from .entity_aliases import (
+    build_brain_region_alias_map as build_matrix_brain_region_alias_map,
+    build_cell_class_alias_map as build_matrix_cell_class_alias_map,
+    build_cell_type_alias_map as build_matrix_cell_type_alias_map,
+    build_region_layer_alias_map as build_matrix_region_layer_alias_map,
+    merge_hybrid_matches,
+    normalize_text,
+    resolve_entities_from_text,
+    validate_controlled_vocabulary,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -438,185 +448,6 @@ MATRIX_REGION_LAYER_ALIAS_MAP = None
 MIN_CELLS_PER_GROUP = 10
 
 
-def build_simple_alias_map(values):
-    alias_map = {}
-    for v in pd.Series(values).dropna().astype(str).unique():
-        alias_map[normalize_text(v)] = str(v)
-    return alias_map
-
-
-def add_region_layer_semantic_aliases(alias_map, available_values):
-    """Add common user-facing names for canonical region_layer labels."""
-    available = set(str(value) for value in (available_values or []))
-    semantic_aliases = {
-        "Cortex": [
-            "cortex",
-            "cortical",
-            "cortical cortex",
-            "cortical gray matter",
-            "cortical grey matter",
-            "cortex gray matter",
-            "cortex grey matter",
-            "gray matter",
-            "grey matter",
-            "cerebral cortex",
-            "neocortex",
-        ],
-        "White Matter Tracts": [
-            "white matter",
-            "white matter tract",
-            "white matter tracts",
-            "white matter tissue",
-            "cerebral white matter",
-            "deep white matter",
-            "frontal white matter",
-            "periventricular white matter",
-            "wm",
-        ],
-        "Major Vessel": [
-            "major vessel",
-            "major vessels",
-            "large vessel",
-            "large vessels",
-        ],
-        "Watershed": [
-            "watershed",
-            "watershed region",
-            "watershed regions",
-            "border zone",
-            "borderzone",
-        ],
-        "Limbic": ["limbic", "limbic system", "limbic region"],
-        "Brainstem": ["brainstem", "brain stem"],
-        "Barrier": ["barrier", "barrier region"],
-        "Olfactory": ["olfactory", "olfactory region", "olfactory system"],
-        "Cerebellum": ["cerebellum", "cerebellar", "cerebellar region"],
-    }
-
-    for canonical, aliases in semantic_aliases.items():
-        if canonical not in available:
-            continue
-        for alias in aliases:
-            alias_map[normalize_text(alias)] = canonical
-    return alias_map
-
-
-def add_brain_region_semantic_aliases(alias_map, available_values):
-    """Add deterministic aliases for the region_name controlled vocabulary."""
-    available = set(str(value) for value in (available_values or []))
-    semantic_aliases = {
-        "Middle Cerebral Artery": [
-            "middle cerebral arteries", "middle cerebral arterial", "mca",
-        ],
-        "Anterior Cerebral Artery": [
-            "anterior cerebral arteries", "anterior cerebral arterial", "aca",
-        ],
-        "Basilar Artery/Circle Of Willis": [
-            "basilar artery", "basilar arteries", "circle of willis",
-            "basilar artery and circle of willis", "willis circle",
-        ],
-        "Lateral Temporal Gyrus": [
-            "lateral temporal cortex", "lateral temporal gyri", "ltg",
-        ],
-        "Insula": ["insular cortex", "insular region", "insular"],
-        "Inferior Parietal Lobule": [
-            "inferior parietal cortex", "inferior parietal lobules", "ipl",
-        ],
-        "Midfrontal Anterior Watershed": [
-            "mid frontal anterior watershed", "middle frontal anterior watershed",
-            "midfrontal anterior border zone", "frontal anterior watershed",
-        ],
-        "Superior Parietal Lobule": [
-            "superior parietal cortex", "superior parietal lobules", "spl",
-        ],
-        "Cuneus": ["cuneal cortex", "cuneal region"],
-        "Posterior Watershed": [
-            "posterior watershed region", "posterior border zone",
-            "posterior borderzone",
-        ],
-        "Inferior Frontal Gyrus": [
-            "inferior frontal cortex", "inferior frontal gyri", "ifg",
-        ],
-        "White Matter Anterior Watershed": [
-            "anterior watershed white matter", "white matter anterior border zone",
-            "anterior white matter watershed",
-        ],
-        "Lateral Occipital Cortex": [
-            "lateral occipital", "lateral occipital region", "loc",
-        ],
-        "Dorsolateral Prefrontal Cortex": [
-            "dorsolateral prefrontal", "dorsolateral pfc",
-            "dorsal lateral prefrontal cortex", "dlpfc",
-        ],
-        "Inferior Temporal Gyrus": [
-            "inferior temporal cortex", "inferior temporal gyri", "itg",
-        ],
-        "Middle Temporal Gyrus": [
-            "middle temporal cortex", "middle temporal gyri", "mtg",
-        ],
-        "Midbrain": ["mid brain", "mesencephalon", "mesencephalic region"],
-        "Orbitofrontal Cortex": [
-            "orbitofrontal", "orbital frontal cortex", "orbital prefrontal cortex",
-            "ofc",
-        ],
-        "Periventricular White Matter": [
-            "periventricular wm", "periventricular white-matter", "pvwm",
-        ],
-        "Cingulum": ["cingulum bundle", "cingulate bundle", "cingulate fasciculus"],
-        "Lingual Gyrus": ["lingual cortex", "lingual gyri"],
-        "Anterior Cingulate Cortex": [
-            "anterior cingulate", "anterior cingulate region", "acc",
-        ],
-        "Parahippocampal Gyrus": [
-            "parahippocampal cortex", "parahippocampal gyri", "phg",
-        ],
-        "Posterior Cingulate Cortex": [
-            "posterior cingulate", "posterior cingulate region", "pcc",
-        ],
-        "Pons": ["pontine", "pontine region", "pons region"],
-        "Hippocampus": [
-            "hippocampal", "hippocampal formation", "hippocampal region",
-        ],
-        "Superior Temporal Gyrus": [
-            "superior temporal cortex", "superior temporal gyri", "stg",
-        ],
-        "Choroid Plexus": [
-            "choroidal plexus", "choroid plexuses", "choroid plexus tissue",
-        ],
-        "Superior Frontal Gyrus And Rostromedial": [
-            "superior frontal gyrus", "superior frontal gyri", "sfg",
-            "rostromedial superior frontal gyrus",
-            "superior frontal and rostromedial",
-        ],
-        "Precuneus": ["precuneal cortex", "precuneal region"],
-        "Supramarginal Gyrus": [
-            "supramarginal cortex", "supramarginal gyri", "smg",
-        ],
-        "Entorhinal Cortex": ["entorhinal", "entorhinal region"],
-        "Thalamus": ["thalamic", "thalamic region"],
-        "Corpus Callosum": [
-            "callosal", "callosal white matter", "corpus callosal",
-        ],
-        "Amygdala": ["amygdalar", "amygdaloid", "amygdaloid complex"],
-        "Fusiform Gyrus": ["fusiform cortex", "fusiform gyri"],
-        "Leptomeninges": [
-            "leptomeningeal", "leptomeningeal tissue", "pia arachnoid",
-            "pia-arachnoid",
-        ],
-        "Olfactory Bulb": ["olfactory bulbs", "olfactory bulb region"],
-        "Cerebellum": ["cerebellar", "cerebellar cortex", "cerebellar region"],
-        "Spinal Cord": ["spinal cord tissue", "spinal region", "spinal-cord"],
-        "Fornix": ["fornical", "fornical region", "fornix bundle"],
-    }
-
-    for canonical, aliases in semantic_aliases.items():
-        if canonical not in available:
-            continue
-        for alias in aliases:
-            alias_map[normalize_text(alias)] = canonical
-    return alias_map
-
-
 def load_gene_names():
     genes_df = pd.read_csv(GENE_NAMES_PATH)
 
@@ -773,43 +604,23 @@ def ensure_matrix_expression_data_loaded():
             )
 
         if MATRIX_CELL_TYPE_ALIAS_MAP is None:
-            MATRIX_CELL_TYPE_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_CELL_TYPES)
-            MATRIX_CELL_TYPE_ALIAS_MAP.update({
-                "capillary": "Capillary",
-                "capillaries": "Capillary",
-                "arterial": "Arterial",
-                "arteriole": "Arterial",
-                "arterioles": "Arterial",
-                "venous": "Venous" if "Venous" in MATRIX_AVAILABLE_CELL_TYPES else "Vein",
-                "opc": "OPC",
-                "astrocyte": "Astrocyte",
-                "astrocytes": "Astrocyte",
-            })
+            MATRIX_CELL_TYPE_ALIAS_MAP = build_matrix_cell_type_alias_map(
+                MATRIX_AVAILABLE_CELL_TYPES
+            )
 
         if MATRIX_CELL_CLASS_ALIAS_MAP is None:
-            MATRIX_CELL_CLASS_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_CELL_CLASSES)
-            MATRIX_CELL_CLASS_ALIAS_MAP.update({
-                "endothelial": "Endothelial",
-                "endothelial cells": "Endothelial",
-                "astrocyte": "Astrocyte",
-                "astrocytes": "Astrocyte",
-                "fibroblast": "Fibroblast",
-                "fibroblasts": "Fibroblast",
-                "opc": "OPC",
-            })
+            MATRIX_CELL_CLASS_ALIAS_MAP = build_matrix_cell_class_alias_map(
+                MATRIX_AVAILABLE_CELL_CLASSES
+            )
 
         if MATRIX_REGION_ALIAS_MAP is None:
-            MATRIX_REGION_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_REGIONS)
-            MATRIX_REGION_ALIAS_MAP = add_brain_region_semantic_aliases(
-                MATRIX_REGION_ALIAS_MAP,
-                MATRIX_AVAILABLE_REGIONS,
+            MATRIX_REGION_ALIAS_MAP = build_matrix_brain_region_alias_map(
+                MATRIX_AVAILABLE_REGIONS
             )
 
         if MATRIX_REGION_LAYER_ALIAS_MAP is None:
-            MATRIX_REGION_LAYER_ALIAS_MAP = build_simple_alias_map(MATRIX_AVAILABLE_REGION_LAYERS)
-            MATRIX_REGION_LAYER_ALIAS_MAP = add_region_layer_semantic_aliases(
-                MATRIX_REGION_LAYER_ALIAS_MAP,
-                MATRIX_AVAILABLE_REGION_LAYERS,
+            MATRIX_REGION_LAYER_ALIAS_MAP = build_matrix_region_layer_alias_map(
+                MATRIX_AVAILABLE_REGION_LAYERS
             )
 
 
@@ -869,39 +680,34 @@ def resolve_matrix_entities(user_input):
         available_region_layers=MATRIX_AVAILABLE_REGION_LAYERS,
     )
 
-    # A valid GPT result, including a valid empty list, takes priority for cell
-    # type and cell class. Deterministic region_name and region_layer aliases
-    # are merged separately below so abbreviations and semantic variants still
-    # resolve when the helper returns an empty or incomplete list. Explicit
-    # no-filter instructions are applied after merging and remain authoritative.
-    cell_type_matches = (
-        gpt_cell_type_matches
-        if gpt_cell_type_matches is not None
-        else local_cell_type_matches
+    # Hybrid resolution: curated deterministic aliases protect common dataset
+    # terminology from an LLM omission, while the LLM covers unenumerated
+    # natural-language variants. Every merged value is validated against the
+    # current matrix vocabulary before it can become a filter.
+    cell_type_matches = merge_hybrid_matches(
+        local_cell_type_matches,
+        gpt_cell_type_matches,
+        MATRIX_AVAILABLE_CELL_TYPES,
+        dimension_name="cell_type",
     )
-    cell_class_matches = (
-        gpt_cell_class_matches
-        if gpt_cell_class_matches is not None
-        else local_cell_class_matches
+    cell_class_matches = merge_hybrid_matches(
+        local_cell_class_matches,
+        gpt_cell_class_matches,
+        MATRIX_AVAILABLE_CELL_CLASSES,
+        dimension_name="cell_class",
     )
-    if gpt_region_matches is None:
-        region_matches = local_region_matches
-    else:
-        # Supplement the helper with deterministic aliases for the complete
-        # region_name vocabulary (for example DLPFC, MCA, insular cortex).
-        region_matches = list(dict.fromkeys(
-            list(gpt_region_matches) + local_region_matches
-        ))
-    if gpt_region_layer_matches is None:
-        region_layer_matches = local_region_layer_matches
-    else:
-        # Deterministic semantic aliases supplement the helper result. This
-        # ensures that natural terms such as "white matter" and "cortical gray
-        # matter" resolve to the canonical layer labels even when the helper
-        # returns an empty or incomplete list.
-        region_layer_matches = list(dict.fromkeys(
-            list(gpt_region_layer_matches) + local_region_layer_matches
-        ))
+    region_matches = merge_hybrid_matches(
+        local_region_matches,
+        gpt_region_matches,
+        MATRIX_AVAILABLE_REGIONS,
+        dimension_name="brain_region",
+    )
+    region_layer_matches = merge_hybrid_matches(
+        local_region_layer_matches,
+        gpt_region_layer_matches,
+        MATRIX_AVAILABLE_REGION_LAYERS,
+        dimension_name="region_layer",
+    )
 
     if dimension_filter_is_disabled(user_input, "cell_type"):
         cell_type_matches = []
@@ -1389,16 +1195,6 @@ def wants_matrix_expression_query(user_input):
 
 ### ranked expression
 
-def normalize_text(x):
-    if pd.isna(x):
-        return ""
-    x = str(x).strip().lower()
-    x = x.replace("_", " ")
-    x = x.replace("-", " ")
-    x = re.sub(r"\s+", " ", x)
-    return x
-
-
 def load_expression_data():
     with open(EXPR_PATH, "r", encoding="utf-8", errors="ignore") as f:
         first_line = f.readline().strip()
@@ -1866,31 +1662,6 @@ def ensure_expression_data_loaded():
         if AVAILABLE_REGIONS is None:
             AVAILABLE_REGIONS = sorted(EXPR_DF["region"].dropna().unique().tolist())
 
-def _match_available_labels(candidates, available, *, dimension_name):
-    """Keep only candidates that correspond to a label in `available`.
-
-    Matching is case/whitespace-insensitive so a minor casing difference in
-    the model's output doesn't silently get dropped and misread downstream
-    as "user did not request this filter". Any candidate that still can't
-    be matched is logged instead of disappearing without a trace.
-    """
-    lookup = {str(a).strip().casefold(): a for a in available}
-    matched = []
-    for candidate in candidates:
-        key = str(candidate).strip().casefold()
-        canonical = lookup.get(key)
-        if canonical is not None:
-            matched.append(canonical)
-        else:
-            logger.warning(
-                "resolve_dataset_entities_with_gpt: dropping unmatched %s "
-                "candidate %r (not in available labels)",
-                dimension_name,
-                candidate,
-            )
-    return matched
-
-
 def resolve_dataset_entities_with_gpt(
     user_input,
     available_cell_types,
@@ -1947,16 +1718,16 @@ def resolve_dataset_entities_with_gpt(
         regions = parsed.get("regions", [])
         region_layers = parsed.get("region_layers", [])
 
-        cell_types = _match_available_labels(
+        cell_types = validate_controlled_vocabulary(
             cell_types, available_cell_types, dimension_name="cell_type"
         )
-        cell_classes = _match_available_labels(
+        cell_classes = validate_controlled_vocabulary(
             cell_classes, available_cell_classes, dimension_name="cell_class"
         )
-        regions = _match_available_labels(
+        regions = validate_controlled_vocabulary(
             regions, available_regions, dimension_name="region"
         )
-        region_layers = _match_available_labels(
+        region_layers = validate_controlled_vocabulary(
             region_layers, available_region_layers, dimension_name="region_layer"
         )
 
@@ -1967,29 +1738,6 @@ def resolve_dataset_entities_with_gpt(
         # None means the helper failed and allows the caller to use local
         # matching. A successful helper response can intentionally return [].
         return None, None, None, None
-
-
-
-def resolve_entities_from_text(user_input, alias_map):
-    text = normalize_text(user_input)
-    found = []
-
-    # exact substring pass
-    for alias_norm, canonical in alias_map.items():
-        if alias_norm and re.search(rf"\b{re.escape(alias_norm)}\b", text):
-            found.append(canonical)
-
-    # fuzzy single-token fallback
-    if not found:
-        words = re.findall(r"\w+", text)
-        for word in words:
-            for alias_norm, canonical in alias_map.items():
-                if len(alias_norm.split()) == 1:
-                    if difflib.SequenceMatcher(None, alias_norm, word).ratio() > 0.86:
-                        found.append(canonical)
-
-    return sorted(set(found))
-
 
 def extract_entities(user_input):
     ensure_expression_data_loaded()
