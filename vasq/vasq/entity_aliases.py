@@ -427,6 +427,62 @@ def merge_hybrid_matches(
     )
 
 
+# Ground-truth Cell_type -> Cell_class hierarchy from the VasQ matrix schema
+# (see pdx[pdx['Cell_class'] == X]['Cell_type'].value_counts() for each class).
+# This is schema metadata, not text-matching aliases: it lets us recognize
+# that a resolved cell_type already pins down its parent cell_class, so an
+# independently-matched class mention on the same query is redundant rather
+# than a second, distinct filter dimension.
+CELL_TYPE_TO_CELL_CLASS: dict[str, str] = {
+    "Capillary": "Endothelial",
+    "Venous": "Endothelial",
+    "Arterial": "Endothelial",
+    "Large_Artery": "Endothelial",
+    "Fenestrated_Capillary": "Endothelial",
+    "EndoMT": "Endothelial",
+    "SMC_1": "Mural_Cell",
+    "SMC_2": "Mural_Cell",
+    "SMC_3": "Mural_Cell",
+    "Pericyte": "Mural_Cell",
+    "Fib_1": "Fibroblast",
+    "Fib_2": "Fibroblast",
+    "Fib_3": "Fibroblast",
+    "Fib_4": "Fibroblast",
+    "Fib_5": "Fibroblast",
+    "Fib_6": "Fibroblast",
+    "Astrocyte": "Astrocyte",
+    "OPC": "OPC",
+    "Oligodendrocyte": "Oligodendrocyte",
+    "Neuron": "Neuron",
+    "Microglia_Macrophage_T": "Microglia_Macrophage_T",
+    "Epithelial_Cell": "Epithelial_Cell",
+    "Ependymal_Cell": "Ependymal_Cell",
+}
+
+
+def exclude_classes_implied_by_cell_types(
+    cell_classes: Iterable[str] | None,
+    cell_types: Iterable[str] | None,
+    *,
+    type_to_class: Mapping[str, str] = CELL_TYPE_TO_CELL_CLASS,
+) -> list[str]:
+    """Drop a cell_class already implied by a more specific cell_type match.
+
+    e.g. cell_types=["Capillary"] already pins the class to "Endothelial", so
+    an independently-matched "Endothelial" alias (from wording like "capillary
+    endothelial cells") is redundant, not a second filter the caller asked for.
+    """
+    implied = {
+        normalize_text(type_to_class[value])
+        for value in cell_types or []
+        if value in type_to_class
+    }
+    return [
+        value for value in cell_classes or []
+        if normalize_text(value) not in implied
+    ]
+
+
 def exclude_normalized_duplicates(
     values: Iterable[str] | None,
     preferred_values: Iterable[str] | None,
@@ -477,6 +533,7 @@ def apply_entity_selection_policy(
     """Apply duplicate precedence and explicit no-filter instructions."""
     cell_types = list(dict.fromkeys(cell_types or []))
     cell_classes = exclude_normalized_duplicates(cell_classes, cell_types)
+    cell_classes = exclude_classes_implied_by_cell_types(cell_classes, cell_types)
     regions = list(dict.fromkeys(regions or []))
     region_layers = list(dict.fromkeys(region_layers or []))
 
@@ -522,7 +579,7 @@ def resolve_entities_from_text(
 ) -> list[str]:
     """Resolve explicit, non-negated aliases with a limited typo fallback."""
     text = normalize_text(user_input)
-    found: list[str] = []
+    matches: list[tuple[int, list[str]]] = []
     occupied_spans: list[tuple[int, int]] = []
 
     def target_values(target: str | Iterable[str]) -> list[str]:
@@ -533,9 +590,12 @@ def resolve_entities_from_text(
     def overlaps_existing(start: int, end: int) -> bool:
         return any(start < used_end and end > used_start for used_start, used_end in occupied_spans)
 
-    # Longest aliases first and occupied spans make a specific phrase win over
-    # nested aliases. For example, SMC2 must not also trigger the SMC group,
-    # and fenestrated capillaries must not also return Capillary.
+    # Longest aliases first so a specific phrase wins over nested aliases
+    # (e.g. SMC2 must not also trigger the SMC group, and fenestrated
+    # capillaries must not also return Capillary). This ordering only decides
+    # *which* alias claims a span; matches are re-sorted by text position
+    # below so the returned entities follow mention order in the query
+    # regardless of which alias's phrase happened to be longer.
     for alias_norm, target in sorted(
         alias_map.items(), key=lambda item: len(item[0]), reverse=True
     ):
@@ -546,9 +606,13 @@ def resolve_entities_from_text(
                 continue
             if overlaps_existing(match.start(), match.end()):
                 continue
-            found.extend(target_values(target))
+            matches.append((match.start(), target_values(target)))
             occupied_spans.append((match.start(), match.end()))
             break
+
+    found: list[str] = []
+    for _, values in sorted(matches, key=lambda item: item[0]):
+        found.extend(values)
 
     # Restrict fuzzy matching to single-token aliases and only use it when no
     # exact/curated alias was found.  This avoids broad fuzzy overmatching.
