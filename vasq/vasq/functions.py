@@ -821,14 +821,40 @@ def ensure_expression_data_loaded():
         AVAILABLE_REGIONS = sorted(EXPR_DF["region"].dropna().unique().tolist())
 
 def resolve_dataset_entities_with_gpt(user_input, available_cell_types, available_regions):
-    system_prompt = (
-        "You are helping map a biology question onto a fixed dataset schema. "
-        "Choose the closest matching dataset labels from the provided lists. "
-        "Return JSON only with keys: "
-        '{"cell_types": [], "regions": []}. '
-        "Only use labels that appear in the provided lists. "
-        "Do not invent labels."
-    )
+    system_prompt = """
+        Extract specifically mentioned cell types and brain regions from the user's
+        biology question and map them to canonical labels from the provided lists.
+        
+        Rules:
+        
+        1. Identify cell types even when the user does not explicitly say
+           "cell type". Terms such as endothelial cells, capillaries, arterial cells,
+           astrocytes, and pericytes may represent cell types.
+        
+        2. Map singular/plural forms, abbreviations, and common biological synonyms
+           to the best unambiguous label in the provided lists.
+        
+        3. Extract every specifically named cell type and region.
+        
+        4. If the user asks for "all cell types", "across cell types", or
+           "different cell types" without naming specific types, return:
+           "cell_types": []
+           An empty list means no cell-type filter will be applied.
+        
+        5. Do not infer cell types from genes, diseases, or brain regions.
+        
+        6. Do not extract a value when the user explicitly says not to use it
+           as a filter.
+        
+        7. Copy labels exactly from the provided lists. Never invent a label.
+        
+        Return JSON only:
+        
+        {
+          "cell_types": [],
+          "regions": []
+        }
+        """
 
     user_prompt = (
         f"User query: {user_input}\n\n"
