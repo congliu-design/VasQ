@@ -77,38 +77,98 @@ def add_valid_alias_groups(
     return alias_map
 
 
+def add_valid_multi_alias_groups(
+    alias_map: dict[str, str | tuple[str, ...]],
+    available_values: Iterable[str],
+    alias_groups: Mapping[tuple[str, ...], Iterable[str]],
+) -> dict[str, str | tuple[str, ...]]:
+    """Add aliases that intentionally expand to multiple canonical labels."""
+    canonical_lookup = {
+        normalize_text(value): str(value).strip()
+        for value in available_values
+        if normalize_text(value)
+    }
+
+    for requested_targets, aliases in alias_groups.items():
+        canonical_targets = tuple(
+            canonical_lookup[normalize_text(target)]
+            for target in requested_targets
+            if normalize_text(target) in canonical_lookup
+        )
+        if not canonical_targets:
+            continue
+
+        for alias in aliases:
+            normalized = normalize_text(alias)
+            if not normalized:
+                continue
+            existing = alias_map.get(normalized)
+            if existing is not None and existing != canonical_targets:
+                logger.warning(
+                    "Skipping ambiguous group alias %r: already maps to %r, not %r",
+                    alias,
+                    existing,
+                    canonical_targets,
+                )
+                continue
+            alias_map[normalized] = canonical_targets
+    return alias_map
+
+
 CELL_TYPE_ALIAS_GROUPS = {
     "Endothelial": ["endothelial", "endothelial cell", "endothelial cells"],
     "Capillary": [
         "capillary", "capillaries", "capillary cell", "capillary cells",
         "capillary endothelial cell", "capillary endothelial cells",
+        "cap ec", "cap ecs", "capec", "capecs",
     ],
     "Arterial": [
         "arterial", "arteriole", "arterioles", "arterial endothelial cell",
-        "arterial endothelial cells",
+        "arterial endothelial cells", "arterial ec", "arterial ecs",
+        "aec", "aecs",
     ],
     "Artery": ["artery", "arteries", "arterial cell", "arterial cells"],
     "Arteriole": ["arteriole", "arterioles", "arteriolar"],
     "Venous": [
         "venous", "vein", "veins", "venule", "venules",
         "venous endothelial cell", "venous endothelial cells",
+        "venous ec", "venous ecs",
     ],
     "Vein": ["vein", "veins", "venous", "venous endothelial cells"],
     "Venule": ["venule", "venules", "venular"],
     "Fenestrated_Capillary": [
         "fenestrated capillary", "fenestrated capillaries",
         "fenestrated endothelial cell", "fenestrated endothelial cells",
-        "fenestrated endothelium",
+        "fenestrated endothelium", "fenestrated ec", "fenestrated ecs",
+        "fenec", "fenecs",
     ],
     "Fenestrated Endothelial": [
         "fenestrated endothelial", "fenestrated endothelial cell",
         "fenestrated endothelial cells", "fenestrated endothelium",
     ],
-    "Large_Artery": ["large artery", "large arteries", "large arterial"],
+    "Large_Artery": [
+        "large artery", "large arteries", "large arterial",
+        "large artery ec", "large artery ecs", "laec", "laecs",
+    ],
     "Large Artery": ["large artery", "large arteries", "large arterial"],
-    "EndoMT": ["endomt", "endothelial to mesenchymal transition cell"],
+    "EndoMT": [
+        "endomt", "endomt cell", "endomt cells",
+        "endothelial to mesenchymal transition cell",
+        "endothelial to mesenchymal transition cells",
+    ],
+    "SMC_1": [
+        "smc1", "smc 1", "smooth muscle cell 1", "smooth muscle subtype 1",
+    ],
+    "SMC_2": [
+        "smc2", "smc 2", "smooth muscle cell 2", "smooth muscle subtype 2",
+    ],
+    "SMC_3": [
+        "smc3", "smc 3", "smooth muscle cell 3", "smooth muscle subtype 3",
+    ],
     "Pericyte": ["pericyte", "pericytes"],
-    "Astrocyte": ["astrocyte", "astrocytes", "astroglia"],
+    "Astrocyte": [
+        "astrocyte", "astrocytes", "astroglia", "astro", "astros",
+    ],
     "OPC": [
         "opc", "opcs", "oligodendrocyte precursor",
         "oligodendrocyte precursors", "oligodendrocyte precursor cell",
@@ -119,15 +179,22 @@ CELL_TYPE_ALIAS_GROUPS = {
         "oligodendrocyte precursors", "oligodendrocyte precursor cell",
         "oligodendrocyte precursor cells",
     ],
-    "Oligodendrocyte": ["oligodendrocyte", "oligodendrocytes"],
-    "Neuron": ["neuron", "neurons", "neuronal cell", "neuronal cells"],
+    "Oligodendrocyte": [
+        "oligodendrocyte", "oligodendrocytes", "oligo", "oligos",
+    ],
+    "Neuron": [
+        "neuron", "neurons", "neuronal", "neuronal cell", "neuronal cells",
+    ],
     "Fibroblast": ["fibroblast", "fibroblasts"],
+    "Fib_1": ["fib1", "fib 1", "fibroblast 1", "fibroblast subtype 1"],
+    "Fib_2": ["fib2", "fib 2", "fibroblast 2", "fibroblast subtype 2"],
+    "Fib_3": ["fib3", "fib 3", "fibroblast 3", "fibroblast subtype 3"],
+    "Fib_4": ["fib4", "fib 4", "fibroblast 4", "fibroblast subtype 4"],
+    "Fib_5": ["fib5", "fib 5", "fibroblast 5", "fibroblast subtype 5"],
+    "Fib_6": ["fib6", "fib 6", "fibroblast 6", "fibroblast subtype 6"],
     "Epithelial": ["epithelial", "epithelial cell", "epithelial cells"],
     "Epithelial_Cell": ["epithelial", "epithelial cell", "epithelial cells"],
     "Ependymal_Cell": ["ependymal", "ependymal cell", "ependymal cells"],
-    "Smooth Muscle": [
-        "smooth muscle", "smooth muscle cell", "smooth muscle cells", "smc",
-    ],
     "Microglia Macrophage or T Cell": [
         "microglia", "microglial cell", "microglial cells", "macrophage",
         "macrophages", "t cell", "t cells",
@@ -139,21 +206,49 @@ CELL_TYPE_ALIAS_GROUPS = {
 }
 
 
+# These aliases describe a biological group represented by several cell_type
+# labels. They cannot be expressed by the ordinary one-alias/one-label map.
+CELL_TYPE_MULTI_ALIAS_GROUPS = {
+    ("SMC_1", "SMC_2", "SMC_3"): [
+        "smc", "smcs", "vsmc", "vsmcs",
+        "smooth muscle", "smooth muscle cell", "smooth muscle cells",
+        "vascular smooth muscle", "vascular smooth muscle cell",
+        "vascular smooth muscle cells",
+    ],
+}
+
+
 CELL_CLASS_ALIAS_GROUPS = {
-    "Endothelial": ["endothelial", "endothelial cell", "endothelial cells"],
-    "Astrocyte": ["astrocyte", "astrocytes", "astroglia"],
-    "Fibroblast": ["fibroblast", "fibroblasts"],
+    "Endothelial": [
+        "endothelial", "endothelial cell", "endothelial cells",
+        "ec", "ecs", "vascular ec", "vascular ecs",
+        "vascular endothelial cell", "vascular endothelial cells",
+        "brain ec", "brain ecs", "brain endothelial cell",
+        "brain endothelial cells", "bec", "becs",
+    ],
+    "Mural_Cell": [
+        "mural", "mural cell", "mural cells",
+        "vascular mural cell", "vascular mural cells",
+    ],
+    "Astrocyte": [
+        "astrocyte", "astrocytes", "astroglia", "astro", "astros",
+    ],
+    "Fibroblast": ["fibroblast", "fibroblasts", "fb", "fbs"],
     "OPC": [
         "opc", "opcs", "oligodendrocyte precursor",
         "oligodendrocyte precursor cell", "oligodendrocyte precursor cells",
     ],
-    "Oligodendrocyte": ["oligodendrocyte", "oligodendrocytes"],
-    "Pericyte": ["pericyte", "pericytes"],
-    "Neuron": ["neuron", "neurons", "neuronal"],
-    "Epithelial": ["epithelial", "epithelial cell", "epithelial cells"],
-    "Smooth Muscle": [
-        "smooth muscle", "smooth muscle cell", "smooth muscle cells", "smc",
+    "Oligodendrocyte": [
+        "oligodendrocyte", "oligodendrocytes", "oligo", "oligos",
     ],
+    "Neuron": ["neuron", "neurons", "neuronal"],
+    "Microglia_Macrophage_T": [
+        "microglia macrophage t", "microglia", "microglial",
+        "microglial cell", "microglial cells", "macrophage", "macrophages",
+        "t cell", "t cells",
+    ],
+    "Epithelial_Cell": ["epithelial", "epithelial cell", "epithelial cells"],
+    "Ependymal_Cell": ["ependymal", "ependymal cell", "ependymal cells"],
 }
 
 
@@ -245,11 +340,18 @@ BRAIN_REGION_ALIAS_GROUPS = {
 }
 
 
-def build_cell_type_alias_map(available_values: Iterable[str]) -> dict[str, str]:
-    return add_valid_alias_groups(
+def build_cell_type_alias_map(
+    available_values: Iterable[str],
+) -> dict[str, str | tuple[str, ...]]:
+    alias_map = add_valid_alias_groups(
         build_canonical_label_map(available_values),
         available_values,
         CELL_TYPE_ALIAS_GROUPS,
+    )
+    return add_valid_multi_alias_groups(
+        alias_map,
+        available_values,
+        CELL_TYPE_MULTI_ALIAS_GROUPS,
     )
 
 
@@ -325,6 +427,82 @@ def merge_hybrid_matches(
     )
 
 
+def exclude_normalized_duplicates(
+    values: Iterable[str] | None,
+    preferred_values: Iterable[str] | None,
+) -> list[str]:
+    """Drop identical labels duplicated in a more specific dimension."""
+    preferred = {normalize_text(value) for value in preferred_values or []}
+    return [
+        value
+        for value in values or []
+        if normalize_text(value) not in preferred
+    ]
+
+
+def dimension_filter_is_disabled(user_input: str, dimension: str) -> bool:
+    """Return True when the query explicitly disables a dimension filter."""
+    text = normalize_text(user_input)
+    dimension_names = {
+        "cell_type": ["cell type"],
+        "cell_class": ["cell class"],
+        "brain_region": ["brain region", "region name", "region"],
+        "region_layer": ["region layer"],
+    }
+
+    for name in dimension_names.get(dimension, []):
+        escaped = re.escape(name)
+        patterns = [
+            rf"\bdo not apply (?:a |an )?{escaped} filter\b",
+            rf"\bdon't apply (?:a |an )?{escaped} filter\b",
+            rf"\bdo not filter (?:by|on) {escaped}\b",
+            rf"\bdon't filter (?:by|on) {escaped}\b",
+            rf"\bno {escaped} filter\b",
+            rf"\bwithout (?:a |an )?{escaped} filter\b",
+            rf"\bwithout filtering (?:by|on) {escaped}\b",
+        ]
+        if any(re.search(pattern, text) for pattern in patterns):
+            return True
+    return False
+
+
+def apply_entity_selection_policy(
+    user_input: str,
+    *,
+    cell_types: Iterable[str] | None = None,
+    cell_classes: Iterable[str] | None = None,
+    regions: Iterable[str] | None = None,
+    region_layers: Iterable[str] | None = None,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Apply duplicate precedence and explicit no-filter instructions."""
+    cell_types = list(dict.fromkeys(cell_types or []))
+    cell_classes = exclude_normalized_duplicates(cell_classes, cell_types)
+    regions = list(dict.fromkeys(regions or []))
+    region_layers = list(dict.fromkeys(region_layers or []))
+
+    normalized_query = normalize_text(user_input)
+    if re.search(r"\bregion layers?\b|\bregion_layer\b", normalized_query):
+        regions = exclude_normalized_duplicates(regions, region_layers)
+    else:
+        region_layers = exclude_normalized_duplicates(region_layers, regions)
+
+    if dimension_filter_is_disabled(user_input, "cell_type"):
+        cell_types = []
+    if dimension_filter_is_disabled(user_input, "cell_class"):
+        cell_classes = []
+    if dimension_filter_is_disabled(user_input, "brain_region"):
+        regions = []
+    if dimension_filter_is_disabled(user_input, "region_layer"):
+        region_layers = []
+
+    return (
+        list(dict.fromkeys(cell_types)),
+        list(dict.fromkeys(cell_classes)),
+        list(dict.fromkeys(regions)),
+        list(dict.fromkeys(region_layers)),
+    )
+
+
 _NEGATION_PREFIX = re.compile(
     r"(?:\bnot|\bwithout|\bexcept|\bexclude|\bexcluding|\bdo not include|"
     r"\bdon't include)\s+(?:the\s+)?$"
@@ -338,34 +516,49 @@ def _is_negated_mention(text: str, start: int) -> bool:
 
 def resolve_entities_from_text(
     user_input: str,
-    alias_map: Mapping[str, str],
+    alias_map: Mapping[str, str | Iterable[str]],
     *,
     fuzzy_threshold: float = 0.86,
 ) -> list[str]:
     """Resolve explicit, non-negated aliases with a limited typo fallback."""
     text = normalize_text(user_input)
     found: list[str] = []
+    occupied_spans: list[tuple[int, int]] = []
 
-    # Longest aliases first makes a specific phrase win before a nested term.
-    for alias_norm, canonical in sorted(
+    def target_values(target: str | Iterable[str]) -> list[str]:
+        if isinstance(target, str):
+            return [target]
+        return list(target)
+
+    def overlaps_existing(start: int, end: int) -> bool:
+        return any(start < used_end and end > used_start for used_start, used_end in occupied_spans)
+
+    # Longest aliases first and occupied spans make a specific phrase win over
+    # nested aliases. For example, SMC2 must not also trigger the SMC group,
+    # and fenestrated capillaries must not also return Capillary.
+    for alias_norm, target in sorted(
         alias_map.items(), key=lambda item: len(item[0]), reverse=True
     ):
         if not alias_norm:
             continue
         for match in re.finditer(rf"\b{re.escape(alias_norm)}\b", text):
-            if not _is_negated_mention(text, match.start()):
-                found.append(canonical)
-                break
+            if _is_negated_mention(text, match.start()):
+                continue
+            if overlaps_existing(match.start(), match.end()):
+                continue
+            found.extend(target_values(target))
+            occupied_spans.append((match.start(), match.end()))
+            break
 
     # Restrict fuzzy matching to single-token aliases and only use it when no
     # exact/curated alias was found.  This avoids broad fuzzy overmatching.
     if not found:
         words = re.findall(r"\w+", text)
         for word in words:
-            for alias_norm, canonical in alias_map.items():
+            for alias_norm, target in alias_map.items():
                 if len(alias_norm.split()) != 1:
                     continue
                 if difflib.SequenceMatcher(None, alias_norm, word).ratio() > fuzzy_threshold:
-                    found.append(canonical)
+                    found.extend(target_values(target))
 
     return list(dict.fromkeys(found))
