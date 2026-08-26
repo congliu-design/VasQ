@@ -193,6 +193,67 @@ def call_helper_api(
 logger = logging.getLogger(__name__)
 
 
+def _extract_web_search_citations(response):
+    """Pull the source URLs OpenAI's web_search tool actually retrieved from
+    the structured response data, not the free text the model wrote.
+
+    The model can accurately summarize a source's content while still
+    mistyping, swapping, or otherwise drifting on the exact URL when it
+    writes a citation out as prose -- that's a second, unverified
+    generation step. `url_citation` annotations on the message's own
+    output_text (and, as a fallback, the raw sources listed on the
+    web_search_call action -- the reason `include=["web_search_call.action.
+    sources"]` is requested above) are the one place the *exact* retrieved
+    URL lives. Defensive attribute access throughout: this targets the
+    openai-python Responses API shape, but is not guaranteed to match every
+    SDK version, so any mismatch degrades to an empty list rather than
+    raising.
+    """
+    citations = []
+    fallback_urls = []
+    try:
+        for item in getattr(response, "output", None) or []:
+            item_type = getattr(item, "type", None)
+
+            if item_type == "message":
+                for content in getattr(item, "content", None) or []:
+                    if getattr(content, "type", None) != "output_text":
+                        continue
+                    for annotation in getattr(content, "annotations", None) or []:
+                        if getattr(annotation, "type", None) != "url_citation":
+                            continue
+                        url = getattr(annotation, "url", None)
+                        if not url:
+                            continue
+                        title = getattr(annotation, "title", None) or url
+                        citations.append((title, url))
+
+            elif item_type == "web_search_call":
+                action = getattr(item, "action", None)
+                if getattr(action, "type", None) == "search":
+                    for source in getattr(action, "sources", None) or []:
+                        url = getattr(source, "url", None)
+                        if url:
+                            fallback_urls.append((url, url))
+    except Exception:
+        logger.exception("Could not extract structured web-search citations")
+
+    # url_citation annotations (with a real title) take priority; sources
+    # from the raw web_search_call action only fill in URLs the model didn't
+    # end up citing by name, and never override a titled entry for the same
+    # URL just because of output-array ordering.
+    citations = citations + fallback_urls
+
+    seen = set()
+    unique = []
+    for title, url in citations:
+        if url in seen:
+            continue
+        seen.add(url)
+        unique.append((title, url))
+    return unique
+
+
 def run_openai_web_search(
     search_prompt,
     *,
@@ -240,6 +301,16 @@ def run_openai_web_search(
         if not result:
             logger.warning("OpenAI Web Search returned no text")
             return None
+
+        verified_citations = _extract_web_search_citations(response)
+        if verified_citations:
+            result += (
+                "\n\nVerified source URLs (retrieved directly by the search "
+                "tool -- when citing a source, copy one of these exact "
+                "links verbatim; never alter, guess, or substitute a URL "
+                "that is not in this list):\n"
+                + "\n".join(f"- {title}: {url}" for title, url in verified_citations)
+            )
 
         logger.info(
             "OpenAI Web Search succeeded stage=%s result_length=%s request_id=%s",
@@ -3093,7 +3164,12 @@ def _chat_impl(user_input, history, should_stop=None):
             "relationships as associations, "
             "not proof of causality. Use web/literature evidence for current "
             "function, pathway, mechanism, clinical-stage, and regulatory "
-            "claims, and preserve its citations. Use VasQ only for measured "
+            "claims, and preserve its citations. When the evidence includes "
+            "a \"Verified source URLs\" list, any link you cite must be "
+            "copied character-for-character from that list, matched to the "
+            "correct claim -- never retype, paraphrase, or reconstruct a "
+            "URL from memory, and never cite a URL that is not in that "
+            "list. Use VasQ only for measured "
             "brain-vasculature expression claims; distinguish matrix mean "
             "expression from marker rank/score. When the web/literature "
             "evidence reports a cell type a gene is known to be associated "
