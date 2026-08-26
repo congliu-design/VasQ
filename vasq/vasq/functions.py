@@ -1092,7 +1092,8 @@ def matrix_expression(
             f"contains fewer than {MIN_CELLS_PER_GROUP} cells."
         )
 
-    all_sections = []
+    gene_stats = {}
+    gene_sections = {}
     regional_plot_frames = []
 
     if len(cell_indices) > 0:
@@ -1110,13 +1111,12 @@ def matrix_expression(
             min_cells=MIN_CELLS_PER_GROUP,
         )
 
-        all_sections.append(
-            format_matrix_expression_summary(
-                stats,
-                gene,
-                group_cols=group_cols,
-                max_rows=40,
-            )
+        gene_stats[gene] = stats
+        gene_sections[gene] = format_matrix_expression_summary(
+            stats,
+            gene,
+            group_cols=group_cols,
+            max_rows=40,
         )
 
         # `stats` already uses the same grouping and cell threshold, so reuse
@@ -1128,6 +1128,7 @@ def matrix_expression(
             regional_plot_frames.append(stats)
 
     plot_json = None
+    top_gene = None
     all_stats = (
         pd.concat(regional_plot_frames, ignore_index=True)
         if regional_plot_frames
@@ -1184,6 +1185,21 @@ def matrix_expression(
             )
             if plot_json and top_gene_note:
                 notes.append(top_gene_note)
+
+    # Whichever gene ends up in the plot must never be the one whose text
+    # table gets silently cut off by the evidence-length cap applied further
+    # downstream (cap_source_text on the full result["text"]) -- that cap
+    # trims from the end, so put the plotted gene's section first regardless
+    # of where it fell in the original gene order. Without this, a gene can
+    # end up fully plotted from freshly computed data while the synthesis
+    # model, working from the truncated text, has no idea that gene's table
+    # exists at all and reports it as missing -- exactly the contradiction
+    # this ordering prevents.
+    if top_gene and top_gene in gene_sections:
+        ordered_genes = [top_gene] + [g for g in present_genes if g != top_gene]
+    else:
+        ordered_genes = present_genes
+    all_sections = [gene_sections[g] for g in ordered_genes if g in gene_sections]
 
     return {
         "text": "\n\n".join(notes + [""] + all_sections),
@@ -1251,9 +1267,27 @@ def select_balanced_expression_rows(
 ):
     """Keep requested comparison values represented in a capped table.
 
-    A global top-N by mean expression can accidentally retain only Cortex and
-    hide White Matter Tracts. Select at least one strong row per observed value
-    of each comparison dimension before filling remaining slots by rank.
+    A global top-N by mean expression can accidentally retain only Cortex
+    and hide White Matter Tracts -- or, just as importantly, retain only
+    whichever single cell type happens to have the single highest value in
+    almost every region, silently excluding every other cell type despite
+    the table nominally being broken out by both.
+
+    An earlier version filled the row budget column by column: every
+    observed value of the first priority column, then every value of the
+    second, and so on. A column with many observed values (brain_region
+    routinely has ~40) could exhaust the entire budget before a column
+    with fewer values (cell_type, cell_class) ever got a single guaranteed
+    row -- e.g. a gene whose single highest-expressing cell type in nearly
+    every region is the same one would fill all 40 rows with just that one
+    cell type, silently dropping every other cell type from the table even
+    though the surrounding text discusses them by name.
+
+    This version round-robins across columns instead: each column
+    contributes at most one new row per pass before moving to the next
+    column, cycling until the budget is full. Every requested dimension
+    gets a fair, interleaved share of the row budget regardless of how
+    many distinct values it has.
     """
     ranked = stats_df.sort_values(
         ["mean_expr", "pct_expr", "n_cells"],
@@ -1272,28 +1306,46 @@ def select_balanced_expression_rows(
         ]
         if col in group_cols and col in ranked.columns
     ]
-    chosen = []
+
     chosen_set = set()
+    value_queues = {
+        col: list(ranked[col].drop_duplicates()) for col in priority_cols
+    }
 
-    for col in priority_cols:
-        for value in ranked[col].drop_duplicates().tolist():
-            candidates = ranked[ranked[col] == value]
-            for idx in candidates.index:
-                if idx not in chosen_set:
-                    chosen.append(idx)
-                    chosen_set.add(idx)
+    progressed = True
+    while len(chosen_set) < max_rows and progressed:
+        progressed = False
+        for col in priority_cols:
+            queue = value_queues[col]
+            picked = None
+            while queue:
+                value = queue.pop(0)
+                candidates = ranked[ranked[col] == value]
+                for idx in candidates.index:
+                    if idx not in chosen_set:
+                        picked = idx
+                        break
+                if picked is not None:
                     break
-            if len(chosen) >= max_rows:
-                return ranked.loc[chosen]
+                # Every row for this value was already claimed by another
+                # column's earlier turn; try this column's next value
+                # within the same round instead of skipping its turn.
+            if picked is not None:
+                chosen_set.add(picked)
+                progressed = True
+            if len(chosen_set) >= max_rows:
+                break
 
-    for idx in ranked.index:
-        if idx not in chosen_set:
-            chosen.append(idx)
-            chosen_set.add(idx)
-        if len(chosen) >= max_rows:
-            break
+    if len(chosen_set) < max_rows:
+        for idx in ranked.index:
+            if idx not in chosen_set:
+                chosen_set.add(idx)
+            if len(chosen_set) >= max_rows:
+                break
 
-    return ranked.loc[chosen]
+    # Return in the original rank order, not round-robin insertion order.
+    chosen_rank_order = [idx for idx in ranked.index if idx in chosen_set]
+    return ranked.loc[chosen_rank_order]
 
 
 def format_comparison_coverage(stats_df, group_cols, max_values=30):
