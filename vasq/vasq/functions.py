@@ -1516,6 +1516,29 @@ def resolve_dataset_entities_with_gpt(
         # matching. A successful helper response can intentionally return [].
         return None, None, None, None
 
+def _unanimous_value(per_gene_map, genes):
+    """A cell-type/region value only counts if EVERY gene in `genes` maps
+    to the exact same non-empty value (single value, not a set) in
+    `per_gene_map`. This check runs in Python rather than trusting the
+    model to self-police cross-gene consistency in one aggregate answer --
+    the same lesson learned from the citation-URL fix: when correctness
+    depends on comparing several independent pieces of the model's own
+    output against each other, do that comparison in code, not prompt
+    instructions alone. One gene missing a value, having a different
+    value, or having more than one candidate value all count as "not
+    unanimous" and yield [].
+    """
+    values = []
+    for gene in genes:
+        gene_values = per_gene_map.get(gene) or per_gene_map.get(gene.upper()) or []
+        if len(gene_values) != 1:
+            return []
+        values.append(gene_values[0])
+    if not values or len(set(values)) != 1:
+        return []
+    return [values[0]]
+
+
 def infer_matrix_hints_from_web_evidence(
     genes,
     web_result_text,
@@ -1535,6 +1558,13 @@ def infer_matrix_hints_from_web_evidence(
     this function never guesses. `cell_reason`/`region_reason` are each
     scoped to their own axis only, so a caller that applies just one axis
     never has to show rationale text about the other, unapplied one.
+
+    When multiple genes are queried together, the model judges each gene
+    independently (so one gene's strong signal, e.g. "APP -> Neuron", can't
+    silently get applied to a different gene, e.g. PSEN1, for which the
+    literature never established that association) and this function only
+    returns a value if every gene agrees on the exact same one -- checked
+    in Python, not left to the model's own aggregate judgment.
     """
     genes = genes or []
     web_result_text = (web_result_text or "").strip()
@@ -1542,28 +1572,33 @@ def infer_matrix_hints_from_web_evidence(
         return [], [], [], [], "", ""
 
     system_prompt = (
-        "Read biomedical literature evidence and decide whether it "
-        "establishes, for the given gene(s): (1) a specific cell type or "
-        "cell class they are known to be associated with -- for example as "
-        "a canonical marker gene, from single-cell/tissue-atlas expression "
-        "data, or a cell-type-specific functional role; and/or (2) a "
-        "specific brain region or region layer they are known to be "
-        "relevant to -- for example a region implicated in the disease "
-        "discussed. Treat these as two independent judgments. Only report "
-        "a value in a given list when the evidence clearly and "
-        "unambiguously supports it; if the evidence is mixed, hedged, "
-        "absent, or discusses multiple plausible values, leave that list "
-        "empty instead of guessing. Return JSON only with keys: "
-        '{"cell_types": [], "cell_classes": [], "regions": [], '
-        '"region_layers": [], "cell_reason": "", "region_reason": ""}. '
-        "Only use exact labels from the supplied lists, and never invent "
-        'one. "cell_reason" is a short (1-2 sentence) plain-language '
-        "summary, naming the gene(s), of what the evidence establishes "
-        'about cell type/class and why -- leave it empty if cell_types and '
-        'cell_classes are both empty. "region_reason" is the same, but '
-        "for the region/region_layer judgment only -- leave it empty if "
-        "regions and region_layers are both empty. Never mention the "
-        "cell-type judgment inside region_reason or vice versa."
+        "Read biomedical literature evidence and decide, for EACH gene "
+        "independently, whether it establishes: (1) a specific cell type "
+        "or cell class that gene is known to be associated with -- for "
+        "example as a canonical marker gene, from single-cell/tissue-atlas "
+        "expression data, or a cell-type-specific functional role; and/or "
+        "(2) a specific brain region or region layer that gene is known to "
+        "be relevant to -- for example a region implicated in the disease "
+        "discussed. Judge every gene separately; do not let one gene's "
+        "strong signal influence another gene's judgment, even if they are "
+        "discussed in the same disease context. Return JSON only with "
+        "keys: "
+        '{"gene_cell_types": {}, "gene_cell_classes": {}, "gene_regions": '
+        '{}, "gene_region_layers": {}, "cell_reason": "", '
+        '"region_reason": ""}. Each of the first four keys maps a gene '
+        "symbol (exactly as given below) to a list of at most one value "
+        "for that gene alone -- an empty list if that gene's own evidence "
+        "does not clearly and unambiguously establish one. Only use exact "
+        "labels from the supplied lists, and never invent one. Every gene "
+        "given below must appear as a key in all four maps, even if its "
+        "value is an empty list. \"cell_reason\" is a short (1-2 sentence) "
+        "plain-language summary of what the evidence establishes about "
+        "cell type/class, gene by gene -- leave it empty if every gene's "
+        "cell-type and cell-class lists are empty. \"region_reason\" is "
+        "the same, but for the region/region_layer judgment only -- leave "
+        "it empty if every gene's region and region_layer lists are "
+        "empty. Never mention the cell-type judgment inside region_reason "
+        "or vice versa."
     )
     user_prompt = (
         f"Genes: {genes}\n\n"
@@ -1591,28 +1626,43 @@ def infer_matrix_hints_from_web_evidence(
         parsed = parse_json_object(response.choices[0].message.content)
         if not parsed:
             return [], [], [], [], "", ""
+
+        def _clean_map(key):
+            raw_map = parsed.get(key) or {}
+            if not isinstance(raw_map, dict):
+                return {}
+            return {
+                str(gene): [str(v) for v in (values or []) if str(v).strip()]
+                for gene, values in raw_map.items()
+            }
+
+        gene_cell_types = _clean_map("gene_cell_types")
+        gene_cell_classes = _clean_map("gene_cell_classes")
+        gene_regions = _clean_map("gene_regions")
+        gene_region_layers = _clean_map("gene_region_layers")
+
         cell_types = validate_controlled_vocabulary(
-            parsed.get("cell_types", []),
+            _unanimous_value(gene_cell_types, genes),
             available_cell_types,
             dimension_name="cell_type",
         )
         cell_classes = validate_controlled_vocabulary(
-            parsed.get("cell_classes", []),
+            _unanimous_value(gene_cell_classes, genes),
             available_cell_classes,
             dimension_name="cell_class",
         )
         regions = validate_controlled_vocabulary(
-            parsed.get("regions", []),
+            _unanimous_value(gene_regions, genes),
             available_regions,
             dimension_name="region",
         )
         region_layers = validate_controlled_vocabulary(
-            parsed.get("region_layers", []),
+            _unanimous_value(gene_region_layers, genes),
             available_region_layers,
             dimension_name="region_layer",
         )
-        cell_reason = str(parsed.get("cell_reason", "")).strip()
-        region_reason = str(parsed.get("region_reason", "")).strip()
+        cell_reason = str(parsed.get("cell_reason", "")).strip() if (cell_types or cell_classes) else ""
+        region_reason = str(parsed.get("region_reason", "")).strip() if (regions or region_layers) else ""
         return cell_types, cell_classes, regions, region_layers, cell_reason, region_reason
     except Exception:
         logger.exception("Web-evidence matrix-hint inference failed")
