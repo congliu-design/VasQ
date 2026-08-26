@@ -313,7 +313,9 @@ BRAIN_REGION_ALIAS_GROUPS = {
     "Cingulum": ["cingulum bundle", "cingulate bundle", "cingulate fasciculus"],
     "Lingual Gyrus": ["lingual cortex", "lingual gyri"],
     "Anterior Cingulate Cortex": ["anterior cingulate", "anterior cingulate region", "acc"],
-    "Parahippocampal Gyrus": ["parahippocampal cortex", "parahippocampal gyri", "phg"],
+    "Parahipocampal Gyrus": [
+        "parahippocampal gyrus", "parahippocampal cortex", "parahippocampal gyri", "phg",
+    ],
     "Posterior Cingulate Cortex": ["posterior cingulate", "posterior cingulate region", "pcc"],
     "Pons": ["pontine", "pontine region", "pons region"],
     "Hippocampus": ["hippocampal", "hippocampal formation", "hippocampal region"],
