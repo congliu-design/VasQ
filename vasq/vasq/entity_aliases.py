@@ -123,34 +123,25 @@ CELL_TYPE_ALIAS_GROUPS = {
         "cap ec", "cap ecs", "capec", "capecs",
     ],
     "Arterial": [
-        "arterial", "arteriole", "arterioles", "arterial endothelial cell",
-        "arterial endothelial cells", "arterial ec", "arterial ecs",
-        "aec", "aecs",
+        "arterial", "arteriole", "arterioles", "arteriolar",
+        "arterial endothelial cell", "arterial endothelial cells",
+        "arterial ec", "arterial ecs", "aec", "aecs",
     ],
-    "Artery": ["artery", "arteries", "arterial cell", "arterial cells"],
-    "Arteriole": ["arteriole", "arterioles", "arteriolar"],
     "Venous": [
-        "venous", "vein", "veins", "venule", "venules",
+        "venous", "vein", "veins", "venule", "venules", "venular",
         "venous endothelial cell", "venous endothelial cells",
         "venous ec", "venous ecs",
     ],
-    "Vein": ["vein", "veins", "venous", "venous endothelial cells"],
-    "Venule": ["venule", "venules", "venular"],
     "Fenestrated_Capillary": [
         "fenestrated capillary", "fenestrated capillaries",
-        "fenestrated endothelial cell", "fenestrated endothelial cells",
-        "fenestrated endothelium", "fenestrated ec", "fenestrated ecs",
-        "fenec", "fenecs",
-    ],
-    "Fenestrated Endothelial": [
         "fenestrated endothelial", "fenestrated endothelial cell",
         "fenestrated endothelial cells", "fenestrated endothelium",
+        "fenestrated ec", "fenestrated ecs", "fenec", "fenecs",
     ],
     "Large_Artery": [
         "large artery", "large arteries", "large arterial",
         "large artery ec", "large artery ecs", "laec", "laecs",
     ],
-    "Large Artery": ["large artery", "large arteries", "large arterial"],
     "EndoMT": [
         "endomt", "endomt cell", "endomt cells",
         "endothelial to mesenchymal transition cell",
@@ -174,11 +165,6 @@ CELL_TYPE_ALIAS_GROUPS = {
         "oligodendrocyte precursors", "oligodendrocyte precursor cell",
         "oligodendrocyte precursor cells",
     ],
-    "Oligodendrocyte Precursor": [
-        "opc", "opcs", "oligodendrocyte precursor",
-        "oligodendrocyte precursors", "oligodendrocyte precursor cell",
-        "oligodendrocyte precursor cells",
-    ],
     "Oligodendrocyte": [
         "oligodendrocyte", "oligodendrocytes", "oligo", "oligos",
     ],
@@ -192,13 +178,8 @@ CELL_TYPE_ALIAS_GROUPS = {
     "Fib_4": ["fib4", "fib 4", "fibroblast 4", "fibroblast subtype 4"],
     "Fib_5": ["fib5", "fib 5", "fibroblast 5", "fibroblast subtype 5"],
     "Fib_6": ["fib6", "fib 6", "fibroblast 6", "fibroblast subtype 6"],
-    "Epithelial": ["epithelial", "epithelial cell", "epithelial cells"],
     "Epithelial_Cell": ["epithelial", "epithelial cell", "epithelial cells"],
     "Ependymal_Cell": ["ependymal", "ependymal cell", "ependymal cells"],
-    "Microglia Macrophage or T Cell": [
-        "microglia", "microglial cell", "microglial cells", "macrophage",
-        "macrophages", "t cell", "t cells",
-    ],
     "Microglia_Macrophage_T": [
         "microglia", "microglial cell", "microglial cells", "macrophage",
         "macrophages", "t cell", "t cells",
@@ -215,6 +196,7 @@ CELL_TYPE_MULTI_ALIAS_GROUPS = {
         "vascular smooth muscle", "vascular smooth muscle cell",
         "vascular smooth muscle cells",
     ],
+    ("Arterial", "Large_Artery"): ["artery", "arteries"],
 }
 
 
