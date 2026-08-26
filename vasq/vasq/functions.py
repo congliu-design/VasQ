@@ -193,24 +193,30 @@ def call_helper_api(
 logger = logging.getLogger(__name__)
 
 
-def _extract_web_search_citations(response):
-    """Pull the source URLs OpenAI's web_search tool actually retrieved from
-    the structured response data, not the free text the model wrote.
+def _splice_web_search_citations(response):
+    """Rewrite the model's own web-search text so each url_citation
+    annotation's exact claim is immediately followed by its exact URL,
+    inline, at the position OpenAI's own annotation says it applies to.
 
-    The model can accurately summarize a source's content while still
-    mistyping, swapping, or otherwise drifting on the exact URL when it
-    writes a citation out as prose -- that's a second, unverified
-    generation step. `url_citation` annotations on the message's own
-    output_text (and, as a fallback, the raw sources listed on the
-    web_search_call action -- the reason `include=["web_search_call.action.
-    sources"]` is requested above) are the one place the *exact* retrieved
-    URL lives. Defensive attribute access throughout: this targets the
-    openai-python Responses API shape, but is not guaranteed to match every
-    SDK version, so any mismatch degrades to an empty list rather than
-    raising.
+    A prior version of this extracted citations into a flat list appended
+    at the end of the text. That fixed one problem (the URL itself being
+    wrong) but created another: a downstream model still had to re-derive
+    which URL matched which claim from a disconnected list, and could pair
+    a correct URL with the wrong claim (or vice versa) doing so -- and it
+    has to redo that guesswork at every downstream rewrite (gene
+    derivation, hint inference, final synthesis). Splicing the URL directly
+    into the text next to the exact claim it supports removes the
+    guesswork entirely: a downstream model only has to preserve a pairing
+    that's already correct, not reconstruct one.
+
+    Returns (text_with_inline_sources, fallback_urls) -- fallback_urls are
+    sources the tool fetched but never tied to a specific claim (from
+    web_search_call.action.sources), for a short "also consulted" note.
+    Falls back to the unmodified `response.output_text` with no inline
+    markers if the expected structure isn't present; never raises.
     """
-    citations = []
     fallback_urls = []
+    pieces = []
     try:
         for item in getattr(response, "output", None) or []:
             item_type = getattr(item, "type", None)
@@ -219,14 +225,25 @@ def _extract_web_search_citations(response):
                 for content in getattr(item, "content", None) or []:
                     if getattr(content, "type", None) != "output_text":
                         continue
-                    for annotation in getattr(content, "annotations", None) or []:
-                        if getattr(annotation, "type", None) != "url_citation":
-                            continue
-                        url = getattr(annotation, "url", None)
-                        if not url:
-                            continue
-                        title = getattr(annotation, "title", None) or url
-                        citations.append((title, url))
+                    text = getattr(content, "text", None) or ""
+                    annotations = [
+                        a
+                        for a in (getattr(content, "annotations", None) or [])
+                        if getattr(a, "type", None) == "url_citation"
+                        and getattr(a, "url", None)
+                        and getattr(a, "start_index", None) is not None
+                        and getattr(a, "end_index", None) is not None
+                    ]
+                    # Splice from the last position backwards so an
+                    # earlier annotation's start/end offsets are never
+                    # invalidated by a later insertion shifting the text.
+                    annotations.sort(key=lambda a: a.end_index, reverse=True)
+                    spliced = text
+                    for annotation in annotations:
+                        end = annotation.end_index
+                        marker = f" [SOURCE: {annotation.url}]"
+                        spliced = spliced[:end] + marker + spliced[end:]
+                    pieces.append(spliced)
 
             elif item_type == "web_search_call":
                 action = getattr(item, "action", None)
@@ -234,24 +251,25 @@ def _extract_web_search_citations(response):
                     for source in getattr(action, "sources", None) or []:
                         url = getattr(source, "url", None)
                         if url:
-                            fallback_urls.append((url, url))
+                            fallback_urls.append(url)
     except Exception:
-        logger.exception("Could not extract structured web-search citations")
+        logger.exception("Could not splice inline web-search citations")
+        pieces = []
 
-    # url_citation annotations (with a real title) take priority; sources
-    # from the raw web_search_call action only fill in URLs the model didn't
-    # end up citing by name, and never override a titled entry for the same
-    # URL just because of output-array ordering.
-    citations = citations + fallback_urls
+    if pieces:
+        text_with_inline_sources = "\n".join(p for p in pieces if p.strip())
+    else:
+        text_with_inline_sources = str(getattr(response, "output_text", "") or "").strip()
 
     seen = set()
-    unique = []
-    for title, url in citations:
+    unique_fallback = []
+    for url in fallback_urls:
         if url in seen:
             continue
         seen.add(url)
-        unique.append((title, url))
-    return unique
+        unique_fallback.append(url)
+
+    return text_with_inline_sources, unique_fallback
 
 
 def run_openai_web_search(
@@ -296,23 +314,19 @@ def run_openai_web_search(
             input=search_prompt,
         )
 
-        result = response.output_text.strip()
+        result, fallback_urls = _splice_web_search_citations(response)
 
         if not result:
             logger.warning("OpenAI Web Search returned no text")
             return None
 
-        verified_citations = _extract_web_search_citations(response)
-        if verified_citations:
+        if fallback_urls:
             result += (
-                "\n\nVerified source URLs (retrieved directly by the search "
-                "tool -- copy a URL verbatim when citing it; never alter, "
-                "guess, or substitute one that is not in this list. The "
-                "label before each colon is just the page's generic title, "
-                "not a full citation -- write your own informative citation "
-                "label (authors/year/journal, if named in the evidence "
-                "above) rather than reusing this label as-is):\n"
-                + "\n".join(f"- {title}: {url}" for title, url in verified_citations)
+                "\n\nOther sources the search tool consulted, not tied to a "
+                "specific claim above (use only if you independently need "
+                "one; do not attach these to a claim that already has its "
+                "own [SOURCE: ...] marker):\n"
+                + "\n".join(f"- {url}" for url in fallback_urls)
             )
 
         logger.info(
@@ -3158,17 +3172,17 @@ def _chat_impl(user_input, history, should_stop=None):
             "relationships as associations, "
             "not proof of causality. Use web/literature evidence for current "
             "function, pathway, mechanism, clinical-stage, and regulatory "
-            "claims, and preserve its citations. When the evidence includes "
-            "a \"Verified source URLs\" list, the URL itself -- the part in "
-            "parentheses or after the colon -- must be copied "
-            "character-for-character from that list, matched to the "
-            "correct claim; never retype, paraphrase, or reconstruct a URL "
-            "from memory, and never cite a URL that is not in that list. "
-            "That constraint applies only to the URL. For the visible link "
-            "text, write an informative citation label -- authors and year, "
-            "or the specific paper's title, if the surrounding evidence "
-            "names them -- rather than defaulting to the generic site name "
-            "the verified-URL entry happens to be labeled with. Use VasQ only for measured "
+            "claims, and preserve its citations. The evidence may contain an "
+            "inline marker like \"[SOURCE: https://...]\" immediately after "
+            "a specific claim -- that marker gives the exact URL for that "
+            "exact claim, already correctly paired; when you cite that "
+            "claim, use exactly that URL and do not display the literal "
+            "\"[SOURCE: ...]\" text itself. Never retype, paraphrase, "
+            "reconstruct from memory, or borrow a URL from a different "
+            "claim's marker. For the visible link text, write an "
+            "informative citation label -- authors and year, or the "
+            "specific paper's title, if the surrounding evidence names "
+            "them -- rather than a generic site name. Use VasQ only for measured "
             "brain-vasculature expression claims; distinguish matrix mean "
             "expression from marker rank/score. When the web/literature "
             "evidence reports a cell type a gene is known to be associated "
