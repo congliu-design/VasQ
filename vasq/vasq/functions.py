@@ -828,10 +828,15 @@ def requested_matrix_group_columns(
     if asks_cell_types:
         group_cols.append("cell_type")
 
-    # Preserve the previous useful default for an expression question that
-    # does not explicitly name a comparison dimension.
     if not group_cols:
+        # Nothing was asked about at all; keep the original two-axis default.
         group_cols = ["brain_region", "cell_type"]
+    elif not asks_cell_types and not asks_cell_classes:
+        # Region and/or region_layer was asked about, but the cell dimension
+        # was never mentioned either way. Still break results out by
+        # cell_type -- a bare "which regions is this expressed in" question
+        # should not silently pool every cell type into one number.
+        group_cols.append("cell_type")
 
     return group_cols
 
@@ -934,43 +939,62 @@ def matrix_expression(user_input, genes_override=None):
             regional_plot_frames.append(stats)
 
     plot_json = None
-    if regional_plot_frames:
-        # Cell-type comparisons need a purpose-built plot table. Keep the
-        # requested filters, but always retain brain region on the x-axis and
-        # cell type on the y-axis/panel dimension. Do not force the text table
-        # to use this additional grouping.
+    all_stats = (
+        pd.concat(regional_plot_frames, ignore_index=True)
+        if regional_plot_frames
+        else pd.DataFrame()
+    )
+    if not all_stats.empty:
         plot_group_cols = list(group_cols)
-        if "cell_type" in group_cols and (
-            len(present_genes) == 1 or len(present_genes) > 2
-        ):
+        plot_gene_order = present_genes
+        top_gene_note = None
+
+        if "cell_type" in group_cols:
+            # A region x cell_type matrix is only readable one gene at a
+            # time (that's what build_single_gene_cell_type_matrix draws).
+            # With several genes, plot only the one with the single highest
+            # measured expression instead of averaging or splitting into a
+            # panel per cell type -- the text table above still reports
+            # every gene and every cell type untouched.
             plot_group_cols = ["brain_region"]
             if "region_layer" in group_cols:
                 plot_group_cols.append("region_layer")
             plot_group_cols.append("cell_type")
 
-            plot_frames = []
-            for gene in present_genes:
-                gene_plot_stats = summarize_group_expression(
-                    gene,
-                    effective_cell_indices,
-                    plot_group_cols,
-                    min_cells=MIN_CELLS_PER_GROUP,
-                )
-                if not gene_plot_stats.empty:
-                    plot_frames.append(gene_plot_stats)
-            plot_stats = (
-                pd.concat(plot_frames, ignore_index=True)
-                if plot_frames
-                else pd.DataFrame()
+            top_gene = present_genes[0]
+            gene_peak = (
+                all_stats.groupby("gene")["mean_expr"]
+                .max()
+                .sort_values(ascending=False)
             )
-        else:
-            plot_stats = pd.concat(regional_plot_frames, ignore_index=True)
+            if not gene_peak.empty:
+                top_gene = gene_peak.index[0]
 
-        plot_json = build_matrix_expression_plot(
-            plot_stats,
-            gene_order=present_genes,
-            comparison_cols=plot_group_cols,
-        )
+            plot_stats = summarize_group_expression(
+                top_gene,
+                effective_cell_indices,
+                plot_group_cols,
+                min_cells=MIN_CELLS_PER_GROUP,
+            )
+            plot_gene_order = [top_gene]
+            if len(present_genes) > 1:
+                top_gene_note = (
+                    f"The region x cell type plot below shows {top_gene}, "
+                    "the gene with the highest measured expression among "
+                    "the genes analyzed. Every gene is broken out separately "
+                    "in the table above."
+                )
+        else:
+            plot_stats = all_stats
+
+        if not plot_stats.empty:
+            plot_json = build_matrix_expression_plot(
+                plot_stats,
+                gene_order=plot_gene_order,
+                comparison_cols=plot_group_cols,
+            )
+            if plot_json and top_gene_note:
+                notes.append(top_gene_note)
 
     return {
         "text": "\n\n".join(notes + [""] + all_sections),
