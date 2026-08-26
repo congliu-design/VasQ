@@ -371,6 +371,23 @@ def search_openai_web(user_input):
     )
 
 
+_STRICT_SOURCE_INSTRUCTION = (
+    "Only cite peer-reviewed literature, PubMed/PMC, official gene or "
+    "protein databases (e.g. Human Protein Atlas, NCBI Gene, UniProt), "
+    "FDA, ClinicalTrials.gov, or other primary/authoritative scientific "
+    "sources. Do not cite blogs, forums, news aggregators, general "
+    "encyclopedias, or any page whose authority you cannot verify from "
+    "its content, even if it appears in search results. If you cannot "
+    "identify a specific, reliable source for a claim, state the claim "
+    "as uncited (e.g. \"widely described in the literature\") rather "
+    "than attaching an approximate, uncertain, or best-guess source to "
+    "it -- an unlabeled claim is preferable to a confidently wrong "
+    "citation. Every citation must trace to a page you actually "
+    "retrieved in this search, never one recalled from general "
+    "training knowledge. "
+)
+
+
 def search_scientific_web(user_input, kg_context=None, kg_assessment=None):
     """First search: establish scientific knowledge and candidate genes."""
     kg_context = (kg_context or "").strip()
@@ -409,9 +426,8 @@ def search_scientific_web(user_input, kg_context=None, kg_assessment=None):
     return run_openai_web_search(
         "Search the live web to answer this biomedical question. "
         + pathway_instruction
-        + "Prioritize peer-reviewed literature, PubMed, FDA, "
-        "ClinicalTrials.gov, and authoritative scientific sources. "
-        "Provide source citations and distinguish established evidence from "
+        + _STRICT_SOURCE_INSTRUCTION
+        + "Provide source citations and distinguish established evidence from "
         "hypotheses.\n\n"
         + context_block
         + f"Question: {user_input}",
@@ -432,7 +448,8 @@ def search_gene_fallback(user_input):
             "Use official human gene symbols. Provide concise supporting "
             "evidence and citations from authoritative genetics resources "
             "or peer-reviewed literature. Do not invent associations.\n\n"
-            f"Question: {user_input}"
+            + _STRICT_SOURCE_INSTRUCTION
+            + f"\nQuestion: {user_input}"
         ),
         stage_name="gene_fallback_web_search",
         search_context_size="low",
@@ -463,7 +480,9 @@ def search_drugs_and_small_molecules(user_input, genes=None, diseases=None):
         "supports that relationship. Distinguish small molecules from "
         "antibodies, nucleic-acid therapies, and other modalities. Prioritize "
         "FDA/EMA labels, ClinicalTrials.gov, PubMed, peer-reviewed literature, "
-        "and authoritative company trial records. Use current information, "
+        "and authoritative company trial records. "
+        + _STRICT_SOURCE_INSTRUCTION
+        + "Use current information, "
         "provide source citations, and explicitly state when no reliable "
         "direct small-molecule match is found.\n\n"
         + "\n".join(entity_lines)
@@ -2776,6 +2795,66 @@ def cap_source_text(text, limit):
     return text[:limit].rstrip() + "\n[Source text truncated]"
 
 
+_URL_PATTERN = re.compile(r'https?://[^\s\])"\'<>]+')
+_MARKDOWN_LINK_PATTERN = re.compile(r'\[([^\]]+)\]\((https?://[^\s)]+)\)')
+
+
+def _normalize_url(url):
+    return str(url or "").strip().rstrip('.,;:)]}\u00bb\u201d\'"').split("#", 1)[0]
+
+
+def extract_known_urls(*texts):
+    """Collect every URL that actually appeared somewhere in this turn's
+    own evidence (web search, KG-RAG, drug search), regardless of stage.
+    Used as a whitelist for `sanitize_uncited_urls` -- a hard, code-level
+    backstop, since prompting alone cannot guarantee a rewriting model
+    never invents or misattributes a URL when composing the final answer.
+    """
+    known = set()
+    for text in texts:
+        if not text:
+            continue
+        for match in _URL_PATTERN.findall(str(text)):
+            known.add(_normalize_url(match))
+    return known
+
+
+def sanitize_uncited_urls(final_message, known_urls):
+    """Strip any hyperlink in the final answer whose URL never appeared
+    anywhere in this turn's own gathered evidence -- keep the visible
+    label text, just drop the link itself.
+
+    This does not guarantee a URL that *did* appear in the evidence is
+    paired with the *correct* claim (that's a separate, prompting-level
+    concern); it only guarantees the reader is never handed a clickable
+    link to something that traces back to nothing in this turn's evidence
+    at all -- e.g. a URL the model reconstructed from general training
+    knowledge rather than from what was actually retrieved just now.
+    """
+    if not final_message or not known_urls:
+        return final_message
+
+    def _replace(match):
+        label, url = match.group(1), match.group(2)
+        normalized = _normalize_url(url)
+        if normalized in known_urls:
+            return match.group(0)
+        # Tolerate minor formatting drift (trailing slash, query string)
+        # the model may introduce while otherwise citing a real source.
+        if any(
+            normalized.startswith(known) or known.startswith(normalized)
+            for known in known_urls
+        ):
+            return match.group(0)
+        logger.warning(
+            "Stripping a citation URL not found in this turn's evidence: %s",
+            url,
+        )
+        return label
+
+    return _MARKDOWN_LINK_PATTERN.sub(_replace, final_message)
+
+
 def build_partial_response(
     genes,
     vasq_text,
@@ -3276,6 +3355,10 @@ def _chat_impl(user_input, history, should_stop=None):
             drug_result=drug_result,
         )
     _raise_if_cancelled(should_stop)
+
+    known_urls = extract_known_urls(scientific_web_result, kg_result, drug_result)
+    final_message = sanitize_uncited_urls(final_message, known_urls)
+
     logger.info("Final message generated: %r", final_message)
     update_history(
         history, "assistant", summarize_turn_for_history(user_input, final_message)
