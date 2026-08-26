@@ -141,8 +141,15 @@ def call_helper_api(
     user_prompt,
     *,
     stage_name="helper_completion",
+    timeout_seconds=None,
+    max_retries=None,
 ):
-    """Call the helper model with parameters compatible with GPT-4o and GPT-5.6."""
+    """Call the helper model with parameters compatible with GPT-4o and GPT-5.6.
+
+    `timeout_seconds`/`max_retries` let a specific caller opt into its own
+    budget instead of sharing OPENAI_HELPER_TIMEOUT_SECONDS with every other
+    helper call in the app. Omit them to keep the previous shared behavior.
+    """
     model = os.getenv("OPENAI_HELPER_MODEL", "gpt-4o")
 
     request_args = {
@@ -158,18 +165,27 @@ def call_helper_api(
     if not model.startswith("gpt-5.6"):
         request_args["temperature"] = 0
 
-    timeout_seconds = _stage_timeout(
+    requested_seconds = (
+        timeout_seconds
+        if timeout_seconds is not None
+        else _env_float("OPENAI_HELPER_TIMEOUT_SECONDS", 30)
+    )
+    resolved_timeout = _stage_timeout(
         stage_name,
-        _env_float("OPENAI_HELPER_TIMEOUT_SECONDS", 30),
+        requested_seconds,
         # Preserve enough time for the final answer even if an optional helper
         # is reached late in the request.
         reserve_seconds=_env_float("VASQ_SYNTHESIS_RESERVE_SECONDS", 50),
     )
-    max_retries = _env_int("OPENAI_HELPER_MAX_RETRIES", 1)
-    attempt_timeout = max(1.0, timeout_seconds / (max_retries + 1))
+    resolved_max_retries = (
+        max_retries
+        if max_retries is not None
+        else _env_int("OPENAI_HELPER_MAX_RETRIES", 1)
+    )
+    attempt_timeout = max(1.0, resolved_timeout / (resolved_max_retries + 1))
     return client.with_options(
         timeout=attempt_timeout,
-        max_retries=max_retries,
+        max_retries=resolved_max_retries,
     ).chat.completions.create(**request_args)
 
 
@@ -1933,6 +1949,14 @@ def infer_matrix_hints_from_web_evidence(
             system_prompt,
             user_prompt,
             stage_name="web_matrix_hint_inference",
+            # This task judges four dimensions plus two rationale fields in
+            # one call -- more for the model to do than the other, simpler
+            # helper calls that share OPENAI_HELPER_TIMEOUT_SECONDS. Give it
+            # its own, more generous budget so it isn't starved by whatever
+            # that shared setting happens to be tuned to.
+            timeout_seconds=_env_float(
+                "OPENAI_MATRIX_HINT_TIMEOUT_SECONDS", 45
+            ),
         )
         parsed = parse_json_object(response.choices[0].message.content)
         if not parsed:
