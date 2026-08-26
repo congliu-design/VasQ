@@ -306,9 +306,12 @@ def run_openai_web_search(
         if verified_citations:
             result += (
                 "\n\nVerified source URLs (retrieved directly by the search "
-                "tool -- when citing a source, copy one of these exact "
-                "links verbatim; never alter, guess, or substitute a URL "
-                "that is not in this list):\n"
+                "tool -- copy a URL verbatim when citing it; never alter, "
+                "guess, or substitute one that is not in this list. The "
+                "label before each colon is just the page's generic title, "
+                "not a full citation -- write your own informative citation "
+                "label (authors/year/journal, if named in the evidence "
+                "above) rather than reusing this label as-is):\n"
                 + "\n".join(f"- {title}: {url}" for title, url in verified_citations)
             )
 
@@ -3156,11 +3159,16 @@ def _chat_impl(user_input, history, should_stop=None):
             "not proof of causality. Use web/literature evidence for current "
             "function, pathway, mechanism, clinical-stage, and regulatory "
             "claims, and preserve its citations. When the evidence includes "
-            "a \"Verified source URLs\" list, any link you cite must be "
-            "copied character-for-character from that list, matched to the "
-            "correct claim -- never retype, paraphrase, or reconstruct a "
-            "URL from memory, and never cite a URL that is not in that "
-            "list. Use VasQ only for measured "
+            "a \"Verified source URLs\" list, the URL itself -- the part in "
+            "parentheses or after the colon -- must be copied "
+            "character-for-character from that list, matched to the "
+            "correct claim; never retype, paraphrase, or reconstruct a URL "
+            "from memory, and never cite a URL that is not in that list. "
+            "That constraint applies only to the URL. For the visible link "
+            "text, write an informative citation label -- authors and year, "
+            "or the specific paper's title, if the surrounding evidence "
+            "names them -- rather than defaulting to the generic site name "
+            "the verified-URL entry happens to be labeled with. Use VasQ only for measured "
             "brain-vasculature expression claims; distinguish matrix mean "
             "expression from marker rank/score. When the web/literature "
             "evidence reports a cell type a gene is known to be associated "
