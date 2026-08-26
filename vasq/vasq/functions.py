@@ -3286,15 +3286,94 @@ def parse_json_object(raw_text):
             return None
 
 
-def recent_conversation_context(history, max_messages=8, max_chars=5000):
+def recent_conversation_context(
+    history, max_messages=8, max_chars_per_message=800, max_chars=5000
+):
+    """Build the short context window analyze_query_intent() uses to resolve
+    follow-ups ("what about that gene").
+
+    Each message is capped *individually* before joining. Capping only the
+    joined blob (the previous behavior) let one long assistant reply --
+    a full VasQ table plus a literature review can run several thousand
+    characters -- eat the entire budget on its own, silently dropping the
+    user question that prompted it and every earlier turn. Per-message
+    capping guarantees several recent turns survive regardless of how long
+    any single one of them was.
+    """
     messages = []
     for message in (history or [])[-max_messages:]:
         if message.get("role") not in {"user", "assistant"}:
             continue
         content = str(message.get("content", "")).strip()
-        if content:
-            messages.append(f"{message['role']}: {content}")
-    return "\n".join(messages)[-max_chars:]
+        if not content:
+            continue
+        if len(content) > max_chars_per_message:
+            content = content[:max_chars_per_message].rstrip() + " […]"
+        messages.append(f"{message['role']}: {content}")
+    combined = "\n".join(messages)
+    # Still cap the overall size as a final safety net, but from the front
+    # now that no single message can dominate it -- keeps the most recent
+    # turns rather than an arbitrary tail cut mid-message.
+    if len(combined) > max_chars:
+        combined = combined[-max_chars:]
+    return combined
+
+
+def summarize_turn_for_history(user_input, final_message, max_verbatim_chars=600):
+    """Compact a turn before it goes into `history`.
+
+    `update_history` used to store `final_message` verbatim -- a VasQ answer
+    (a full expression table plus a literature review) is often several
+    thousand characters. Every later turn's intent classification and final
+    synthesis reread the *entire* growing history, so storing raw answers
+    makes each turn's context bigger, and unrelated (long-ago) detail can
+    crowd out the one thing a follow-up actually needs: what was just
+    discussed. Store a short summary instead, so history grows by roughly a
+    fixed, small amount per turn regardless of how detailed the answer was.
+
+    Short replies (greetings, brief clarifications) are kept verbatim --
+    they are already compact, so summarizing them would spend a call for no
+    benefit.
+    """
+    text = str(final_message or "").strip()
+    if len(text) <= max_verbatim_chars:
+        return text
+
+    system_prompt = (
+        "Compress an assistant's answer into a short note for the "
+        "conversation's own memory, written so a later turn can resolve a "
+        "follow-up question (e.g. 'what about that gene', 'and in the "
+        "hippocampus?') without rereading the full answer. In 2-4 sentences, "
+        "state: what was asked, which genes, diseases, cell types, and brain "
+        "regions were involved, and the single most important conclusion or "
+        "measured finding. Do not restate full tables, citations, or "
+        "caveats -- keep only what a future turn needs to stay oriented. "
+        "Plain text, no markdown, no headers."
+    )
+    user_prompt = (
+        f"User's question:\n{user_input}\n\n"
+        f"Assistant's full answer:\n{cap_source_text(text, 12000)}"
+    )
+    try:
+        response = call_helper_api(
+            system_prompt,
+            user_prompt,
+            stage_name="history_summary",
+            timeout_seconds=_env_float("OPENAI_HISTORY_SUMMARY_TIMEOUT_SECONDS", 20),
+        )
+        summary = str(
+            getattr(response.choices[0].message, "content", None) or ""
+        ).strip()
+        if summary:
+            return summary
+    except Exception:
+        logger.exception(
+            "History summarization failed; falling back to a plain truncation"
+        )
+
+    # Fallback: keep the turn discoverable even if summarization fails,
+    # rather than silently dropping it or storing the (huge) raw text.
+    return text[:max_verbatim_chars].rstrip() + " […]"
 
 
 def is_simple_conversational_message(user_input):
@@ -3656,7 +3735,9 @@ def _chat_impl(user_input, history, should_stop=None):
         final_message = getattr(direct_message, "content", None) or (
             "I'm sorry, but I couldn't generate a response."
         )
-        update_history(history, "assistant", final_message)
+        update_history(
+            history, "assistant", summarize_turn_for_history(user_input, final_message)
+        )
         return final_message, history, None
 
     resolved_question = intent.get("resolved_question") or user_input
@@ -4007,13 +4088,21 @@ def _chat_impl(user_input, history, should_stop=None):
         ),
     }
 
+    # Even summarized, unbounded history growth is still growth. Cap how many
+    # past turns synthesis rereads every time -- a safety net for very long
+    # sessions, on top of (not instead of) storing summaries rather than raw
+    # answers.
+    max_synthesis_history = _env_int("VASQ_SYNTHESIS_HISTORY_MESSAGES", 20)
     if history and history[0].get("role") == "system":
-        synthesis_messages = (
-            [history[0], synthesis_instruction]
-            + history[1:]
-        )
+        past_turns = history[1:]
+        if len(past_turns) > max_synthesis_history:
+            past_turns = past_turns[-max_synthesis_history:]
+        synthesis_messages = [history[0], synthesis_instruction] + past_turns
     else:
-        synthesis_messages = [synthesis_instruction] + history[:]
+        past_turns = history[:]
+        if len(past_turns) > max_synthesis_history:
+            past_turns = past_turns[-max_synthesis_history:]
+        synthesis_messages = [synthesis_instruction] + past_turns
 
     synthesis_messages.append({
         "role": "user",
@@ -4046,7 +4135,9 @@ def _chat_impl(user_input, history, should_stop=None):
         )
     _raise_if_cancelled(should_stop)
     logger.info("Final message generated: %r", final_message)
-    update_history(history, "assistant", final_message)
+    update_history(
+        history, "assistant", summarize_turn_for_history(user_input, final_message)
+    )
 
     return final_message, history, graph_json
 
