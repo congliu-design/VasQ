@@ -894,7 +894,8 @@ def matrix_expression(
             inferred_classes,
             inferred_regions,
             inferred_layers,
-            reason,
+            cell_reason,
+            region_reason,
         ) = infer_matrix_hints_from_web_evidence(
             present_genes or genes,
             combined_evidence_text,
@@ -903,27 +904,31 @@ def matrix_expression(
             MATRIX_AVAILABLE_REGIONS,
             MATRIX_AVAILABLE_REGION_LAYERS,
         )
-        applied = []
         if cell_axis_empty and (inferred_types or inferred_classes):
             cell_types, cell_classes = inferred_types, inferred_classes
-            applied.append(
-                "cell type/class (" + ", ".join(inferred_types + inferred_classes) + ")"
+            note = (
+                "Cell type/class filter ("
+                + ", ".join(inferred_types + inferred_classes)
+                + ") was not requested in the question. It was inferred "
+                "from the literature evidence gathered for this gene and "
+                "applied as the matrix filter; other cell types were not "
+                "analyzed."
             )
+            if cell_reason:
+                note += f" Literature rationale: {cell_reason}"
+            web_filter_notes.append(note)
         if region_axis_empty and (inferred_regions or inferred_layers):
             regions, region_layers = inferred_regions, inferred_layers
-            applied.append(
-                "region (" + ", ".join(inferred_regions + inferred_layers) + ")"
-            )
-        if applied:
             note = (
-                "Filter(s) not requested in the question -- "
-                + "; ".join(applied)
-                + " -- were inferred from the literature evidence gathered "
-                "for this gene and applied as matrix filters. Other values "
-                "on that axis were not analyzed."
+                "Region filter ("
+                + ", ".join(inferred_regions + inferred_layers)
+                + ") was not requested in the question. It was inferred "
+                "from the literature evidence gathered for this gene and "
+                "applied as the matrix filter; other regions were not "
+                "analyzed."
             )
-            if reason:
-                note += f" Literature rationale: {reason}"
+            if region_reason:
+                note += f" Literature rationale: {region_reason}"
             web_filter_notes.append(note)
 
     group_cols = requested_matrix_group_columns(
@@ -1878,17 +1883,17 @@ def infer_matrix_hints_from_web_evidence(
     fallback for whichever dimensions the user's own query left
     unresolved, so the VasQ matrix would otherwise be reported across
     everything on that axis. Returns
-    (cell_types, cell_classes, regions, region_layers, reason). Every list
-    is empty, and reason is "", when the evidence does not clearly and
-    unambiguously support a specific value -- this function never guesses.
-    `reason` is the organized, plain-language rationale behind whatever was
-    reported, so it can be preserved and shown to the reader rather than
-    discarded once the labels are extracted.
+    (cell_types, cell_classes, regions, region_layers, cell_reason,
+    region_reason). Every list is empty, and each reason is "", when the
+    evidence does not clearly and unambiguously support a specific value --
+    this function never guesses. `cell_reason`/`region_reason` are each
+    scoped to their own axis only, so a caller that applies just one axis
+    never has to show rationale text about the other, unapplied one.
     """
     genes = genes or []
     web_result_text = (web_result_text or "").strip()
     if not genes or not web_result_text:
-        return [], [], [], [], ""
+        return [], [], [], [], "", ""
 
     system_prompt = (
         "Read biomedical literature evidence and decide whether it "
@@ -1898,16 +1903,21 @@ def infer_matrix_hints_from_web_evidence(
         "data, or a cell-type-specific functional role; and/or (2) a "
         "specific brain region or region layer they are known to be "
         "relevant to -- for example a region implicated in the disease "
-        "discussed. Only report a value in a given list when the evidence "
-        "clearly and unambiguously supports it; if the evidence is mixed, "
-        "hedged, absent, or discusses multiple plausible values, leave that "
-        "list empty instead of guessing. Return JSON only with keys: "
+        "discussed. Treat these as two independent judgments. Only report "
+        "a value in a given list when the evidence clearly and "
+        "unambiguously supports it; if the evidence is mixed, hedged, "
+        "absent, or discusses multiple plausible values, leave that list "
+        "empty instead of guessing. Return JSON only with keys: "
         '{"cell_types": [], "cell_classes": [], "regions": [], '
-        '"region_layers": [], "reason": ""}. Only use exact labels from the '
-        "supplied lists, and never invent one. \"reason\" is a short "
-        "(1-3 sentence) plain-language summary, naming the gene(s), of "
-        "what the evidence establishes and why -- leave it empty if "
-        "nothing was established."
+        '"region_layers": [], "cell_reason": "", "region_reason": ""}. '
+        "Only use exact labels from the supplied lists, and never invent "
+        'one. "cell_reason" is a short (1-2 sentence) plain-language '
+        "summary, naming the gene(s), of what the evidence establishes "
+        'about cell type/class and why -- leave it empty if cell_types and '
+        'cell_classes are both empty. "region_reason" is the same, but '
+        "for the region/region_layer judgment only -- leave it empty if "
+        "regions and region_layers are both empty. Never mention the "
+        "cell-type judgment inside region_reason or vice versa."
     )
     user_prompt = (
         f"Genes: {genes}\n\n"
@@ -1926,7 +1936,7 @@ def infer_matrix_hints_from_web_evidence(
         )
         parsed = parse_json_object(response.choices[0].message.content)
         if not parsed:
-            return [], [], [], [], ""
+            return [], [], [], [], "", ""
         cell_types = validate_controlled_vocabulary(
             parsed.get("cell_types", []),
             available_cell_types,
@@ -1947,11 +1957,12 @@ def infer_matrix_hints_from_web_evidence(
             available_region_layers,
             dimension_name="region_layer",
         )
-        reason = str(parsed.get("reason", "")).strip()
-        return cell_types, cell_classes, regions, region_layers, reason
+        cell_reason = str(parsed.get("cell_reason", "")).strip()
+        region_reason = str(parsed.get("region_reason", "")).strip()
+        return cell_types, cell_classes, regions, region_layers, cell_reason, region_reason
     except Exception:
         logger.exception("Web-evidence matrix-hint inference failed")
-        return [], [], [], [], ""
+        return [], [], [], [], "", ""
 
 
 
