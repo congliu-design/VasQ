@@ -12,6 +12,7 @@ import ast
 import logging
 import numpy as np
 from scipy import sparse
+from urllib.parse import urlparse
 
 from openai import OpenAI
 
@@ -193,30 +194,41 @@ def call_helper_api(
 logger = logging.getLogger(__name__)
 
 
+def _domain_label(url):
+    """A link label mechanically derived from the URL itself -- the domain
+    is literally a substring of the URL, so there is no separate piece of
+    data that could drift out of sync with it the way a title or an
+    author/year label (sourced from somewhere else) can.
+    """
+    try:
+        host = urlparse(url).netloc or url
+    except Exception:
+        host = url
+    return host[4:] if host.startswith("www.") else host
+
+
 def _splice_web_search_citations(response):
     """Rewrite the model's own web-search text so each url_citation
     annotation becomes a complete, ready-to-use markdown link -- inserted
     immediately after the exact claim it supports, at the position OpenAI's
     own annotation says it applies to.
 
-    Two earlier versions of this fix progressively narrower failure modes:
+    Earlier versions of this fix progressively narrowed the failure mode:
     (1) appending a flat URL list at the end of the text still left a
     downstream model to re-derive which URL matched which claim from a
     disconnected list; (2) splicing a bare "[SOURCE: url]" marker inline
-    fixed that pairing, but still let the model write its own free-text
-    citation label (e.g. "Smith et al., 2020") for the visible link text --
-    and a model can recall a real, well-known paper's name from its own
-    training knowledge for a claim, independent of what the search tool
-    actually retrieved for that specific sentence, producing a citation
-    that is individually real on both ends (a genuine paper name, a genuine
-    URL) but wired to each other incorrectly.
+    fixed that pairing but still let the model write its own free-text
+    citation label (e.g. "Smith et al., 2020"); (3) using the annotation's
+    own page title as the label removed the model's free-text step, but a
+    title is still a separate piece of data alongside the URL that a
+    rewriting model could still touch or replace.
 
-    This version closes that gap by using the annotation's own `title` --
-    which lives in the same annotation object as the URL, so the two can
-    never be sourced from different places -- as the link's visible text,
-    producing a complete `[title](url)` markdown link directly. Downstream
-    models are instructed to preserve it verbatim rather than write their
-    own label, removing the free-text-recall step entirely.
+    This version drops the idea of a descriptive label entirely and uses
+    the URL's own domain as the visible text -- mechanically extracted
+    from the URL string itself, so the visible text and the link target
+    can never be sourced from two different places. Less informative than
+    an author/year citation, but there is nothing left for a rewriting
+    model to get wrong about the pairing.
 
     Returns (text_with_inline_sources, fallback_urls) -- fallback_urls are
     sources the tool fetched but never tied to a specific claim (from
@@ -251,13 +263,7 @@ def _splice_web_search_citations(response):
                     for annotation in annotations:
                         end = annotation.end_index
                         url = annotation.url
-                        # The title lives in the same annotation as the
-                        # URL -- it cannot drift to a different source the
-                        # way a model-written label independently can.
-                        title = (
-                            getattr(annotation, "title", None) or url
-                        ).replace("[", "(").replace("]", ")")
-                        marker = f" [{title}]({url})"
+                        marker = f" [{_domain_label(url)}]({url})"
                         spliced = spliced[:end] + marker + spliced[end:]
                     pieces.append(spliced)
 
@@ -3286,16 +3292,14 @@ def _chat_impl(user_input, history, should_stop=None):
             "function, pathway, mechanism, clinical-stage, and regulatory "
             "claims, and preserve its citations. The evidence text may "
             "already contain complete markdown links, e.g. "
-            "\"[paper title](https://...)\", immediately after a specific "
-            "claim -- both the visible text and the URL there were pulled "
-            "directly from the same retrieved source, already correctly "
-            "paired. When you use that claim, keep that exact link exactly "
-            "as given, character for character, including its visible "
-            "text. Never rewrite, shorten, or replace the visible text with "
-            "your own author/year guess, never change the URL, and never "
-            "move a link to a different claim than the one it followed in "
-            "the evidence. If a claim has no such link, do not invent one "
-            "from memory -- state it without a citation. Use VasQ only for measured "
+            "\"[pubmed.ncbi.nlm.nih.gov](https://...)\", immediately after "
+            "a specific claim -- keep that exact link exactly as given, "
+            "character for character, including its visible text. Never "
+            "rewrite, shorten, or replace the visible text with an "
+            "author/year or paper-title guess, never change the URL, and "
+            "never move a link to a different claim than the one it "
+            "followed in the evidence. If a claim has no such link, do not "
+            "invent one from memory -- state it without a citation. Use VasQ only for measured "
             "brain-vasculature expression claims; distinguish matrix mean "
             "expression from marker rank/score. When the web/literature "
             "evidence reports a cell type a gene is known to be associated "
