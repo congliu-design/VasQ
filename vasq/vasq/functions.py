@@ -1816,16 +1816,33 @@ def wrap_plot_label(value, max_chars=22, max_lines=3):
     return "<br>".join(lines)
 
 
+def marker_size_from_cell_counts(n_cells_series, *, min_size=4.0, max_size=17.0):
+    """Map cell counts to dot diameters on a log scale, normalized to the
+    min/max actually present in this plot. Cell counts routinely span two
+    to three orders of magnitude (tens to tens of thousands) in a single
+    plot, so a linear or sqrt scale would make everything but the single
+    largest group look identically tiny; log compresses that range into a
+    readable size gradient instead.
+    """
+    counts = np.clip(n_cells_series.to_numpy(dtype=float), 1.0, None)
+    log_counts = np.log10(counts)
+    log_min, log_max = log_counts.min(), log_counts.max()
+    if log_max > log_min:
+        normalized = (log_counts - log_min) / (log_max - log_min)
+    else:
+        # Every group in this plot has (about) the same cell count.
+        normalized = np.ones_like(log_counts)
+    return (min_size + (max_size - min_size) * normalized).round(1).tolist()
+
+
 def matrix_plot_marker(plot_df, *, showscale=True, color_max=None):
-    """Shared dot-matrix encoding: color=mean, size=expressing fraction."""
+    """Shared dot-matrix encoding: color=mean expression, size=cells analyzed."""
     if color_max is None:
         positive = plot_df.loc[plot_df["mean_expr"] > 0, "mean_expr"]
         color_max = float(positive.quantile(0.95)) if not positive.empty else 1.0
     color_max = max(float(color_max), 0.001)
     return {
-        "size": (
-            4.0 + 13.0 * np.sqrt(plot_df["pct_expr"].to_numpy())
-        ).round(1).tolist(),
+        "size": marker_size_from_cell_counts(plot_df["n_cells"]),
         "sizemode": "diameter",
         "color": plot_df["mean_expr"].astype(float).tolist(),
         "cmin": 0,
@@ -1919,7 +1936,7 @@ def build_single_gene_cell_type_matrix(plot_df, comparison_cols):
                 "text": (
                     f"<b>{gene} expression: region × cell type</b>"
                     "<br><span style='font-size:12px;color:#64748b'>"
-                    "Color = mean expression · Size = expressing-cell fraction"
+                    "Color = mean expression · Size = cells analyzed"
                     f" · Groups require ≥{MIN_CELLS_PER_GROUP} cells</span>"
                 ),
                 "x": 0.02,
@@ -2110,7 +2127,7 @@ def build_cell_type_gene_panels(plot_df, gene_order, comparison_cols):
                 "<b>VasQ expression by cell type</b>"
                 "<br><span style='font-size:12px;color:#64748b'>"
                 "Each panel is one cell type · x = region · y = gene · "
-                "Color = mean expression · Size = expressing-cell fraction"
+                "Color = mean expression · Size = cells analyzed"
                 f" · Groups require ≥{MIN_CELLS_PER_GROUP} cells</span>"
             ),
             "x": 0.02,
@@ -2242,9 +2259,9 @@ def build_matrix_expression_plot(
 
     x_values = plot_df["_comparison_label"].tolist()
     y_values = plot_df["gene"].tolist()
-    marker_sizes = (
-        6.0 + 18.0 * np.sqrt(plot_df["pct_expr"].to_numpy())
-    ).round(1).tolist()
+    marker_sizes = marker_size_from_cell_counts(
+        plot_df["n_cells"], min_size=6.0, max_size=24.0
+    )
 
     color_values = plot_df["mean_expr"].tolist()
     positive_colors = plot_df.loc[
@@ -2314,7 +2331,7 @@ def build_matrix_expression_plot(
                 "text": (
                     f"<b>VasQ expression by {dimension_title}</b>"
                     "<br><span style='font-size:12px;color:#64748b'>"
-                    "Color = mean expression · Size = expressing-cell fraction"
+                    "Color = mean expression · Size = cells analyzed"
                     f" · Groups require ≥{MIN_CELLS_PER_GROUP} cells"
                     "</span>"
                 ),
