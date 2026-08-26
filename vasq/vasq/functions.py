@@ -194,17 +194,33 @@ def call_helper_api(
 logger = logging.getLogger(__name__)
 
 
-def _domain_label(url):
-    """A link label mechanically derived from the URL itself -- the domain
-    is literally a substring of the URL, so there is no separate piece of
-    data that could drift out of sync with it the way a title or an
-    author/year label (sourced from somewhere else) can.
+def _source_label(url):
+    """A link label mechanically derived from the URL itself -- domain plus
+    enough of the path to tell two different pages on the same domain
+    apart (e.g. two different NCBI Bookshelf chapters, both under
+    ncbi.nlm.nih.gov). Still derived only from the URL string itself, with
+    no separate piece of data (a title, an author name) that could drift
+    out of sync with the link target -- that drift is exactly what made an
+    author/year or page-title label unreliable even when it started out
+    correctly paired with its URL.
     """
     try:
-        host = urlparse(url).netloc or url
+        parsed = urlparse(url)
+        host = parsed.netloc or url
+        if host.startswith("www."):
+            host = host[4:]
+        path = parsed.path.strip("/")
     except Exception:
-        host = url
-    return host[4:] if host.startswith("www.") else host
+        return url
+    if not path:
+        return host
+    # Keep the label compact: enough of the path to distinguish pages,
+    # not the entire thing for a long or deeply nested URL.
+    segments = [s for s in path.split("/") if s]
+    short_path = "/".join(segments[:2])
+    if len(short_path) > 40:
+        short_path = short_path[:40].rstrip("/") + "\u2026"
+    return f"{host}/{short_path}"
 
 
 def _splice_web_search_citations(response):
@@ -221,14 +237,17 @@ def _splice_web_search_citations(response):
     citation label (e.g. "Smith et al., 2020"); (3) using the annotation's
     own page title as the label removed the model's free-text step, but a
     title is still a separate piece of data alongside the URL that a
-    rewriting model could still touch or replace.
+    rewriting model could still touch or replace; (4) using just the URL's
+    domain made two different pages on the same host (e.g. two different
+    NCBI Bookshelf chapters) look identical.
 
-    This version drops the idea of a descriptive label entirely and uses
-    the URL's own domain as the visible text -- mechanically extracted
-    from the URL string itself, so the visible text and the link target
-    can never be sourced from two different places. Less informative than
-    an author/year citation, but there is nothing left for a rewriting
-    model to get wrong about the pairing.
+    This version uses the domain plus a short piece of the URL's own path
+    as the visible text -- still mechanically extracted from the URL
+    string itself, so the visible text and the link target can never be
+    sourced from two different places, but specific enough to tell two
+    same-domain sources apart. Less informative than an author/year
+    citation, but there is nothing left for a rewriting model to get wrong
+    about the pairing.
 
     Returns (text_with_inline_sources, fallback_urls) -- fallback_urls are
     sources the tool fetched but never tied to a specific claim (from
@@ -263,7 +282,7 @@ def _splice_web_search_citations(response):
                     for annotation in annotations:
                         end = annotation.end_index
                         url = annotation.url
-                        marker = f" [{_domain_label(url)}]({url})"
+                        marker = f" [{_source_label(url)}]({url})"
                         spliced = spliced[:end] + marker + spliced[end:]
                     pieces.append(spliced)
 
@@ -3394,13 +3413,18 @@ def _chat_impl(user_input, history, should_stop=None):
             "function, pathway, mechanism, clinical-stage, and regulatory "
             "claims, and preserve its citations. The evidence text may "
             "already contain complete markdown links, e.g. "
-            "\"[pubmed.ncbi.nlm.nih.gov](https://...)\", immediately after "
+            "\"[pubmed.ncbi.nlm.nih.gov/12345](https://...)\", immediately after "
             "a specific claim -- keep that exact link exactly as given, "
             "character for character, including its visible text. Never "
             "rewrite, shorten, or replace the visible text with an "
             "author/year or paper-title guess, never change the URL, and "
             "never move a link to a different claim than the one it "
-            "followed in the evidence. If a claim has no such link, do not "
+            "followed in the evidence. A claim may have more than one such "
+            "link immediately after it (multiple sources supporting the "
+            "same statement) -- when it does, keep all of them, separated "
+            "by a single space exactly as given; do not wrap them in your "
+            "own parentheses or brackets, and do not merge, reorder, or "
+            "drop any of them. If a claim has no such link, do not "
             "invent one from memory -- state it without a citation. Use VasQ only for measured "
             "brain-vasculature expression claims; distinguish matrix mean "
             "expression from marker rank/score. When the web/literature "
