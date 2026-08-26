@@ -1716,6 +1716,7 @@ def build_marker_bar_plot(marker_rows, title=None):
             },
             "height": max(420, 165 + 38 * len(plot_df)),
             "autosize": True,
+            "hovermode": "closest",
             "bargap": 0.34,
             "paper_bgcolor": "rgba(0,0,0,0)",
             "plot_bgcolor": "#ffffff",
@@ -2721,6 +2722,11 @@ def build_single_gene_cell_type_matrix(plot_df, comparison_cols):
             # as though they belonged to the wrong cell type.
             "height": max(650, 210 + 30 * len(cell_order)),
             "autosize": True,
+            # Without this, hovering can trigger every point sharing the
+            # nearest x (region) at once instead of just the point under the
+            # cursor -- e.g. every cell type present in that region popping
+            # up together.
+            "hovermode": "closest",
             "paper_bgcolor": "rgba(0,0,0,0)",
             "plot_bgcolor": "#ffffff",
             "font": {"family": "Satoshi, Arial, sans-serif", "color": "#32175a", "size": 16},
@@ -2903,6 +2909,7 @@ def build_cell_type_gene_panels(plot_df, gene_order, comparison_cols):
         },
         "height": max(760, 180 + len(cell_types) * max(190, 34 * len(gene_order))),
         "autosize": True,
+        "hovermode": "closest",
         "paper_bgcolor": "rgba(0,0,0,0)",
         "plot_bgcolor": "#ffffff",
         "font": {"family": "Satoshi, Arial, sans-serif", "color": "#32175a", "size": 13},
@@ -3112,6 +3119,7 @@ def build_matrix_expression_plot(
             },
             "height": max(650, 220 + 42 * len(gene_order)),
             "autosize": True,
+            "hovermode": "closest",
             "paper_bgcolor": "rgba(0,0,0,0)",
             "plot_bgcolor": "#ffffff",
             "font": {
