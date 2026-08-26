@@ -1800,10 +1800,6 @@ def matrix_plot_marker(plot_df, *, showscale=True, color_max=None):
             [0.60, "#5b3d8b"],
             [1.00, "#32175a"],
         ],
-        "opacity": [
-            0.5 if int(n) < 20 else 0.92
-            for n in plot_df["n_cells"]
-        ],
         "line": {"color": "#ffffff", "width": 1},
         "showscale": showscale,
         "colorbar": {
@@ -2213,10 +2209,6 @@ def build_matrix_expression_plot(
     marker_sizes = (
         6.0 + 18.0 * np.sqrt(plot_df["pct_expr"].to_numpy())
     ).round(1).tolist()
-    marker_opacity = [
-        0.45 if n_cells < 20 else 0.9
-        for n_cells in plot_df["n_cells"]
-    ]
 
     color_values = plot_df["mean_expr"].tolist()
     positive_colors = plot_df.loc[
@@ -2270,7 +2262,6 @@ def build_matrix_expression_plot(
                         [0.60, "#5b3d8b"],
                         [1.00, "#32175a"],
                     ],
-                    "opacity": marker_opacity,
                     "line": {"color": "#ffffff", "width": 1},
                     "colorbar": {
                         "title": {"text": "Mean<br>expression"},
