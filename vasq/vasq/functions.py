@@ -669,18 +669,36 @@ def resolve_matrix_entities(user_input):
         user_input, MATRIX_REGION_LAYER_ALIAS_MAP
     )
 
-    (
-        gpt_cell_type_matches,
-        gpt_cell_class_matches,
-        gpt_region_matches,
-        gpt_region_layer_matches,
-    ) = resolve_dataset_entities_with_gpt(
-        user_input,
-        MATRIX_AVAILABLE_CELL_TYPES,
-        MATRIX_AVAILABLE_REGIONS,
-        available_cell_classes=MATRIX_AVAILABLE_CELL_CLASSES,
-        available_region_layers=MATRIX_AVAILABLE_REGION_LAYERS,
+    # GPT is a fallback for wording the deterministic aliases can't cover,
+    # not a second opinion on every query. Only call it when local
+    # string/fuzzy matching found nothing at all across every dimension; if
+    # any dimension already resolved locally, trust that result for all
+    # four dimensions and skip the network round-trip entirely.
+    any_local_match = (
+        local_cell_type_matches
+        or local_cell_class_matches
+        or local_region_matches
+        or local_region_layer_matches
     )
+
+    if any_local_match:
+        gpt_cell_type_matches = None
+        gpt_cell_class_matches = None
+        gpt_region_matches = None
+        gpt_region_layer_matches = None
+    else:
+        (
+            gpt_cell_type_matches,
+            gpt_cell_class_matches,
+            gpt_region_matches,
+            gpt_region_layer_matches,
+        ) = resolve_dataset_entities_with_gpt(
+            user_input,
+            MATRIX_AVAILABLE_CELL_TYPES,
+            MATRIX_AVAILABLE_REGIONS,
+            available_cell_classes=MATRIX_AVAILABLE_CELL_CLASSES,
+            available_region_layers=MATRIX_AVAILABLE_REGION_LAYERS,
+        )
 
     # Hybrid resolution: curated deterministic aliases protect common dataset
     # terminology from an LLM omission, while the LLM covers unenumerated
