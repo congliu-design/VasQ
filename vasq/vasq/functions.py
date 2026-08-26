@@ -291,7 +291,14 @@ def search_scientific_web(user_input, kg_context=None, kg_assessment=None):
         "are involved, provide a prioritized list of official human gene "
         "symbols and distinguish causal genes from risk-associated or "
         "mechanistic genes. If pathway, function, or gene-association evidence "
-        "is not available, say so instead of inferring it. "
+        "is not available, say so instead of inferring it. For each gene "
+        "discussed, also state which cell type(s) the literature identifies "
+        "it with -- for example as a canonical marker gene, from single-cell "
+        "or tissue-atlas expression data, or from a cell-type-specific "
+        "functional role -- and cite the supporting source. This will be "
+        "cross-checked against measured single-cell expression data, so be "
+        "explicit about which cell type(s) are reported and say so plainly "
+        "if the literature does not establish a cell-type association. "
     )
 
     return run_openai_web_search(
@@ -841,7 +848,12 @@ def requested_matrix_group_columns(
     return group_cols
 
 
-def matrix_expression(user_input, genes_override=None):
+def matrix_expression(
+    user_input,
+    genes_override=None,
+    web_evidence_text=None,
+    kg_evidence_text=None,
+):
     ensure_matrix_expression_data_loaded()
 
     if genes_override:
@@ -857,7 +869,63 @@ def matrix_expression(user_input, genes_override=None):
     if not genes:
         return "Please specify a gene for matrix-based expression queries."
 
+    present_genes = [g for g in genes if g in MATRIX_GENE_TO_IDX]
+    missing_genes = [g for g in genes if g not in MATRIX_GENE_TO_IDX]
+
     cell_types, cell_classes, regions, region_layers = resolve_matrix_entities(user_input)
+
+    cell_axis_empty = not cell_types and not cell_classes
+    region_axis_empty = not regions and not region_layers
+
+    combined_evidence_text = "\n\n".join(
+        part for part in [kg_evidence_text, web_evidence_text] if part
+    )
+
+    web_filter_notes = []
+    if (cell_axis_empty or region_axis_empty) and combined_evidence_text:
+        # The user's own query left the cell axis and/or region axis
+        # unresolved. Before falling back to reporting every value on that
+        # axis, check whether the KG-RAG/literature evidence already
+        # gathered establishes one -- and if it does, use it as the actual
+        # matrix filter (not just a side comparison), and keep the model's
+        # own rationale rather than discarding it once labels are pulled out.
+        (
+            inferred_types,
+            inferred_classes,
+            inferred_regions,
+            inferred_layers,
+            reason,
+        ) = infer_matrix_hints_from_web_evidence(
+            present_genes or genes,
+            combined_evidence_text,
+            MATRIX_AVAILABLE_CELL_TYPES,
+            MATRIX_AVAILABLE_CELL_CLASSES,
+            MATRIX_AVAILABLE_REGIONS,
+            MATRIX_AVAILABLE_REGION_LAYERS,
+        )
+        applied = []
+        if cell_axis_empty and (inferred_types or inferred_classes):
+            cell_types, cell_classes = inferred_types, inferred_classes
+            applied.append(
+                "cell type/class (" + ", ".join(inferred_types + inferred_classes) + ")"
+            )
+        if region_axis_empty and (inferred_regions or inferred_layers):
+            regions, region_layers = inferred_regions, inferred_layers
+            applied.append(
+                "region (" + ", ".join(inferred_regions + inferred_layers) + ")"
+            )
+        if applied:
+            note = (
+                "Filter(s) not requested in the question -- "
+                + "; ".join(applied)
+                + " -- were inferred from the literature evidence gathered "
+                "for this gene and applied as matrix filters. Other values "
+                "on that axis were not analyzed."
+            )
+            if reason:
+                note += f" Literature rationale: {reason}"
+            web_filter_notes.append(note)
+
     group_cols = requested_matrix_group_columns(
         user_input,
         cell_types=cell_types,
@@ -865,9 +933,6 @@ def matrix_expression(user_input, genes_override=None):
         regions=regions,
         region_layers=region_layers,
     )
-
-    present_genes = [g for g in genes if g in MATRIX_GENE_TO_IDX]
-    missing_genes = [g for g in genes if g not in MATRIX_GENE_TO_IDX]
 
     notes = [
         "This answer uses log-normalized values from the HVG-filtered expression matrix.",
@@ -879,6 +944,8 @@ def matrix_expression(user_input, genes_override=None):
             f"Cell type: {', '.join(cell_types) if cell_types else 'ALL'}."
         ),
     ]
+
+    notes.extend(web_filter_notes)
 
     if missing_genes:
         notes.append(
@@ -1797,6 +1864,96 @@ def resolve_dataset_entities_with_gpt(
         # None means the helper failed and allows the caller to use local
         # matching. A successful helper response can intentionally return [].
         return None, None, None, None
+
+def infer_matrix_hints_from_web_evidence(
+    genes,
+    web_result_text,
+    available_cell_types,
+    available_cell_classes,
+    available_regions,
+    available_region_layers,
+):
+    """Read literature evidence to see if it establishes cell-type and/or
+    brain-region associations for the given genes -- used only as a
+    fallback for whichever dimensions the user's own query left
+    unresolved, so the VasQ matrix would otherwise be reported across
+    everything on that axis. Returns
+    (cell_types, cell_classes, regions, region_layers, reason). Every list
+    is empty, and reason is "", when the evidence does not clearly and
+    unambiguously support a specific value -- this function never guesses.
+    `reason` is the organized, plain-language rationale behind whatever was
+    reported, so it can be preserved and shown to the reader rather than
+    discarded once the labels are extracted.
+    """
+    genes = genes or []
+    web_result_text = (web_result_text or "").strip()
+    if not genes or not web_result_text:
+        return [], [], [], [], ""
+
+    system_prompt = (
+        "Read biomedical literature evidence and decide whether it "
+        "establishes, for the given gene(s): (1) a specific cell type or "
+        "cell class they are known to be associated with -- for example as "
+        "a canonical marker gene, from single-cell/tissue-atlas expression "
+        "data, or a cell-type-specific functional role; and/or (2) a "
+        "specific brain region or region layer they are known to be "
+        "relevant to -- for example a region implicated in the disease "
+        "discussed. Only report a value in a given list when the evidence "
+        "clearly and unambiguously supports it; if the evidence is mixed, "
+        "hedged, absent, or discusses multiple plausible values, leave that "
+        "list empty instead of guessing. Return JSON only with keys: "
+        '{"cell_types": [], "cell_classes": [], "regions": [], '
+        '"region_layers": [], "reason": ""}. Only use exact labels from the '
+        "supplied lists, and never invent one. \"reason\" is a short "
+        "(1-3 sentence) plain-language summary, naming the gene(s), of "
+        "what the evidence establishes and why -- leave it empty if "
+        "nothing was established."
+    )
+    user_prompt = (
+        f"Genes: {genes}\n\n"
+        f"Available cell types: {available_cell_types}\n\n"
+        f"Available cell classes: {available_cell_classes}\n\n"
+        f"Available brain regions: {available_regions}\n\n"
+        f"Available region layers: {available_region_layers}\n\n"
+        f"Literature evidence:\n{cap_source_text(web_result_text, 6000)}"
+    )
+
+    try:
+        response = call_helper_api(
+            system_prompt,
+            user_prompt,
+            stage_name="web_matrix_hint_inference",
+        )
+        parsed = parse_json_object(response.choices[0].message.content)
+        if not parsed:
+            return [], [], [], [], ""
+        cell_types = validate_controlled_vocabulary(
+            parsed.get("cell_types", []),
+            available_cell_types,
+            dimension_name="cell_type",
+        )
+        cell_classes = validate_controlled_vocabulary(
+            parsed.get("cell_classes", []),
+            available_cell_classes,
+            dimension_name="cell_class",
+        )
+        regions = validate_controlled_vocabulary(
+            parsed.get("regions", []),
+            available_regions,
+            dimension_name="region",
+        )
+        region_layers = validate_controlled_vocabulary(
+            parsed.get("region_layers", []),
+            available_region_layers,
+            dimension_name="region_layer",
+        )
+        reason = str(parsed.get("reason", "")).strip()
+        return cell_types, cell_classes, regions, region_layers, reason
+    except Exception:
+        logger.exception("Web-evidence matrix-hint inference failed")
+        return [], [], [], [], ""
+
+
 
 def extract_entities(user_input):
     ensure_expression_data_loaded()
@@ -3627,6 +3784,10 @@ def _chat_impl(user_input, history, should_stop=None):
                     vasq_result = matrix_expression(
                         resolved_question,
                         genes_override=genes,
+                        web_evidence_text=scientific_web_result,
+                        kg_evidence_text=(
+                            kg_result if kg_assessment.get("relevant") else None
+                        ),
                     )
                 logger.info("VasQ analysis completed for genes: %s", genes)
             except Exception:
@@ -3743,7 +3904,15 @@ def _chat_impl(user_input, history, should_stop=None):
             "function, pathway, mechanism, clinical-stage, and regulatory "
             "claims, and preserve its citations. Use VasQ only for measured "
             "brain-vasculature expression claims; distinguish matrix mean "
-            "expression from marker rank/score. In the drug section, clearly "
+            "expression from marker rank/score. When the web/literature "
+            "evidence reports a cell type a gene is known to be associated "
+            "with (a marker gene, atlas data, or cell-type-specific "
+            "function) and the VasQ matrix also reports that gene's "
+            "measured expression by cell type, explicitly state whether the "
+            "VasQ-measured highest-expressing cell type agrees or disagrees "
+            "with the literature-reported cell type, and note the "
+            "discrepancy plainly rather than silently picking one source. "
+            "In the drug section, clearly "
             "separate direct gene/protein modulators, pathway-related "
             "compounds, and disease-directed treatments, and distinguish "
             "approved, clinical, preclinical, and research-tool status. Never "
