@@ -669,19 +669,17 @@ def resolve_matrix_entities(user_input):
         user_input, MATRIX_REGION_LAYER_ALIAS_MAP
     )
 
-    # GPT is a fallback for wording the deterministic aliases can't cover,
-    # not a second opinion on every query. Only call it when local
-    # string/fuzzy matching found nothing at all across every dimension; if
-    # any dimension already resolved locally, trust that result for all
-    # four dimensions and skip the network round-trip entirely.
-    any_local_match = (
-        local_cell_type_matches
-        or local_cell_class_matches
-        or local_region_matches
-        or local_region_layer_matches
-    )
+    # cell_type/cell_class are one axis (a specific type already implies its
+    # class); brain_region/region_layer are the other axis (a named region
+    # already implies its coarse layer bucket, and vice versa). GPT is only
+    # worth consulting for an axis where *neither* member resolved locally.
+    # If either member of a pair already hit, that whole axis is trusted and
+    # GPT's opinion on it is discarded even when the shared call still
+    # returns one -- local never gets overridden or duplicated.
+    cell_axis_resolved = bool(local_cell_type_matches) or bool(local_cell_class_matches)
+    region_axis_resolved = bool(local_region_matches) or bool(local_region_layer_matches)
 
-    if any_local_match:
+    if cell_axis_resolved and region_axis_resolved:
         gpt_cell_type_matches = None
         gpt_cell_class_matches = None
         gpt_region_matches = None
@@ -699,6 +697,12 @@ def resolve_matrix_entities(user_input):
             available_cell_classes=MATRIX_AVAILABLE_CELL_CLASSES,
             available_region_layers=MATRIX_AVAILABLE_REGION_LAYERS,
         )
+        if cell_axis_resolved:
+            gpt_cell_type_matches = None
+            gpt_cell_class_matches = None
+        if region_axis_resolved:
+            gpt_region_matches = None
+            gpt_region_layer_matches = None
 
     # Hybrid resolution: curated deterministic aliases protect common dataset
     # terminology from an LLM omission, while the LLM covers unenumerated
