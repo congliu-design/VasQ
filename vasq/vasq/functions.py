@@ -19,6 +19,8 @@ from .entity_aliases import (
     build_cell_class_alias_map as build_matrix_cell_class_alias_map,
     build_cell_type_alias_map as build_matrix_cell_type_alias_map,
     build_region_layer_alias_map as build_matrix_region_layer_alias_map,
+    exclude_classes_implied_by_cell_types,
+    exclude_normalized_duplicates,
     merge_hybrid_matches,
     normalize_text,
     resolve_entities_from_text,
@@ -707,6 +709,17 @@ def resolve_matrix_entities(user_input):
         gpt_region_layer_matches,
         MATRIX_AVAILABLE_REGION_LAYERS,
         dimension_name="region_layer",
+    )
+
+    # Cross-dimension reconciliation. merge_hybrid_matches above only
+    # combines local+GPT matches within a single dimension; it cannot see
+    # that a resolved cell_type already pins down (and makes redundant) a
+    # cell_class match found independently in the same query.
+    cell_class_matches = exclude_normalized_duplicates(
+        cell_class_matches, cell_type_matches
+    )
+    cell_class_matches = exclude_classes_implied_by_cell_types(
+        cell_class_matches, cell_type_matches
     )
 
     if dimension_filter_is_disabled(user_input, "cell_type"):
