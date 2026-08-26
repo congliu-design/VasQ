@@ -1,3 +1,4 @@
+import concurrent.futures
 import contextvars
 import json
 import threading
@@ -3685,26 +3686,39 @@ def _chat_impl(user_input, history, should_stop=None):
         )
     else:
         _raise_if_cancelled(should_stop)
-        try:
-            kg_result = query_kg_rag(resolved_question)
-        except Exception:
-            logger.exception("KG-RAG branch failed")
-            kg_result = None
+        # KG-RAG and the first Web Search are independent lookups. Running
+        # them sequentially means paying for both wait times in full; in
+        # observed logs KG-RAG alone has taken 160-250s. Overlapping them
+        # turns the wall-clock cost into roughly max(KG-RAG, Web Search)
+        # instead of their sum. The trade-off: Web Search can no longer wait
+        # to see whether KG-RAG found anything relevant, so it always
+        # searches from the question directly rather than being primed with
+        # KG context -- KG's own content still reaches gene derivation and
+        # the final synthesis evidence package below, unaffected.
+        kg_result = None
+        scientific_web_result = None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            kg_future = executor.submit(query_kg_rag, resolved_question)
+            logger.info("Web Search stage 1/2: scientific knowledge and genes")
+            web_future = executor.submit(
+                search_scientific_web,
+                resolved_question,
+                kg_context=None,
+                kg_assessment=None,
+            )
+            try:
+                kg_result = kg_future.result()
+            except Exception:
+                logger.exception("KG-RAG branch failed")
+                kg_result = None
+            try:
+                scientific_web_result = web_future.result()
+            except Exception:
+                logger.exception("Scientific Web Search branch failed")
+                scientific_web_result = None
 
         _raise_if_cancelled(should_stop)
         kg_assessment = assess_kg_relevance(resolved_question, kg_result)
-
-        _raise_if_cancelled(should_stop)
-        try:
-            logger.info("Web Search stage 1/2: scientific knowledge and genes")
-            scientific_web_result = search_scientific_web(
-                resolved_question,
-                kg_context=kg_result,
-                kg_assessment=kg_assessment,
-            )
-        except Exception:
-            logger.exception("Scientific Web Search branch failed")
-            scientific_web_result = None
 
         _raise_if_cancelled(should_stop)
 
