@@ -61,6 +61,22 @@ def _env_int(name, default, minimum=0, maximum=5):
     return max(minimum, min(maximum, value))
 
 
+def _env_bool(name, default):
+    """Read a boolean environment setting with a safe fallback."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return bool(default)
+
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    logger.warning("Invalid %s=%r; using default=%s", name, raw_value, default)
+    return bool(default)
+
+
 def _stage_timeout(stage_name, requested_seconds, reserve_seconds=5.0):
     """Cap a network call by both its stage limit and the current turn budget."""
     requested_seconds = max(1.0, float(requested_seconds))
@@ -112,19 +128,11 @@ def call_api(
         "messages": history,
     }
 
- 
     if functions:
         request_args["functions"] = functions
-    
-        # Chat Completions + function calling must use none
+        
         if model.startswith("gpt-5.6"):
             request_args["reasoning_effort"] = "none"
-    
-    elif model.startswith("gpt-5.6"):
-        request_args["reasoning_effort"] = os.getenv(
-            "OPENAI_MAIN_REASONING_EFFORT",
-            "xhigh",
-        )
             
     timeout_seconds = timeout_seconds or _env_float(
         "OPENAI_CHAT_TIMEOUT_SECONDS", 45
@@ -349,21 +357,27 @@ def run_openai_web_search(
     try:
         timeout_seconds = _stage_timeout(
             stage_name,
-            _env_float("OPENAI_WEB_TIMEOUT_SECONDS", 150),
+            _env_float("OPENAI_WEB_TIMEOUT_SECONDS", 600),
             reserve_seconds=_env_float("VASQ_SYNTHESIS_RESERVE_SECONDS", 50),
         )
+        web_model = os.getenv("OPENAI_WEB_MODEL", "gpt-5.6-sol")
+        use_background = _env_bool("OPENAI_WEB_BACKGROUND", True)
+        poll_interval = _env_float(
+            "OPENAI_WEB_POLL_INTERVAL_SECONDS", 2, minimum=0.5
+        )
+        http_timeout = _env_float(
+            "OPENAI_WEB_HTTP_TIMEOUT_SECONDS", 30, minimum=5
+        )
         logger.info(
-            "Calling OpenAI Web Search stage=%s model=%s context=%s timeout=%.1fs",
+            "Calling OpenAI Web Search stage=%s model=%s context=%s "
+            "timeout=%.1fs background=%s",
             stage_name,
-            os.getenv("OPENAI_WEB_MODEL", "gpt-5.6-terra"),
+            web_model,
             search_context_size,
             timeout_seconds,
+            use_background,
         )
 
-        # Keep the quality-first synthesis model independent from the
-        # latency-sensitive search worker. In particular, do not silently use
-        # OPENAI_MODEL=gpt-5.6-sol for every hosted Web Search call.
-        web_model = os.getenv("OPENAI_WEB_MODEL", "gpt-5.6-terra")
         request_args = {
             "model": web_model,
             "tools": [
@@ -386,12 +400,100 @@ def run_openai_web_search(
                 "effort": os.getenv("OPENAI_WEB_REASONING_EFFORT", "low")
             }
 
-        response = client.with_options(
-            timeout=timeout_seconds,
+        if use_background:
+            request_args["background"] = True
+
+        web_client = client.with_options(
+            # A background create/retrieve request should return quickly. The
+            # much longer scientific-search limit is enforced by the polling
+            # deadline below, rather than by one fragile HTTP connection.
+            timeout=min(timeout_seconds, http_timeout)
+            if use_background
+            else timeout_seconds,
             # A Web Search retry can repeat a large and expensive tool call.
             # Default to no retry; it can be enabled explicitly if desired.
             max_retries=_env_int("OPENAI_WEB_MAX_RETRIES", 0),
-        ).responses.create(**request_args)
+        )
+        stage_deadline = time.monotonic() + timeout_seconds
+        response = web_client.responses.create(**request_args)
+
+        if use_background:
+            response_id = getattr(response, "id", None)
+            if not response_id:
+                logger.warning(
+                    "OpenAI Web Search background response has no id stage=%s",
+                    stage_name,
+                )
+                return None
+
+            logger.info(
+                "OpenAI Web Search background task submitted stage=%s "
+                "response_id=%s status=%s",
+                stage_name,
+                response_id,
+                getattr(response, "status", None),
+            )
+
+            while getattr(response, "status", None) in {"queued", "in_progress"}:
+                remaining = stage_deadline - time.monotonic()
+                if remaining <= 0:
+                    try:
+                        client.with_options(
+                            timeout=min(10.0, http_timeout),
+                            max_retries=0,
+                        ).responses.cancel(response_id)
+                    except Exception:
+                        logger.warning(
+                            "Could not cancel expired Web Search response_id=%s",
+                            response_id,
+                            exc_info=True,
+                        )
+                    logger.warning(
+                        "OpenAI Web Search reached its %.1fs stage deadline "
+                        "stage=%s response_id=%s",
+                        timeout_seconds,
+                        stage_name,
+                        response_id,
+                    )
+                    return None
+
+                time.sleep(min(poll_interval, remaining))
+                remaining = stage_deadline - time.monotonic()
+                if remaining <= 0:
+                    continue
+
+                try:
+                    response = client.with_options(
+                        timeout=min(http_timeout, max(1.0, remaining)),
+                        max_retries=0,
+                    ).responses.retrieve(response_id)
+                except (
+                    openai.APITimeoutError,
+                    openai.APIConnectionError,
+                    openai.RateLimitError,
+                ) as exc:
+                    # A transient polling failure does not mean that the
+                    # server-side response stopped running. Keep polling until
+                    # the stage deadline rather than abandoning useful work.
+                    logger.warning(
+                        "OpenAI Web Search poll failed stage=%s response_id=%s "
+                        "error=%s; retrying within stage budget",
+                        stage_name,
+                        response_id,
+                        type(exc).__name__,
+                    )
+
+            status = getattr(response, "status", None)
+            if status != "completed":
+                logger.warning(
+                    "OpenAI Web Search ended without completion stage=%s "
+                    "response_id=%s status=%s error=%r",
+                    stage_name,
+                    response_id,
+                    status,
+                    getattr(response, "error", None),
+                )
+                return None
 
         result, fallback_urls = _splice_web_search_citations(response)
 
@@ -4533,7 +4635,7 @@ def _chat_impl(user_input, history, should_stop=None):
 
 def chat(user_input, history, should_stop=None):
     """Run one synchronous chat turn inside a hard wall-clock budget."""
-    budget_seconds = _env_float("VASQ_TURN_BUDGET_SECONDS", 240)
+    budget_seconds = _env_float("VASQ_TURN_BUDGET_SECONDS", 600)
     started_at = time.monotonic()
     deadline_token = _TURN_DEADLINE.set(started_at + budget_seconds)
     logger.info("VasQ turn started budget=%.1fs", budget_seconds)
