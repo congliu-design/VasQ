@@ -605,6 +605,11 @@ MATRIX_REGION_LAYER_ALIAS_MAP = None
 # text table and every plot enforce the same rule.
 MIN_CELLS_PER_GROUP = 10
 
+# Keep multi-gene answers readable and inexpensive to render. Every gene still
+# receives a text summary; only the three strongest overall expression
+# profiles receive Plotly figures.
+MAX_PLOTTED_GENES = 3
+
 
 def load_gene_names():
     genes_df = pd.read_csv(GENE_NAMES_PATH)
@@ -1023,62 +1028,15 @@ def matrix_expression(
 
     cell_types, cell_classes, regions, region_layers = resolve_matrix_entities(user_input)
 
-    cell_axis_empty = not cell_types and not cell_classes
-    region_axis_empty = not regions and not region_layers
-
-    combined_evidence_text = "\n\n".join(
-        part for part in [kg_evidence_text, web_evidence_text] if part
-    )
-
+    # Literature evidence must not silently narrow the matrix scope. The
+    # literature and VasQ comparison is only meaningful when VasQ is allowed to
+    # evaluate every cell type/region inside the user's explicit filters. In an
+    # earlier implementation, a literature statement such as "APP is neuronal"
+    # could become a Neuron-only matrix filter, making it impossible to test
+    # whether Neuron was actually the highest VasQ cell type. Keep literature
+    # available for final synthesis, but derive matrix filters only from the
+    # user's question.
     web_filter_notes = []
-    if (cell_axis_empty or region_axis_empty) and combined_evidence_text:
-        # The user's own query left the cell axis and/or region axis
-        # unresolved. Before falling back to reporting every value on that
-        # axis, check whether the KG-RAG/literature evidence already
-        # gathered establishes one -- and if it does, use it as the actual
-        # matrix filter (not just a side comparison), and keep the model's
-        # own rationale rather than discarding it once labels are pulled out.
-        (
-            inferred_types,
-            inferred_classes,
-            inferred_regions,
-            inferred_layers,
-            cell_reason,
-            region_reason,
-        ) = infer_matrix_hints_from_web_evidence(
-            present_genes or genes,
-            combined_evidence_text,
-            MATRIX_AVAILABLE_CELL_TYPES,
-            MATRIX_AVAILABLE_CELL_CLASSES,
-            MATRIX_AVAILABLE_REGIONS,
-            MATRIX_AVAILABLE_REGION_LAYERS,
-        )
-        if cell_axis_empty and (inferred_types or inferred_classes):
-            cell_types, cell_classes = inferred_types, inferred_classes
-            note = (
-                "Cell type/class filter ("
-                + ", ".join(inferred_types + inferred_classes)
-                + ") was not requested in the question. It was inferred "
-                "from the literature evidence gathered for this gene and "
-                "applied as the matrix filter; other cell types were not "
-                "analyzed."
-            )
-            if cell_reason:
-                note += f" Literature rationale: {cell_reason}"
-            web_filter_notes.append(note)
-        if region_axis_empty and (inferred_regions or inferred_layers):
-            regions, region_layers = inferred_regions, inferred_layers
-            note = (
-                "Region filter ("
-                + ", ".join(inferred_regions + inferred_layers)
-                + ") was not requested in the question. It was inferred "
-                "from the literature evidence gathered for this gene and "
-                "applied as the matrix filter; other regions were not "
-                "analyzed."
-            )
-            if region_reason:
-                note += f" Literature rationale: {region_reason}"
-            web_filter_notes.append(note)
 
     group_cols = requested_matrix_group_columns(
         user_input,
@@ -1125,6 +1083,7 @@ def matrix_expression(
         )
 
     gene_stats = {}
+    gene_plot_scores = {}
     gene_sections = {}
     regional_plot_frames = []
 
@@ -1145,15 +1104,24 @@ def matrix_expression(
     # detail is smaller.
     gene_count = max(1, len(present_genes))
     if gene_count <= 2:
-        rows_per_gene, coverage_values_per_gene = 40, 30
+        rows_per_gene, cell_types_per_gene, coverage_values_per_gene = 12, 12, 12
     elif gene_count <= 5:
-        rows_per_gene, coverage_values_per_gene = 20, 20
+        rows_per_gene, cell_types_per_gene, coverage_values_per_gene = 6, 8, 8
     elif gene_count <= 10:
-        rows_per_gene, coverage_values_per_gene = 10, 10
+        rows_per_gene, cell_types_per_gene, coverage_values_per_gene = 3, 6, 6
     else:
-        rows_per_gene, coverage_values_per_gene = 5, 6
+        rows_per_gene, cell_types_per_gene, coverage_values_per_gene = 1, 4, 4
 
     for gene in present_genes:
+        # Rank plot candidates by expression across every matched cell,
+        # including zero values. This is more stable than selecting genes by
+        # one potentially extreme region x cell-type group.
+        gene_values = get_gene_vector(effective_cell_indices, gene)
+        gene_plot_scores[gene] = (
+            float(gene_values.mean()) if len(gene_values) else 0.0,
+            float((gene_values > 0).mean()) if len(gene_values) else 0.0,
+        )
+
         # Keep every requested comparison dimension separate. This prevents,
         # for example, Layer 2 and Layer 3 from being pooled into one mean.
         stats = summarize_group_expression(
@@ -1164,24 +1132,34 @@ def matrix_expression(
         )
 
         gene_stats[gene] = stats
+        # This is a raw-cell-weighted aggregation across all matched regions,
+        # not an unweighted average of region-level means. It is therefore the
+        # correct VasQ quantity to compare with a literature statement about a
+        # gene's overall cell-type association.
+        cell_type_stats = summarize_group_expression(
+            gene,
+            effective_cell_indices,
+            ["cell_type"],
+            min_cells=MIN_CELLS_PER_GROUP,
+        )
         gene_sections[gene] = format_matrix_expression_summary(
             stats,
             gene,
             group_cols=group_cols,
+            cell_type_stats=cell_type_stats,
             max_rows=rows_per_gene,
+            max_cell_type_rows=cell_types_per_gene,
             max_coverage_values=coverage_values_per_gene,
         )
 
-        # `stats` already uses the same grouping and cell threshold, so reuse
-        # it for the visual instead of recomputing it with identical
-        # arguments. This keeps the plot points exactly aligned with the
-        # rows shown in the table while avoiding a second, redundant pass
-        # over the expression matrix for every gene.
+        # Preserve every eligible group for plotting. The compact text table
+        # below is capped for readability, but the graph payload is separate
+        # from the LLM evidence text and therefore does not consume its token
+        # budget.
         if not stats.empty:
             regional_plot_frames.append(stats)
 
     plot_json = None
-    top_gene = None
     all_stats = (
         pd.concat(regional_plot_frames, ignore_index=True)
         if regional_plot_frames
@@ -1189,70 +1167,87 @@ def matrix_expression(
     )
     if not all_stats.empty:
         plot_group_cols = list(group_cols)
-        plot_gene_order = present_genes
-        top_gene_note = None
+        plot_genes = select_top_expression_genes(
+            present_genes,
+            gene_plot_scores,
+            max_genes=MAX_PLOTTED_GENES,
+        )
 
         if "cell_type" in group_cols:
-            # A region x cell_type matrix is only readable one gene at a
-            # time (that's what build_single_gene_cell_type_matrix draws).
-            # With several genes, plot only the one with the single highest
-            # measured expression instead of averaging or splitting into a
-            # panel per cell type -- the text table above still reports
-            # every gene and every cell type untouched.
+            # One region x cell-type figure per gene is much easier to read
+            # than flattening gene x region x cell type into one axis. Keep
+            # the complete eligible statistics in each figure; only the text
+            # summary is capped.
             plot_group_cols = ["brain_region"]
             if "region_layer" in group_cols:
                 plot_group_cols.append("region_layer")
             plot_group_cols.append("cell_type")
 
-            top_gene = present_genes[0]
-            gene_peak = (
-                all_stats.groupby("gene")["mean_expr"]
-                .max()
-                .sort_values(ascending=False)
-            )
-            if not gene_peak.empty:
-                top_gene = gene_peak.index[0]
+            plot_payloads = []
+            for gene in plot_genes:
+                if plot_group_cols == list(group_cols):
+                    plot_stats = gene_stats.get(gene, pd.DataFrame())
+                else:
+                    plot_stats = summarize_group_expression(
+                        gene,
+                        effective_cell_indices,
+                        plot_group_cols,
+                        min_cells=MIN_CELLS_PER_GROUP,
+                    )
+                if plot_stats.empty:
+                    continue
+                gene_plot_json = build_matrix_expression_plot(
+                    plot_stats,
+                    gene_order=[gene],
+                    comparison_cols=plot_group_cols,
+                )
+                if gene_plot_json:
+                    plot_payloads.append(json.loads(gene_plot_json))
 
-            plot_stats = summarize_group_expression(
-                top_gene,
-                effective_cell_indices,
-                plot_group_cols,
-                min_cells=MIN_CELLS_PER_GROUP,
-            )
-            plot_gene_order = [top_gene]
-            if len(present_genes) > 1:
-                top_gene_note = (
-                    f"The region x cell type plot below shows {top_gene}, "
-                    "the gene with the highest measured expression among "
-                    "the genes analyzed. Every gene is broken out separately "
-                    "in the table above."
+            if plot_payloads:
+                plot_json = (
+                    plot_payloads[0]
+                    if len(plot_payloads) == 1
+                    else plot_payloads
+                )
+                notes.append(
+                    "Separate region × cell type plots are provided for the "
+                    f"top {len(plot_genes)} genes by overall mean expression "
+                    "across all matched cells (including zeros): "
+                    + ", ".join(plot_genes)
+                    + ". Every analyzed gene remains in the text summary; "
+                    "plot data are not included in the LLM text budget."
                 )
         else:
-            plot_stats = all_stats
-
-        if not plot_stats.empty:
+            plot_stats = all_stats[all_stats["gene"].isin(plot_genes)].copy()
             plot_json = build_matrix_expression_plot(
                 plot_stats,
-                gene_order=plot_gene_order,
+                gene_order=plot_genes,
                 comparison_cols=plot_group_cols,
             )
-            if plot_json and top_gene_note:
-                notes.append(top_gene_note)
+            if plot_json:
+                notes.append(
+                    f"The plot is limited to the top {len(plot_genes)} genes "
+                    "by overall mean expression across all matched cells "
+                    "(including zeros): "
+                    + ", ".join(plot_genes)
+                    + ". Every analyzed gene remains in the text summary."
+                )
 
-    # Whichever gene ends up in the plot must never be the one whose text
-    # table gets silently cut off by the evidence-length cap applied further
-    # downstream (cap_source_text on the full result["text"]) -- that cap
-    # trims from the end, so put the plotted gene's section first regardless
-    # of where it fell in the original gene order. Without this, a gene can
-    # end up fully plotted from freshly computed data while the synthesis
-    # model, working from the truncated text, has no idea that gene's table
-    # exists at all and reports it as missing -- exactly the contradiction
-    # this ordering prevents.
-    if top_gene and top_gene in gene_sections:
-        ordered_genes = [top_gene] + [g for g in present_genes if g != top_gene]
-    else:
-        ordered_genes = present_genes
-    all_sections = [gene_sections[g] for g in ordered_genes if g in gene_sections]
+    # Cap each gene independently so no early gene can consume the entire
+    # synthesis allowance and erase later genes. The deterministic global
+    # maximum and cross-region cell-type ranking are placed first in each
+    # section, so optional detail rows are what get trimmed first.
+    per_gene_text_limit = max(600, 12000 // gene_count)
+    all_sections = [
+        cap_text_at_line_boundary(
+            gene_sections[g],
+            per_gene_text_limit,
+            suffix="[Additional per-gene detail omitted from synthesis text]",
+        )
+        for g in present_genes
+        if g in gene_sections
+    ]
 
     return {
         "text": "\n\n".join(notes + [""] + all_sections),
@@ -1311,6 +1306,17 @@ def summarize_group_expression(
         rows.append(row)
 
     return pd.DataFrame(rows)
+
+
+def select_top_expression_genes(gene_order, gene_scores, max_genes=3):
+    """Select plot genes by stable, whole-subset expression measurements."""
+    eligible = [gene for gene in gene_order if gene in gene_scores]
+    ranked = sorted(
+        eligible,
+        key=lambda gene: gene_scores[gene],
+        reverse=True,
+    )
+    return ranked[:max(0, int(max_genes))]
 
 
 def select_balanced_expression_rows(
@@ -1436,7 +1442,9 @@ def format_matrix_expression_summary(
     stats_df,
     gene,
     group_cols=None,
+    cell_type_stats=None,
     max_rows=40,
+    max_cell_type_rows=8,
     max_coverage_values=30,
 ):
     if stats_df.empty:
@@ -1450,6 +1458,12 @@ def format_matrix_expression_summary(
         for col in (group_cols or ["brain_region", "cell_type"])
         if col in stats_df.columns
     ]
+
+    ranked = stats_df.sort_values(
+        ["mean_expr", "pct_expr", "n_cells"],
+        ascending=[False, False, False],
+    )
+    peak = ranked.iloc[0]
 
     work = select_balanced_expression_rows(
         stats_df,
@@ -1485,14 +1499,69 @@ def format_matrix_expression_summary(
         + " |"
     )
 
+    peak_dimensions = []
+    for col in group_cols:
+        peak_dimensions.append(
+            f"{display_names.get(col, col)}="
+            f"{str(peak.get(col, 'All matched values')).replace('|', '/')}"
+        )
+
     lines = [
+        f"VasQ deterministic summary for {gene}:",
+        "",
         (
-            f"Measured comparison groups for {gene}, ranked by average "
-            "log-normalized expression (groups with fewer than "
+            f"Global maximum among all {len(stats_df)} eligible requested "
+            "comparison groups: "
+            + "; ".join(peak_dimensions)
+            + f"; Mean expression={peak['mean_expr']:.3f}; "
+            f"Expressing cells={100.0 * peak['pct_expr']:.1f}%; "
+            f"Cells analyzed (n)={int(peak['n_cells'])}."
+        ),
+    ]
+
+    if cell_type_stats is not None and not cell_type_stats.empty:
+        ranked_cell_types = cell_type_stats.sort_values(
+            ["mean_expr", "pct_expr", "n_cells"],
+            ascending=[False, False, False],
+        )
+        shown_cell_types = ranked_cell_types.head(max_cell_type_rows)
+        lines.extend([
+            "",
+            (
+                "Overall cell-type ranking across all matched regions "
+                "(computed directly from all matched cells, so region-level "
+                "means are not averaged equally):"
+            ),
+            "",
+            (
+                "| Rank | Cell type | Mean expression (log-normalized) | "
+                "Expressing cells | Cells analyzed (n) |"
+            ),
+            "| ---: | --- | ---: | ---: | ---: |",
+        ])
+        for rank, (_, row) in enumerate(shown_cell_types.iterrows(), start=1):
+            cell_type = str(row.get("cell_type", "Unknown")).replace("|", "/")
+            lines.append(
+                f"| {rank} | {cell_type} | {row['mean_expr']:.3f} | "
+                f"{100.0 * row['pct_expr']:.1f}% | "
+                f"{int(row['n_cells'])} |"
+            )
+        if len(ranked_cell_types) > len(shown_cell_types):
+            lines.append(
+                f"Top {len(shown_cell_types)} of "
+                f"{len(ranked_cell_types)} eligible cell types shown."
+            )
+
+    lines.extend([
+        "",
+        (
+            "Representative detailed comparison groups, selected from the "
+            "complete ranked result while balancing the requested dimensions "
+            "(groups with fewer than "
             f"{MIN_CELLS_PER_GROUP} cells are not displayed):"
         ),
         "",
-    ]
+    ])
     lines.extend(format_comparison_coverage(stats_df, group_cols, max_values=max_coverage_values))
     lines.extend([
         "",
@@ -3023,6 +3092,27 @@ def cap_source_text(text, limit):
     return text[:limit].rstrip() + "\n[Source text truncated]"
 
 
+def cap_text_at_line_boundary(text, limit, suffix="[Text truncated]"):
+    """Cap text without cutting a Markdown row or consuming another gene."""
+    text = str(text or "").strip()
+    limit = max(0, int(limit))
+    if len(text) <= limit:
+        return text
+
+    suffix = str(suffix or "").strip()
+    if len(suffix) >= limit:
+        return suffix[:limit]
+
+    content_budget = limit - len(suffix) - 1
+    clipped = text[:content_budget]
+    if "\n" in clipped:
+        clipped = clipped.rsplit("\n", 1)[0]
+    clipped = clipped.rstrip()
+    if not clipped:
+        return suffix
+    return clipped + "\n" + suffix
+
+
 _URL_PATTERN = re.compile(r'https?://[^\s\])"\'<>]+')
 _MARKDOWN_LINK_PATTERN = re.compile(r'\[([^\]]+)\]\((https?://[^\s)]+)\)')
 
@@ -3499,10 +3589,19 @@ def _chat_impl(user_input, history, should_stop=None):
             "evidence reports a cell type a gene is known to be associated "
             "with (a marker gene, atlas data, or cell-type-specific "
             "function) and the VasQ matrix also reports that gene's "
-            "measured expression by cell type, explicitly state whether the "
-            "VasQ-measured highest-expressing cell type agrees or disagrees "
-            "with the literature-reported cell type, and note the "
-            "discrepancy plainly rather than silently picking one source. "
+            "measured expression by cell type, use the supplied 'Overall "
+            "cell-type ranking across all matched regions' to decide whether "
+            "the VasQ result agrees or disagrees with the literature-reported "
+            "cell type. That ranking is computed directly from all matched "
+            "cells and is the authoritative cell-type comparison. Report the "
+            "supplied 'Global maximum among all eligible requested comparison "
+            "groups' separately as the most specific requested-group peak "
+            "(region-specific when Brain region is one of the dimensions). "
+            "When that peak is a single region x cell-type group, do not use "
+            "it to decide overall cell-type agreement. Note a discrepancy "
+            "plainly rather than silently "
+            "picking one source. Do not infer that a cell type is absent just "
+            "because it is outside a capped table. "
             "In the drug section, clearly "
             "separate direct gene/protein modulators, pathway-related "
             "compounds, and disease-directed treatments, and distinguish "
