@@ -162,9 +162,15 @@ def call_helper_api(
         ],
     }
 
-    # GPT-5.6 only accepts its default sampling settings. Older models such as
-    # GPT-4o can still use temperature=0 for deterministic helper tasks.
-    if not model.startswith("gpt-5.6"):
+    # Helper calls are short classification/extraction tasks. GPT-5.6 defaults
+    # to medium reasoning when this setting is omitted, which adds unnecessary
+    # latency and can exhaust the small helper-stage timeout. Preserve the
+    # fast, deterministic behavior expected by these callers.
+    if model.startswith("gpt-5.6"):
+        request_args["reasoning_effort"] = os.getenv(
+            "OPENAI_HELPER_REASONING_EFFORT", "none"
+        )
+    else:
         request_args["temperature"] = 0
 
     requested_seconds = (
@@ -335,38 +341,49 @@ def run_openai_web_search(
     try:
         timeout_seconds = _stage_timeout(
             stage_name,
-            _env_float("OPENAI_WEB_TIMEOUT_SECONDS", 75),
+            _env_float("OPENAI_WEB_TIMEOUT_SECONDS", 150),
             reserve_seconds=_env_float("VASQ_SYNTHESIS_RESERVE_SECONDS", 50),
         )
         logger.info(
-            "Calling OpenAI Web Search stage=%s context=%s timeout=%.1fs",
+            "Calling OpenAI Web Search stage=%s model=%s context=%s timeout=%.1fs",
             stage_name,
+            os.getenv("OPENAI_WEB_MODEL", "gpt-5.6-terra"),
             search_context_size,
             timeout_seconds,
         )
 
-        response = client.with_options(
-            timeout=timeout_seconds,
-            # A Web Search retry can repeat a large and expensive tool call.
-            # Default to no retry; it can be enabled explicitly if desired.
-            max_retries=_env_int("OPENAI_WEB_MAX_RETRIES", 0),
-        ).responses.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-5.6-terra"),
-            tools=[
+        # Keep the quality-first synthesis model independent from the
+        # latency-sensitive search worker. In particular, do not silently use
+        # OPENAI_MODEL=gpt-5.6-sol for every hosted Web Search call.
+        web_model = os.getenv("OPENAI_WEB_MODEL", "gpt-5.6-terra")
+        request_args = {
+            "model": web_model,
+            "tools": [
                 {
                     "type": "web_search",
                     "search_context_size": search_context_size,
                     "external_web_access": True,
                 }
             ],
+            "tool_choice": "required",
+            "include": ["web_search_call.action.sources"],
+            "input": search_prompt,
+        }
 
-            # å› ä¸ºåªæœ‰ web_search ä¸€ä¸ªå·¥å…·ï¼Œæ‰€ä»¥ required ä¿è¯ä¸€å®šæœç´¢
-            tool_choice="required",
+        # Responses uses the nested `reasoning` request shape. Low effort is
+        # enough for search/tool selection while avoiding GPT-5.6's default
+        # medium-effort latency. This remains configurable for harder searches.
+        if web_model.startswith("gpt-5.6"):
+            request_args["reasoning"] = {
+                "effort": os.getenv("OPENAI_WEB_REASONING_EFFORT", "low")
+            }
 
-            include=["web_search_call.action.sources"],
-
-            input=search_prompt,
-        )
+        response = client.with_options(
+            timeout=timeout_seconds,
+            # A Web Search retry can repeat a large and expensive tool call.
+            # Default to no retry; it can be enabled explicitly if desired.
+            max_retries=_env_int("OPENAI_WEB_MAX_RETRIES", 0),
+        ).responses.create(**request_args)
 
         result, fallback_urls = _splice_web_search_citations(response)
 
@@ -487,7 +504,7 @@ def search_scientific_web(user_input, kg_context=None, kg_assessment=None):
         + f"Question: {user_input}",
         stage_name="scientific_web_search",
         search_context_size=os.getenv(
-            "OPENAI_SCIENTIFIC_SEARCH_CONTEXT_SIZE", "high"
+            "OPENAI_SCIENTIFIC_SEARCH_CONTEXT_SIZE", "medium"
         ),
     )
 
@@ -573,14 +590,17 @@ def search_drugs_and_small_molecules(user_input, genes=None, diseases=None):
     genes = [str(x).upper().strip() for x in (genes or []) if str(x).strip()]
     diseases = [str(x).strip() for x in (diseases or []) if str(x).strip()]
 
-    if not genes and not diseases:
-        return None
-
     entity_lines = []
     if genes:
         entity_lines.append("Genes/targets: " + ", ".join(genes))
     if diseases:
         entity_lines.append("Diseases/conditions: " + ", ".join(diseases))
+    if not entity_lines:
+        entity_lines.append(
+            "No gene or disease was pre-resolved. Search directly from the "
+            "original question, including relevant drug-delivery platforms, "
+            "therapeutic modalities, transport receptors, and mechanisms."
+        )
 
     return run_openai_web_search(
         "Search the live web for drugs and small molecules related to the "
@@ -4214,7 +4234,7 @@ def _chat_impl(user_input, history, should_stop=None):
     # asked for drugs/therapeutics; a disease or gene alone is not sufficient.
     drug_result = None
     asks_drugs = bool(intent.get("asks_drugs"))
-    if not direct_vasq_only and asks_drugs and (genes or diseases):
+    if not direct_vasq_only and asks_drugs:
         _raise_if_cancelled(should_stop)
         try:
             logger.info(
@@ -4294,7 +4314,7 @@ def _chat_impl(user_input, history, should_stop=None):
                 "SCIENTIFIC WEB STATUS:\nNo usable web evidence was returned."
             )
 
-    if not direct_vasq_only and asks_drugs and (genes or diseases):
+    if not direct_vasq_only and asks_drugs:
         if drug_result:
             evidence_parts.append(
                 "DRUG AND SMALL-MOLECULE EVIDENCE:\n"
