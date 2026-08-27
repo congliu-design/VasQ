@@ -490,6 +490,65 @@ def search_scientific_web(user_input, kg_context=None, kg_assessment=None):
             "OPENAI_SCIENTIFIC_SEARCH_CONTEXT_SIZE", "high"
         ),
     )
+
+
+def search_gene_literature_evidence(user_input, genes, diseases=None):
+    """Retrieve compact, cited evidence for every prioritized expression gene.
+
+    The primary search runs before the final gene list exists, so it is good at
+    discovering candidate genes but cannot reliably guarantee equal literature
+    coverage for every gene ultimately selected. This second, bounded search
+    uses the finalized list and asks for one compact evidence record per gene.
+    """
+    genes = list(dict.fromkeys(
+        str(gene).upper().strip()
+        for gene in (genes or [])
+        if str(gene).strip()
+    ))
+    diseases = list(dict.fromkeys(
+        str(disease).strip()
+        for disease in (diseases or [])
+        if str(disease).strip()
+    ))
+
+    if not genes:
+        return None
+
+    disease_context = (
+        ", ".join(diseases)
+        if diseases
+        else "the disease or biological context in the original question"
+    )
+
+    return run_openai_web_search(
+        (
+            "Search the live scientific web for gene-by-gene evidence for "
+            "the exact prioritized human genes below. Cover every listed "
+            "gene in the supplied order and do not add unrelated genes. For "
+            "each gene, use a heading exactly formatted as 'GENE: SYMBOL', "
+            "followed by two concise evidence bullets: (1) its relationship "
+            f"to {disease_context}, clearly labeled as causal, genetic-risk, "
+            "associated, mechanistic, or uncertain; and (2) any reliable "
+            "brain or cell-type association relevant to interpreting a "
+            "single-nucleus expression matrix. Put at least one inline "
+            "source citation immediately after the supported statement for "
+            "each gene, preferably a gene-specific peer-reviewed paper, "
+            "PubMed/PMC record, major genetics consortium, or authoritative "
+            "atlas/database entry. Use no more than two sources per gene. "
+            "If reliable gene-specific evidence or cell-type evidence cannot "
+            "be found, state that limitation under that gene instead of "
+            "omitting the gene or borrowing a citation from another gene. "
+            "Keep the result compact enough that all genes retain coverage. "
+            + _STRICT_SOURCE_INSTRUCTION
+            + "\n\nExact genes: "
+            + ", ".join(genes)
+            + f"\n\nOriginal question: {user_input}"
+        ),
+        stage_name="gene_literature_web_search",
+        search_context_size=os.getenv(
+            "OPENAI_GENE_LITERATURE_CONTEXT_SIZE", "high"
+        ),
+    )
     
 def search_gene_fallback(user_input):
     """Focused fallback when the main scientific search returns no genes."""
@@ -3137,6 +3196,100 @@ def extract_known_urls(*texts):
     return known
 
 
+def extract_gene_literature_links(evidence_text, genes, max_links_per_gene=2):
+    """Map citations to exact gene sections emitted by the focused search."""
+    text = str(evidence_text or "")
+    if not text.strip():
+        return {}
+
+    # Fallback sources were consulted by the tool but are deliberately not
+    # tied to a claim. Exclude that appendix so its URLs cannot accidentally
+    # be assigned to the final gene section.
+    text = text.split(
+        "\n\nOther sources the search tool consulted",
+        1,
+    )[0]
+    requested = {
+        str(gene).upper().strip()
+        for gene in (genes or [])
+        if str(gene).strip()
+    }
+    heading_pattern = re.compile(
+        r"(?im)^[ \t]*(?:#{1,6}[ \t]+)?(?:[-*][ \t]+)?"
+        r"(?:\*\*)?GENE:[ \t]*([A-Z][A-Z0-9.-]{1,19})"
+        r"(?:\*\*)?[^\n]*$"
+    )
+    headings = list(heading_pattern.finditer(text))
+    links_by_gene = {}
+
+    for index, match in enumerate(headings):
+        gene = match.group(1).upper()
+        if gene not in requested:
+            continue
+        section_end = (
+            headings[index + 1].start()
+            if index + 1 < len(headings)
+            else len(text)
+        )
+        section = text[match.end():section_end]
+        urls = []
+        for raw_url in _URL_PATTERN.findall(section):
+            url = _normalize_url(raw_url)
+            if url and url not in urls:
+                urls.append(url)
+            if len(urls) >= max_links_per_gene:
+                break
+        if urls:
+            links_by_gene[gene] = urls
+
+    return links_by_gene
+
+
+def append_missing_gene_literature_links(
+    final_message,
+    gene_literature_result,
+    genes,
+):
+    """Keep gene-specific links visible even if synthesis drops citations."""
+    links_by_gene = extract_gene_literature_links(
+        gene_literature_result,
+        genes,
+    )
+    if not links_by_gene:
+        return final_message
+
+    final_urls = extract_known_urls(final_message)
+    missing_lines = []
+    for gene in genes or []:
+        gene = str(gene).upper().strip()
+        urls = links_by_gene.get(gene, [])
+        if not urls:
+            continue
+        if any(
+            url in final_urls
+            or any(
+                url.startswith(existing) or existing.startswith(url)
+                for existing in final_urls
+            )
+            for url in urls
+        ):
+            continue
+        citations = " ".join(
+            f"[{_source_label(url)}]({url})"
+            for url in urls
+        )
+        missing_lines.append(f"- **{gene}:** {citations}")
+
+    if not missing_lines:
+        return final_message
+
+    return (
+        str(final_message or "").rstrip()
+        + "\n\n### Gene-specific literature links\n\n"
+        + "\n".join(missing_lines)
+    )
+
+
 def sanitize_uncited_urls(final_message, known_urls):
     """Strip any hyperlink in the final answer whose URL never appeared
     anywhere in this turn's own gathered evidence -- keep the visible
@@ -3392,7 +3545,7 @@ def _chat_impl(user_input, history, should_stop=None):
             fallback_web_result = None
 
         _raise_if_cancelled(should_stop)
-    
+
         if fallback_web_result:
             fallback_genes = derive_genes_from_first_search(
                 resolved_question,
@@ -3432,6 +3585,38 @@ def _chat_impl(user_input, history, should_stop=None):
             logger.warning(
                 "Focused gene fallback search returned no evidence"
             )
+
+    # The discovery search above runs before the final prioritized gene list
+    # exists. For disease-expression questions, retrieve a second, compact
+    # evidence set that explicitly covers every selected gene with its own
+    # literature statement and citation. This prevents the final answer from
+    # collapsing ten genes into one generic disease-association paragraph.
+    gene_literature_result = None
+    needs_gene_literature = (
+        not direct_vasq_only
+        and bool(genes)
+        and bool(
+            diseases
+            or wants_web_search(user_input)
+            or not user_supplied_genes
+        )
+    )
+    if needs_gene_literature:
+        _raise_if_cancelled(should_stop)
+        try:
+            logger.info(
+                "Web Search: gene-by-gene literature coverage for genes=%s",
+                genes,
+            )
+            gene_literature_result = search_gene_literature_evidence(
+                resolved_question,
+                genes,
+                diseases=diseases,
+            )
+        except Exception:
+            logger.exception("Gene-by-gene literature search failed")
+            gene_literature_result = None
+        _raise_if_cancelled(should_stop)
 
     # Branch B: calculate expression for the explicit or first-search-derived
     # gene list. Marker/rank questions (previously served by a separate
@@ -3534,12 +3719,23 @@ def _chat_impl(user_input, history, should_stop=None):
                 "No sufficiently relevant knowledge-graph content was available."
             )
 
-        if scientific_web_result:
+        if gene_literature_result:
             evidence_parts.append(
-                "SCIENTIFIC WEB/LITERATURE EVIDENCE:\n"
-                + cap_source_text(scientific_web_result, 7000)
+                "GENE-BY-GENE SCIENTIFIC LITERATURE EVIDENCE:\n"
+                + cap_source_text(gene_literature_result, 18000)
             )
         else:
+            evidence_parts.append(
+                "GENE-BY-GENE LITERATURE STATUS:\n"
+                "No usable gene-specific literature evidence was returned."
+            )
+
+        if scientific_web_result:
+            evidence_parts.append(
+                "PRIMARY SCIENTIFIC WEB EVIDENCE USED TO IDENTIFY GENES:\n"
+                + cap_source_text(scientific_web_result, 5000)
+            )
+        elif not gene_literature_result:
             evidence_parts.append(
                 "SCIENTIFIC WEB STATUS:\nNo usable web evidence was returned."
             )
@@ -3612,7 +3808,24 @@ def _chat_impl(user_input, history, should_stop=None):
             "(1) associated genes and supporting knowledge and (2) VasQ "
             "matrix expression by the requested brain region, region layer, "
             "cell class, and/or cell type dimensions with the supplied measured "
-            "values. Preserve every comparison dimension present in the VasQ "
+            "values. In section (1), treat 'GENE LIST DERIVED FROM THE FIRST "
+            "SEARCH' as the closed list to explain unless the user explicitly "
+            "asks for additional genes. Cover every gene in that list in its "
+            "own bullet or short paragraph, normally with one or two substantive "
+            "sentences describing the type of disease evidence and relevant "
+            "function or cell-type context. Preserve at least one exact inline "
+            "literature link for each gene whenever its gene-by-gene evidence "
+            "supplies one. Do not replace these gene-specific explanations "
+            "with one generic knowledge-graph paragraph, and do not append a "
+            "larger list of incidental knowledge-graph genes. If gene-specific "
+            "evidence is unavailable for one gene, state that only for that "
+            "gene. In section (2), do not jump directly from a generic matrix "
+            "description to tables and plots. Before any detailed table, give "
+            "every analyzed gene one concise interpretation bullet stating "
+            "its top overall VasQ cell type, its most specific requested-group "
+            "peak, and whether the cell-type result agrees with the cited "
+            "literature when that comparison is supported. Preserve every "
+            "comparison dimension present in the VasQ "
             "table and never merge distinct region layers, cell types, or brain "
             "regions. Treat the supplied 'Applied matrix filters' line as the "
             "authoritative record of which filters were actually used. Treat "
@@ -3682,12 +3895,32 @@ def _chat_impl(user_input, history, should_stop=None):
         final_message = build_partial_response(
             genes,
             vasq_text,
-            scientific_web_result,
+            "\n\n".join(
+                part
+                for part in [gene_literature_result, scientific_web_result]
+                if part
+            ),
             drug_result=drug_result,
         )
     _raise_if_cancelled(should_stop)
 
-    known_urls = extract_known_urls(scientific_web_result, kg_result, drug_result)
+    # The synthesis prompt asks the model to preserve inline citations, but a
+    # rewriting step can still occasionally omit one. Because the focused
+    # search uses deterministic GENE: SYMBOL sections, safely append only the
+    # gene-to-URL pairs actually returned by that search when their URLs are
+    # absent from the synthesized answer.
+    final_message = append_missing_gene_literature_links(
+        final_message,
+        gene_literature_result,
+        genes,
+    )
+
+    known_urls = extract_known_urls(
+        gene_literature_result,
+        scientific_web_result,
+        kg_result,
+        drug_result,
+    )
     final_message = sanitize_uncited_urls(final_message, known_urls)
 
     logger.info("Final message generated: %r", final_message)
