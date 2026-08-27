@@ -2662,6 +2662,52 @@ def pretty_region_name(region):
 
 # Invoke KG_RAG
 
+
+def _log_kg_rag_text(label, text):
+    """Log complete KG-RAG text in bounded chunks for Railway readability.
+
+    `%r` preserves newlines and whitespace in each chunk, while chunking keeps
+    Railway or log collectors from silently truncating one very long line.
+    Set KG_RAG_LOG_RESULT=false to disable content logging, or adjust
+    KG_RAG_LOG_CHUNK_CHARS when a different collector limit is preferred.
+    """
+    text = str(text or "")
+    if not _env_bool("KG_RAG_LOG_RESULT", True):
+        logger.info(
+            "KG-RAG %s content logging disabled result_length=%s",
+            label,
+            len(text),
+        )
+        return
+
+    chunk_chars = int(_env_float(
+        "KG_RAG_LOG_CHUNK_CHARS",
+        2000,
+        minimum=200,
+    ))
+    # Avoid accidentally creating an oversized log line even if the Railway
+    # environment variable is set too high.
+    chunk_chars = min(chunk_chars, 8000)
+    total_chunks = max(1, (len(text) + chunk_chars - 1) // chunk_chars)
+
+    if not text:
+        logger.info("KG-RAG %s chunk=1/1 text=<empty>", label)
+        return
+
+    for index in range(total_chunks):
+        start = index * chunk_chars
+        chunk = text[start:start + chunk_chars]
+        logger.info(
+            "KG-RAG %s chunk=%s/%s chars=%s-%s text=%r",
+            label,
+            index + 1,
+            total_chunks,
+            start,
+            start + len(chunk),
+            chunk,
+        )
+
+
 def query_kg_rag(user_input):
     url = os.getenv(
         "KG_RAG_URL",
@@ -2675,7 +2721,11 @@ def query_kg_rag(user_input):
             reserve_seconds=_env_float("VASQ_RETRIEVAL_RESERVE_SECONDS", 110),
         )
     
-        logger.info("Calling KG-RAG timeout=%.1fs", timeout_seconds)
+        logger.info(
+            "Calling KG-RAG timeout=%.1fs query=%r",
+            timeout_seconds,
+            str(user_input or ""),
+        )
 
         kg_started_at = time.monotonic()
         
@@ -2693,8 +2743,33 @@ def query_kg_rag(user_input):
             len(response.content),
         )
 
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError:
+            logger.exception(
+                "KG-RAG returned invalid JSON content_type=%r",
+                response.headers.get("content-type"),
+            )
+            _log_kg_rag_text("raw-response", response.text)
+            return None
+
+        if not isinstance(payload, dict):
+            logger.warning(
+                "KG-RAG JSON payload is not an object payload_type=%s",
+                type(payload).__name__,
+            )
+            _log_kg_rag_text(
+                "raw-json-payload",
+                json.dumps(payload, ensure_ascii=False, default=str),
+            )
+            return None
+
+        logger.info(
+            "KG-RAG JSON parsed payload_keys=%s",
+            sorted(str(key) for key in payload.keys()),
+        )
         result = str(payload.get("result", "")).strip()
+        _log_kg_rag_text("result", result)
 
         failure_markers = [
             "no vectorstore hit",
@@ -2703,16 +2778,27 @@ def query_kg_rag(user_input):
             "i don't have specific information",
         ]
 
-        if not result or any(
-            marker in result.lower()
+        matched_failure_markers = [
+            marker
             for marker in failure_markers
-        ):
+            if marker in result.lower()
+        ]
+
+        if not result or matched_failure_markers:
             logger.warning(
-                "KG-RAG returned no useful information: %s",
-                result[:500]
+                "KG-RAG result rejected empty=%s matched_failure_markers=%s "
+                "result_length=%s preview=%r",
+                not bool(result),
+                matched_failure_markers,
+                len(result),
+                result[:500],
             )
             return None
 
+        logger.info(
+            "KG-RAG result passed initial checks result_length=%s",
+            len(result),
+        )
         return result
 
     except requests.exceptions.Timeout:
@@ -4212,6 +4298,14 @@ def _chat_impl(user_input, history, should_stop=None):
 
         _raise_if_cancelled(should_stop)
         kg_assessment = assess_kg_relevance(resolved_question, kg_result)
+        logger.info(
+            "KG-RAG relevance assessment relevant=%s "
+            "has_function_or_pathway=%s reason=%r result_length=%s",
+            kg_assessment.get("relevant"),
+            kg_assessment.get("has_function_or_pathway"),
+            kg_assessment.get("reason"),
+            len(str(kg_result or "")),
+        )
 
         _raise_if_cancelled(should_stop)
 
