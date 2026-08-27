@@ -1,4 +1,3 @@
-import concurrent.futures
 import contextvars
 import json
 import threading
@@ -6,7 +5,6 @@ import openai
 import os
 import pandas as pd
 import re
-import requests
 import time
 import ast
 import logging
@@ -412,7 +410,7 @@ def run_openai_web_search(
         )
         logger.info(
             "Calling OpenAI Web Search stage=%s model=%s context=%s "
-            "timeout=%.1fs background=%s",
+            "timeout=%.1fs background=%s spoke_policy=consider_when_relevant",
             stage_name,
             web_model,
             search_context_size,
@@ -543,6 +541,16 @@ def run_openai_web_search(
             logger.warning("OpenAI Web Search returned no text")
             return None
 
+        claim_bound_result = result.split(
+            "\n\nOther sources the search tool consulted",
+            1,
+        )[0]
+        spoke_evidence_used = bool(re.search(
+            r"https?://(?:[^/]+\.)?(?:spoke\.rbvi\.ucsf\.edu|spoke\.ucsf\.edu)(?:/|\b)",
+            claim_bound_result,
+            flags=re.IGNORECASE,
+        ))
+
         if fallback_urls:
             result += (
                 "\n\nOther sources the search tool consulted, not tied to a "
@@ -553,9 +561,11 @@ def run_openai_web_search(
             )
 
         logger.info(
-            "OpenAI Web Search succeeded stage=%s result_length=%s request_id=%s",
+            "OpenAI Web Search succeeded stage=%s result_length=%s "
+            "spoke_evidence_used=%s request_id=%s",
             stage_name,
             len(result),
+            spoke_evidence_used,
             getattr(response, "_request_id", None),
         )
         return result
@@ -588,7 +598,9 @@ def search_openai_web(user_input):
         "Search the live web before answering the following biomedical "
         "question. Prioritize peer-reviewed literature, PubMed, FDA, "
         "ClinicalTrials.gov, and authoritative medical sources. "
-        "Provide source citations.\n\n"
+        "Provide source citations. "
+        + _SPOKE_SOURCE_INSTRUCTION
+        + "\n\n"
         f"Question: {user_input}",
         stage_name="generic_biomedical_web_search",
     )
@@ -611,24 +623,27 @@ _STRICT_SOURCE_INSTRUCTION = (
 )
 
 
-def search_scientific_web(user_input, kg_context=None, kg_assessment=None):
+_SPOKE_SOURCE_INSTRUCTION = (
+    "For questions involving relationships among genes, proteins, diseases, "
+    "compounds or drugs, pathways, biological processes, tissues, or cell "
+    "types, consider the official SPOKE knowledge graph "
+    "(https://spoke.rbvi.ucsf.edu/) as an optional supplementary discovery "
+    "source. Attempt to use SPOKE only through an official SPOKE page or API "
+    "result that is directly accessible during this search. SPOKE is not a "
+    "required source: if its website or graph API is unavailable, errors, or "
+    "does not expose an inspectable relationship, continue with the original "
+    "source databases and primary literature without delaying or weakening "
+    "the answer. Never claim that SPOKE supports a relationship unless that "
+    "relationship was directly retrieved in this search. Treat SPOKE graph "
+    "relationships as associations rather than proof of causality, and verify "
+    "important claims against the underlying source database or primary "
+    "literature whenever possible. Do not use SPOKE alone to establish current "
+    "regulatory approval, clinical-development status, or clinical benefit. "
+)
+
+
+def search_scientific_web(user_input):
     """First search: establish scientific knowledge and candidate genes."""
-    kg_context = (kg_context or "").strip()
-    kg_assessment = kg_assessment or {}
-
-    if kg_context and kg_assessment.get("relevant"):
-        context_block = (
-            "A biomedical knowledge graph returned the following potentially "
-            "relevant context. Use it only to guide the search; independently "
-            "verify every scientific claim:\n"
-            f"{kg_context[:4000]}\n\n"
-        )
-    else:
-        context_block = (
-            "The biomedical knowledge graph did not return sufficiently "
-            "relevant context. Search from the original question directly.\n\n"
-        )
-
     pathway_instruction = (
         "Pay particular attention to molecular function, biological pathways, "
         "mechanism, disease relevance, and human genes supported by the "
@@ -650,9 +665,9 @@ def search_scientific_web(user_input, kg_context=None, kg_assessment=None):
         "Search the live web to answer this biomedical question. "
         + pathway_instruction
         + _STRICT_SOURCE_INSTRUCTION
+        + _SPOKE_SOURCE_INSTRUCTION
         + "Provide source citations and distinguish established evidence from "
-        "hypotheses.\n\n"
-        + context_block
+        "hypotheses. Search from the original question directly.\n\n"
         + f"Question: {user_input}",
         stage_name="scientific_web_search",
         search_context_size=os.getenv(
@@ -709,6 +724,7 @@ def search_gene_literature_evidence(user_input, genes, diseases=None):
             "omitting the gene or borrowing a citation from another gene. "
             "Keep the result compact enough that all genes retain coverage. "
             + _STRICT_SOURCE_INSTRUCTION
+            + _SPOKE_SOURCE_INSTRUCTION
             + "\n\nExact genes: "
             + ", ".join(genes)
             + f"\n\nOriginal question: {user_input}"
@@ -731,6 +747,7 @@ def search_gene_fallback(user_input):
             "evidence and citations from authoritative genetics resources "
             "or peer-reviewed literature. Do not invent associations.\n\n"
             + _STRICT_SOURCE_INSTRUCTION
+            + _SPOKE_SOURCE_INSTRUCTION
             + f"\nQuestion: {user_input}"
         ),
         stage_name="gene_fallback_web_search",
@@ -767,6 +784,7 @@ def search_drugs_and_small_molecules(user_input, genes=None, diseases=None):
         "FDA/EMA labels, ClinicalTrials.gov, PubMed, peer-reviewed literature, "
         "and authoritative company trial records. "
         + _STRICT_SOURCE_INSTRUCTION
+        + _SPOKE_SOURCE_INSTRUCTION
         + "Use current information, "
         "provide source citations, and explicitly state when no reliable "
         "direct small-molecule match is found.\n\n"
@@ -1559,7 +1577,6 @@ def matrix_expression(
     user_input,
     genes_override=None,
     web_evidence_text=None,
-    kg_evidence_text=None,
     original_user_input=None,
 ):
     ensure_matrix_expression_data_loaded()
@@ -2562,7 +2579,6 @@ def extract_genes(user_input):
 def derive_genes_from_first_search(
     user_input,
     scientific_web_result,
-    kg_result=None,
     existing_genes=None,
 ):
     """Build the gene list that drives VasQ and the second drug search.
@@ -2588,11 +2604,6 @@ def derive_genes_from_first_search(
         evidence_parts.append(
             "Web/literature evidence:\n"
             + cap_source_text(scientific_web_result, 9000)
-        )
-    if kg_result:
-        evidence_parts.append(
-            "Knowledge-graph evidence:\n"
-            + cap_source_text(kg_result, 3000)
         )
 
     if not evidence_parts:
@@ -2656,160 +2667,6 @@ def pretty_region_name(region):
         "BA.CoW": "basilar artery / circle of Willis",
     }
     return region_map.get(region, region)
-
-
-### KG-RAG Functions ###
-
-# Invoke KG_RAG
-
-
-def _log_kg_rag_text(label, text):
-    """Log complete KG-RAG text in bounded chunks for Railway readability.
-
-    `%r` preserves newlines and whitespace in each chunk, while chunking keeps
-    Railway or log collectors from silently truncating one very long line.
-    Set KG_RAG_LOG_RESULT=false to disable content logging, or adjust
-    KG_RAG_LOG_CHUNK_CHARS when a different collector limit is preferred.
-    """
-    text = str(text or "")
-    if not _env_bool("KG_RAG_LOG_RESULT", True):
-        logger.info(
-            "KG-RAG %s content logging disabled result_length=%s",
-            label,
-            len(text),
-        )
-        return
-
-    chunk_chars = int(_env_float(
-        "KG_RAG_LOG_CHUNK_CHARS",
-        2000,
-        minimum=200,
-    ))
-    # Avoid accidentally creating an oversized log line even if the Railway
-    # environment variable is set too high.
-    chunk_chars = min(chunk_chars, 8000)
-    total_chunks = max(1, (len(text) + chunk_chars - 1) // chunk_chars)
-
-    if not text:
-        logger.info("KG-RAG %s chunk=1/1 text=<empty>", label)
-        return
-
-    for index in range(total_chunks):
-        start = index * chunk_chars
-        chunk = text[start:start + chunk_chars]
-        logger.info(
-            "KG-RAG %s chunk=%s/%s chars=%s-%s text=%r",
-            label,
-            index + 1,
-            total_chunks,
-            start,
-            start + len(chunk),
-            chunk,
-        )
-
-
-def query_kg_rag(user_input):
-    url = os.getenv(
-        "KG_RAG_URL",
-        "http://kg-rag.railway.internal:8080/query"
-    )
-
-    try:
-        timeout_seconds = _stage_timeout(
-            "kg_rag",
-            _env_float("KG_RAG_TIMEOUT_SECONDS", 35),
-            reserve_seconds=_env_float("VASQ_RETRIEVAL_RESERVE_SECONDS", 110),
-        )
-    
-        logger.info(
-            "Calling KG-RAG timeout=%.1fs query=%r",
-            timeout_seconds,
-            str(user_input or ""),
-        )
-
-        kg_started_at = time.monotonic()
-        
-        response = requests.post(
-            url,
-            json={"query": user_input},
-            timeout=timeout_seconds,
-        )
-        response.raise_for_status()
-        
-        logger.info(
-            "KG-RAG HTTP succeeded elapsed=%.1fs status=%s response_bytes=%s",
-            time.monotonic() - kg_started_at,
-            response.status_code,
-            len(response.content),
-        )
-
-        try:
-            payload = response.json()
-        except ValueError:
-            logger.exception(
-                "KG-RAG returned invalid JSON content_type=%r",
-                response.headers.get("content-type"),
-            )
-            _log_kg_rag_text("raw-response", response.text)
-            return None
-
-        if not isinstance(payload, dict):
-            logger.warning(
-                "KG-RAG JSON payload is not an object payload_type=%s",
-                type(payload).__name__,
-            )
-            _log_kg_rag_text(
-                "raw-json-payload",
-                json.dumps(payload, ensure_ascii=False, default=str),
-            )
-            return None
-
-        logger.info(
-            "KG-RAG JSON parsed payload_keys=%s",
-            sorted(str(key) for key in payload.keys()),
-        )
-        result = str(payload.get("result", "")).strip()
-        _log_kg_rag_text("result", result)
-
-        failure_markers = [
-            "no vectorstore hit",
-            "no entity-level hits found",
-            "no specific information",
-            "i don't have specific information",
-        ]
-
-        matched_failure_markers = [
-            marker
-            for marker in failure_markers
-            if marker in result.lower()
-        ]
-
-        if not result or matched_failure_markers:
-            logger.warning(
-                "KG-RAG result rejected empty=%s matched_failure_markers=%s "
-                "result_length=%s preview=%r",
-                not bool(result),
-                matched_failure_markers,
-                len(result),
-                result[:500],
-            )
-            return None
-
-        logger.info(
-            "KG-RAG result passed initial checks result_length=%s",
-            len(result),
-        )
-        return result
-
-    except requests.exceptions.Timeout:
-        logger.warning(
-            "KG-RAG timed out; continuing with scientific Web Search"
-        )
-        return None
-    
-    except requests.exceptions.RequestException:
-        logger.exception("KG-RAG request failed")
-        return None
 
 
 def wrap_plot_label(value, max_chars=22, max_lines=3):
@@ -3799,53 +3656,6 @@ def analyze_query_intent(user_input, history=None):
         return fallback_query_intent(user_input)
 
 
-def assess_kg_relevance(user_input, kg_result):
-    """Separate a useful KG hit from a non-empty but irrelevant response."""
-    if not kg_result or not str(kg_result).strip():
-        return {
-            "relevant": False,
-            "has_function_or_pathway": False,
-            "reason": "no KG result",
-        }
-
-    system_prompt = (
-        "Assess whether biomedical knowledge-graph content is relevant to a "
-        "question. Return JSON only with keys: relevant (boolean), "
-        "has_function_or_pathway (boolean), and reason (short string). Content "
-        "is relevant only if it addresses the question's entities or their "
-        "biological relationships. Do not treat generic biomedical text as a "
-        "relevant hit."
-    )
-    prompt = (
-        f"Question:\n{user_input}\n\n"
-        f"Knowledge-graph result:\n{str(kg_result)[:5000]}"
-    )
-
-    try:
-        response = call_helper_api(system_prompt, prompt)
-        parsed = parse_json_object(response.choices[0].message.content)
-        if not parsed:
-            raise ValueError("KG assessment helper returned invalid JSON")
-        return {
-            "relevant": bool(parsed.get("relevant", False)),
-            "has_function_or_pathway": bool(
-                parsed.get("has_function_or_pathway", False)
-            ),
-            "reason": str(parsed.get("reason", "")).strip(),
-        }
-    except Exception:
-        logger.exception("KG relevance assessment failed")
-        lowered = str(kg_result).lower()
-        return {
-            "relevant": True,
-            "has_function_or_pathway": any(
-                term in lowered
-                for term in ["pathway", "function", "participates", "process"]
-            ),
-            "reason": "fallback assessment",
-        }
-
-
 def ensure_chat_initialized(history):
     """Initialize each conversation independently; avoid process-global routing."""
     if not any(message.get("role") == "system" for message in history):
@@ -3924,6 +3734,8 @@ _DEFAULT_CITATION_DOMAINS = {
     "www.uniprot.org",
     "proteinatlas.org",
     "www.proteinatlas.org",
+    "spoke.rbvi.ucsf.edu",
+    "spoke.ucsf.edu",
     "ebi.ac.uk",
     "www.ebi.ac.uk",
 }
@@ -3978,7 +3790,7 @@ def _normalize_url(url):
 
 def extract_known_urls(*texts):
     """Collect every URL that actually appeared somewhere in this turn's
-    own evidence (web search, KG-RAG, drug search), regardless of stage.
+    own Web Search evidence, regardless of stage.
     Used as a whitelist for `sanitize_uncited_urls` -- a hard, code-level
     backstop, since prompting alone cannot guarantee a rewriting model
     never invents or misattributes a URL when composing the final answer.
@@ -4236,7 +4048,7 @@ def _chat_impl(user_input, history, should_stop=None):
     diseases = intent.get("diseases") or []
 
     # An explicit VasQ-matrix-only request should not spend several minutes on
-    # KG-RAG or Web Search. An equally explicit request for web/literature
+    # Web Search. An equally explicit request for web/literature
     # search takes precedence and keeps the normal external-evidence route.
     direct_vasq_only = (
         explicitly_requests_vasq_matrix(user_input)
@@ -4249,63 +4061,26 @@ def _chat_impl(user_input, history, should_stop=None):
         intent["use_vasq"] = True
     logger.info("Direct VasQ-only routing=%s", direct_vasq_only)
 
-    kg_result = None
-    kg_assessment = {
-        "relevant": False,
-        "reason": "KG-RAG was not run for a VasQ-only request.",
-    }
     scientific_web_result = None
 
-    # Branch A: unless this is a direct VasQ-only request, run KG-RAG followed
-    # by a function/pathway-oriented Web Search.
+    # Branch A: unless this is a direct VasQ-only request, run a
+    # function/pathway-oriented Web Search. The search prompt considers SPOKE
+    # when relevant, but SPOKE is optional and must not block primary-source
+    # retrieval when its public graph API is unavailable.
     if direct_vasq_only:
         logger.info(
-            "Direct VasQ matrix request detected; skipping KG-RAG and "
-            "OpenAI Web Search"
+            "Direct VasQ matrix request detected; skipping OpenAI Web Search"
         )
     else:
         _raise_if_cancelled(should_stop)
-        # KG-RAG and the first Web Search are independent lookups. Running
-        # them sequentially means paying for both wait times in full; in
-        # observed logs KG-RAG alone has taken 160-250s. Overlapping them
-        # turns the wall-clock cost into roughly max(KG-RAG, Web Search)
-        # instead of their sum. The trade-off: Web Search can no longer wait
-        # to see whether KG-RAG found anything relevant, so it always
-        # searches from the question directly rather than being primed with
-        # KG context -- KG's own content still reaches gene derivation and
-        # the final synthesis evidence package below, unaffected.
-        kg_result = None
-        scientific_web_result = None
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            kg_future = executor.submit(query_kg_rag, resolved_question)
+        try:
             logger.info("Web Search stage 1/2: scientific knowledge and genes")
-            web_future = executor.submit(
-                search_scientific_web,
-                resolved_question,
-                kg_context=None,
-                kg_assessment=None,
+            scientific_web_result = search_scientific_web(
+                resolved_question
             )
-            try:
-                kg_result = kg_future.result()
-            except Exception:
-                logger.exception("KG-RAG branch failed")
-                kg_result = None
-            try:
-                scientific_web_result = web_future.result()
-            except Exception:
-                logger.exception("Scientific Web Search branch failed")
-                scientific_web_result = None
-
-        _raise_if_cancelled(should_stop)
-        kg_assessment = assess_kg_relevance(resolved_question, kg_result)
-        logger.info(
-            "KG-RAG relevance assessment relevant=%s "
-            "has_function_or_pathway=%s reason=%r result_length=%s",
-            kg_assessment.get("relevant"),
-            kg_assessment.get("has_function_or_pathway"),
-            kg_assessment.get("reason"),
-            len(str(kg_result or "")),
-        )
+        except Exception:
+            logger.exception("Scientific Web Search branch failed")
+            scientific_web_result = None
 
         _raise_if_cancelled(should_stop)
 
@@ -4315,11 +4090,6 @@ def _chat_impl(user_input, history, should_stop=None):
         genes = derive_genes_from_first_search(
             resolved_question,
             scientific_web_result,
-            kg_result=(
-                kg_result
-                if kg_assessment.get("relevant")
-                else None
-            ),
             existing_genes=genes,
         )
 
@@ -4362,7 +4132,6 @@ def _chat_impl(user_input, history, should_stop=None):
             fallback_genes = derive_genes_from_first_search(
                 resolved_question,
                 fallback_web_result,
-                kg_result=None,
                 existing_genes=[],
             )
 
@@ -4450,9 +4219,6 @@ def _chat_impl(user_input, history, should_stop=None):
                     resolved_question,
                     genes_override=genes,
                     web_evidence_text=scientific_web_result,
-                    kg_evidence_text=(
-                        kg_result if kg_assessment.get("relevant") else None
-                    ),
                     original_user_input=user_input,
                 )
                 if isinstance(vasq_result, dict):
@@ -4505,8 +4271,8 @@ def _chat_impl(user_input, history, should_stop=None):
     if direct_vasq_only:
         evidence_parts.append(
             "SOURCE SCOPE:\n"
-            "The user explicitly requested VasQ matrix data only. KG-RAG "
-            "and Web Search were not run."
+            "The user explicitly requested VasQ matrix data only. External "
+            "Web Search was not run."
         )
 
     if genes:
@@ -4528,17 +4294,6 @@ def _chat_impl(user_input, history, should_stop=None):
         evidence_parts.append("VASQ STATUS:\n" + vasq_note)
 
     if not direct_vasq_only:
-        if kg_result and kg_assessment.get("relevant"):
-            evidence_parts.append(
-                "RELEVANT BIOMEDICAL KNOWLEDGE-GRAPH CONTEXT:\n"
-                + cap_source_text(kg_result, 3000)
-            )
-        else:
-            evidence_parts.append(
-                "KNOWLEDGE-GRAPH STATUS:\n"
-                "No sufficiently relevant knowledge-graph content was available."
-            )
-
         if gene_literature_result:
             evidence_parts.append(
                 "GENE-BY-GENE SCIENTIFIC LITERATURE EVIDENCE:\n"
@@ -4580,10 +4335,12 @@ def _chat_impl(user_input, history, should_stop=None):
             "Answer the user's scientific question directly using the evidence "
             "package supplied after the conversation. Integrate only relevant "
             "evidence. When SOURCE SCOPE says VasQ matrix data only, do not "
-            "introduce literature or knowledge-graph claims and do not imply "
+            "introduce external scientific claims and do not imply "
             "that external sources were searched. Treat knowledge-graph "
-            "relationships as associations, "
-            "not proof of causality. Use web/literature evidence for current "
+            "relationships retrieved through Web Search, including SPOKE "
+            "relationships, as associations rather than proof of causality. "
+            "Prefer the cited underlying database or primary literature when "
+            "it is supplied. Use web/literature evidence for current "
             "function, pathway, mechanism, clinical-stage, and regulatory "
             "claims, and preserve its citations. The evidence text may "
             "already contain complete markdown links, e.g. "
@@ -4637,7 +4394,7 @@ def _chat_impl(user_input, history, should_stop=None):
             "literature link for each gene whenever its gene-by-gene evidence "
             "supplies one. Do not replace these gene-specific explanations "
             "with one generic knowledge-graph paragraph, and do not append a "
-            "larger list of incidental knowledge-graph genes. If gene-specific "
+            "larger list of incidental SPOKE or knowledge-graph genes. If gene-specific "
             "evidence is unavailable for one gene, state that only for that "
             "gene. In section (2), do not jump directly from a generic matrix "
             "description to tables and plots. Before any detailed table, give "
@@ -4760,7 +4517,6 @@ def _chat_impl(user_input, history, should_stop=None):
     known_urls = extract_known_urls(
         gene_literature_result,
         scientific_web_result,
-        kg_result,
         drug_result,
     )
     final_message = sanitize_uncited_urls(final_message, known_urls)
