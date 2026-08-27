@@ -282,6 +282,19 @@ def _splice_web_search_citations(response):
                     for annotation in annotations:
                         end = annotation.end_index
                         url = annotation.url
+                        # OpenAI's web_search generation often already
+                        # embeds its own markdown link to the cited URL
+                        # directly in the text, right around where the
+                        # annotation says it applies -- unconditionally
+                        # splicing another one in would duplicate it next
+                        # to the model's own. Check a window of the
+                        # *original* text (not `spliced`, which may already
+                        # have later-position markers inserted) around this
+                        # position for an existing link to this exact URL.
+                        window_start = max(0, end - 300)
+                        window_end = min(len(text), end + 50)
+                        if f"]({url})" in text[window_start:window_end]:
+                            continue
                         marker = f" [{_source_label(url)}]({url})"
                         spliced = spliced[:end] + marker + spliced[end:]
                     pieces.append(spliced)
