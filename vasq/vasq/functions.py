@@ -1293,6 +1293,12 @@ def matrix_expression(
                     + ". Every analyzed gene remains in the text summary."
                 )
 
+    expression_table = build_expression_table_payload(
+        all_stats,
+        gene_order=present_genes,
+        group_cols=group_cols,
+    )
+
     # Cap each gene independently so no early gene can consume the entire
     # synthesis allowance and erase later genes. The deterministic global
     # maximum and cross-region cell-type ranking are placed first in each
@@ -1310,7 +1316,8 @@ def matrix_expression(
 
     return {
         "text": "\n\n".join(notes + [""] + all_sections),
-        "graph_json": plot_json
+        "graph_json": plot_json,
+        "expression_table": expression_table,
     }
 
 
@@ -1376,6 +1383,89 @@ def select_top_expression_genes(gene_order, gene_scores, max_genes=3):
         reverse=True,
     )
     return ranked[:max(0, int(max_genes))]
+
+
+def build_expression_table_payload(stats_df, gene_order, group_cols):
+    """Serialize every eligible expression group for UI paging and CSV.
+
+    This payload is returned separately from the compact evidence text, so the
+    complete table never consumes synthesis tokens. The view stores it under
+    the request ID and serves only one filtered page to the browser at a time.
+    """
+    if stats_df is None or stats_df.empty:
+        return None
+
+    display_names = {
+        "gene": "Gene",
+        "brain_region": "Brain region",
+        "region_layer": "Region layer",
+        "cell_class": "Cell class",
+        "cell_type": "Cell type",
+        "mean_expr": "Mean expression (log-normalized)",
+        "pct_expr": "Expressing cells (%)",
+        "n_cells": "Cells analyzed (n)",
+    }
+    dimension_cols = [
+        col
+        for col in (group_cols or [])
+        if col in stats_df.columns
+    ]
+    column_keys = [
+        "gene",
+        *dimension_cols,
+        "mean_expr",
+        "pct_expr",
+        "n_cells",
+    ]
+    gene_rank = {
+        str(gene): rank
+        for rank, gene in enumerate(gene_order or [])
+    }
+    work = stats_df.copy()
+    work["_gene_rank"] = work["gene"].map(gene_rank).fillna(len(gene_rank))
+    work = work.sort_values(
+        ["_gene_rank", "mean_expr", "pct_expr", "n_cells"],
+        ascending=[True, False, False, False],
+    )
+
+    rows = []
+    for _, row in work.iterrows():
+        record = {"gene": str(row.get("gene", ""))}
+        for col in dimension_cols:
+            value = row.get(col, "")
+            record[col] = "" if pd.isna(value) else str(value)
+        record["mean_expr"] = round(float(row["mean_expr"]), 6)
+        record["pct_expr"] = round(100.0 * float(row["pct_expr"]), 2)
+        record["n_cells"] = int(row["n_cells"])
+        rows.append(record)
+
+    filter_keys = [
+        key
+        for key in [
+            "gene",
+            "brain_region",
+            "region_layer",
+            "cell_class",
+            "cell_type",
+        ]
+        if key in column_keys
+    ]
+    filters = {
+        key: sorted({str(row[key]) for row in rows if str(row.get(key, ""))})
+        for key in filter_keys
+    }
+
+    return {
+        "columns": [
+            {"key": key, "label": display_names[key]}
+            for key in column_keys
+        ],
+        "filter_keys": filter_keys,
+        "filters": filters,
+        "rows": rows,
+        "total_rows": len(rows),
+        "minimum_cells_per_group": MIN_CELLS_PER_GROUP,
+    }
 
 
 def select_balanced_expression_rows(
@@ -3136,12 +3226,16 @@ def ensure_chat_initialized(history):
         initialize(history)
 
 
-def retrieved_text_and_graph(result):
+def retrieved_text_graph_and_table(result):
     if isinstance(result, dict):
-        return str(result.get("text", "") or ""), result.get("graph_json")
+        return (
+            str(result.get("text", "") or ""),
+            result.get("graph_json"),
+            result.get("expression_table"),
+        )
     if result is None:
-        return "", None
-    return str(result), None
+        return "", None, None
+    return str(result), None, None
 
 
 def cap_source_text(text, limit):
@@ -3424,7 +3518,7 @@ def _chat_impl(user_input, history, should_stop=None):
         update_history(
             history, "assistant", summarize_turn_for_history(user_input, final_message)
         )
-        return final_message, history, None
+        return final_message, history, None, None
 
     resolved_question = intent.get("resolved_question") or user_input
     user_supplied_genes = list(intent.get("genes") or [])
@@ -3654,7 +3748,9 @@ def _chat_impl(user_input, history, should_stop=None):
             )
 
     _raise_if_cancelled(should_stop)
-    vasq_text, graph_json = retrieved_text_and_graph(vasq_result)
+    vasq_text, graph_json, expression_table = retrieved_text_graph_and_table(
+        vasq_result
+    )
 
     # Branch C: optional second Web Search. Only run it when the user actually
     # asked for drugs/therapeutics; a disease or gene alone is not sufficient.
@@ -3824,7 +3920,12 @@ def _chat_impl(user_input, history, should_stop=None):
             "every analyzed gene one concise interpretation bullet stating "
             "its top overall VasQ cell type, its most specific requested-group "
             "peak, and whether the cell-type result agrees with the cited "
-            "literature when that comparison is supported. Preserve every "
+            "literature when that comparison is supported. If you create the "
+            "compact peak-summary table, label its two concepts unambiguously "
+            "as 'Highest cell type pooled across regions' and 'Cell type in "
+            "highest region x cell-type group'; never shorten them to the "
+            "ambiguous labels 'Overall top cell type' and 'Cell type at peak'. "
+            "Preserve every "
             "comparison dimension present in the VasQ "
             "table and never merge distinct region layers, cell types, or brain "
             "regions. Treat the supplied 'Applied matrix filters' line as the "
@@ -3928,7 +4029,7 @@ def _chat_impl(user_input, history, should_stop=None):
         history, "assistant", summarize_turn_for_history(user_input, final_message)
     )
 
-    return final_message, history, graph_json
+    return final_message, history, graph_json, expression_table
 
 
 def chat(user_input, history, should_stop=None):
@@ -3957,7 +4058,7 @@ def chat(user_input, history, should_stop=None):
             "Please retry; any optional evidence source that is slow will be skipped."
         )
         update_history(safe_history, "assistant", fallback)
-        return fallback, safe_history, None
+        return fallback, safe_history, None, None
     finally:
         elapsed = time.monotonic() - started_at
         logger.info("VasQ turn finished elapsed=%.1fs", elapsed)
