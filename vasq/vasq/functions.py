@@ -1133,6 +1133,26 @@ def matrix_expression(
     else:
         effective_cell_indices = MATRIX_META.index.to_numpy()
 
+    # With many genes queried together, the per-gene text below is later
+    # joined and hard-capped by length downstream (cap_source_text on the
+    # full result["text"], applied in _chat_impl before synthesis). A fixed
+    # 40-row table per gene lets the first few genes consume that entire
+    # budget, silently cutting every later gene's section down to nothing
+    # -- the synthesis model then has no way to know that gene's data
+    # exists at all and reports it as "not supplied", even though it was
+    # measured and is sitting right here. Shrinking the per-gene budget as
+    # the gene count grows keeps every gene represented, even if each one's
+    # detail is smaller.
+    gene_count = max(1, len(present_genes))
+    if gene_count <= 2:
+        rows_per_gene, coverage_values_per_gene = 40, 30
+    elif gene_count <= 5:
+        rows_per_gene, coverage_values_per_gene = 20, 20
+    elif gene_count <= 10:
+        rows_per_gene, coverage_values_per_gene = 10, 10
+    else:
+        rows_per_gene, coverage_values_per_gene = 5, 6
+
     for gene in present_genes:
         # Keep every requested comparison dimension separate. This prevents,
         # for example, Layer 2 and Layer 3 from being pooled into one mean.
@@ -1148,7 +1168,8 @@ def matrix_expression(
             stats,
             gene,
             group_cols=group_cols,
-            max_rows=40,
+            max_rows=rows_per_gene,
+            max_coverage_values=coverage_values_per_gene,
         )
 
         # `stats` already uses the same grouping and cell threshold, so reuse
@@ -1416,6 +1437,7 @@ def format_matrix_expression_summary(
     gene,
     group_cols=None,
     max_rows=40,
+    max_coverage_values=30,
 ):
     if stats_df.empty:
         return (
@@ -1471,7 +1493,7 @@ def format_matrix_expression_summary(
         ),
         "",
     ]
-    lines.extend(format_comparison_coverage(stats_df, group_cols))
+    lines.extend(format_comparison_coverage(stats_df, group_cols, max_values=max_coverage_values))
     lines.extend([
         "",
         header,
