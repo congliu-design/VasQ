@@ -1134,31 +1134,42 @@ document.addEventListener("DOMContentLoaded", function() {
         if (!graphJsonValue) return;
 
         try {
-            const graphJson = typeof graphJsonValue === 'string'
+            const parsedGraphs = typeof graphJsonValue === 'string'
                 ? JSON.parse(graphJsonValue)
                 : graphJsonValue;
-            const graphDiv = document.createElement('div');
-            graphDiv.className = 'vasq-plot-card';
-            graphDiv.setAttribute(
-                'aria-label',
-                'VasQ gene expression across brain regions'
-            );
-            messagesContainer.appendChild(graphDiv);
-            await Plotly.newPlot(
-                graphDiv,
-                graphJson.data,
-                graphJson.layout,
-                {
-                    responsive: true,
-                    displaylogo: false,
-                    scrollZoom: false,
-                    modeBarButtonsToRemove: [
-                        'select2d',
-                        'lasso2d',
-                        'autoScale2d'
-                    ]
-                }
-            );
+            const graphList = Array.isArray(parsedGraphs)
+                ? parsedGraphs
+                : [parsedGraphs];
+
+            for (const graphItem of graphList) {
+                const graphJson = typeof graphItem === 'string'
+                    ? JSON.parse(graphItem)
+                    : graphItem;
+                if (!graphJson || !Array.isArray(graphJson.data)) continue;
+
+                const graphDiv = document.createElement('div');
+                graphDiv.className = 'vasq-plot-card';
+                graphDiv.setAttribute(
+                    'aria-label',
+                    'VasQ gene expression across brain regions'
+                );
+                messagesContainer.appendChild(graphDiv);
+                await Plotly.newPlot(
+                    graphDiv,
+                    graphJson.data,
+                    graphJson.layout,
+                    {
+                        responsive: true,
+                        displaylogo: false,
+                        scrollZoom: false,
+                        modeBarButtonsToRemove: [
+                            'select2d',
+                            'lasso2d',
+                            'autoScale2d'
+                        ]
+                    }
+                );
+            }
             scrollToBottom();
         } catch (error) {
             console.error('Could not render graph:', error);
