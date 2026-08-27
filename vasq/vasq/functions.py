@@ -112,11 +112,19 @@ def call_api(
         "messages": history,
     }
 
+ 
     if functions:
         request_args["functions"] = functions
-        
+    
+        # Chat Completions + function calling must use none
         if model.startswith("gpt-5.6"):
             request_args["reasoning_effort"] = "none"
+    
+    elif model.startswith("gpt-5.6"):
+        request_args["reasoning_effort"] = os.getenv(
+            "OPENAI_MAIN_REASONING_EFFORT",
+            "xhigh",
+        )
             
     timeout_seconds = timeout_seconds or _env_float(
         "OPENAI_CHAT_TIMEOUT_SECONDS", 45
