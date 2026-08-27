@@ -3536,7 +3536,7 @@ def history_entry_from_synthesis(
     user_input,
     final_message,
     generated_summary=None,
-    max_chars=600,
+    max_chars=1200,
 ):
     """Bound a bundled history note without making another model request."""
     max_chars = max(8, int(max_chars))
