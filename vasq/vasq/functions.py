@@ -873,7 +873,12 @@ def dimension_filter_is_disabled(user_input, dimension):
     return False
 
 
-def resolve_matrix_entities(user_input):
+def resolve_matrix_entities(
+    user_input,
+    *,
+    include_interpretations=False,
+    interpretation_input=None,
+):
     ensure_matrix_expression_data_loaded()
 
     local_cell_type_matches = resolve_entities_from_text(
@@ -889,6 +894,30 @@ def resolve_matrix_entities(user_input):
         user_input, MATRIX_REGION_LAYER_ALIAS_MAP
     )
 
+    # `user_input` may be the intent helper's context-resolved rewrite. Keep
+    # the literal current-turn wording separately for disclosure, otherwise a
+    # hidden rewrite from "memory-related region" to "Hippocampus" makes the
+    # mapping look as though the user explicitly requested Hippocampus.
+    disclosure_input = interpretation_input or user_input
+    if disclosure_input == user_input:
+        disclosure_cell_type_matches = local_cell_type_matches
+        disclosure_cell_class_matches = local_cell_class_matches
+        disclosure_region_matches = local_region_matches
+        disclosure_region_layer_matches = local_region_layer_matches
+    else:
+        disclosure_cell_type_matches = resolve_entities_from_text(
+            disclosure_input, MATRIX_CELL_TYPE_ALIAS_MAP
+        )
+        disclosure_cell_class_matches = resolve_entities_from_text(
+            disclosure_input, MATRIX_CELL_CLASS_ALIAS_MAP
+        )
+        disclosure_region_matches = resolve_entities_from_text(
+            disclosure_input, MATRIX_REGION_ALIAS_MAP
+        )
+        disclosure_region_layer_matches = resolve_entities_from_text(
+            disclosure_input, MATRIX_REGION_LAYER_ALIAS_MAP
+        )
+
     # cell_type/cell_class are one axis (a specific type already implies its
     # class); brain_region/region_layer are the other axis (a named region
     # already implies its coarse layer bucket, and vice versa). GPT is only
@@ -898,6 +927,16 @@ def resolve_matrix_entities(user_input):
     # returns one -- local never gets overridden or duplicated.
     cell_axis_resolved = bool(local_cell_type_matches) or bool(local_cell_class_matches)
     region_axis_resolved = bool(local_region_matches) or bool(local_region_layer_matches)
+    disclosure_cell_axis_resolved = (
+        bool(disclosure_cell_type_matches)
+        or bool(disclosure_cell_class_matches)
+    )
+    disclosure_region_axis_resolved = (
+        bool(disclosure_region_matches)
+        or bool(disclosure_region_layer_matches)
+    )
+
+    gpt_filter_interpretations = []
 
     if cell_axis_resolved and region_axis_resolved:
         gpt_cell_type_matches = None
@@ -910,19 +949,33 @@ def resolve_matrix_entities(user_input):
             gpt_cell_class_matches,
             gpt_region_matches,
             gpt_region_layer_matches,
+            gpt_filter_interpretations,
         ) = resolve_dataset_entities_with_gpt(
             user_input,
             MATRIX_AVAILABLE_CELL_TYPES,
             MATRIX_AVAILABLE_REGIONS,
             available_cell_classes=MATRIX_AVAILABLE_CELL_CLASSES,
             available_region_layers=MATRIX_AVAILABLE_REGION_LAYERS,
+            include_interpretations=True,
         )
         if cell_axis_resolved:
             gpt_cell_type_matches = None
             gpt_cell_class_matches = None
+            gpt_filter_interpretations = [
+                item
+                for item in gpt_filter_interpretations
+                if isinstance(item, dict)
+                and item.get("dimension") not in {"cell_type", "cell_class"}
+            ]
         if region_axis_resolved:
             gpt_region_matches = None
             gpt_region_layer_matches = None
+            gpt_filter_interpretations = [
+                item
+                for item in gpt_filter_interpretations
+                if isinstance(item, dict)
+                and item.get("dimension") not in {"brain_region", "region_layer"}
+            ]
 
     # Hybrid resolution: curated deterministic aliases protect common dataset
     # terminology from an LLM omission, while the LLM covers unenumerated
@@ -978,6 +1031,27 @@ def resolve_matrix_entities(user_input):
     region_matches = list(dict.fromkeys(region_matches or []))
     region_layer_matches = list(dict.fromkeys(region_layer_matches or []))
 
+    filter_interpretations = normalize_filter_interpretations(
+        disclosure_input,
+        gpt_filter_interpretations,
+        cell_types=cell_type_matches,
+        cell_classes=cell_class_matches,
+        regions=region_matches,
+        region_layers=region_layer_matches,
+        semantic_dimensions={
+            *(
+                []
+                if disclosure_cell_axis_resolved
+                else ["cell_type", "cell_class"]
+            ),
+            *(
+                []
+                if disclosure_region_axis_resolved
+                else ["brain_region", "region_layer"]
+            ),
+        },
+    )
+
     logger.info(
         "Matrix filters resolved cell_types=%s cell_classes=%s "
         "brain_regions=%s region_layers=%s",
@@ -987,7 +1061,255 @@ def resolve_matrix_entities(user_input):
         region_layer_matches,
     )
 
-    return cell_type_matches, cell_class_matches, region_matches, region_layer_matches
+    result = (
+        cell_type_matches,
+        cell_class_matches,
+        region_matches,
+        region_layer_matches,
+    )
+    if include_interpretations:
+        return (*result, filter_interpretations)
+    return result
+
+
+def _semantic_source_phrase(user_input, dimension):
+    """Recover a concise functional phrase when the helper omitted it."""
+    if dimension in {"brain_region", "region_layer"}:
+        match = re.search(
+            r"\b(?:memory|learning|emotion|motor|visual|auditory|language|"
+            r"executive|reward|sleep)[-\s]+related(?:\s+(?:brain\s+)?regions?)?\b",
+            user_input,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return match.group(0).strip()
+    return ""
+
+
+def _default_filter_interpretation_reason(source_phrase, dimension, labels):
+    phrase_norm = normalize_text(source_phrase)
+    label_norms = {normalize_text(label) for label in labels}
+    if (
+        dimension == "brain_region"
+        and "memory related" in phrase_norm
+        and "hippocampus" in label_norms
+    ):
+        return (
+            "the hippocampus is a canonical memory-related structure and "
+            "is the closest matching brain-region label available in VasQ"
+        )
+    dimension_label = {
+        "brain_region": "brain-region",
+        "region_layer": "region-layer",
+        "cell_type": "cell-type",
+        "cell_class": "cell-class",
+    }.get(dimension, "dataset")
+    return (
+        f"this was the closest supported match in the available VasQ "
+        f"{dimension_label} vocabulary"
+    )
+
+
+def normalize_filter_interpretations(
+    user_input,
+    raw_interpretations,
+    *,
+    cell_types=None,
+    cell_classes=None,
+    regions=None,
+    region_layers=None,
+    semantic_dimensions=None,
+):
+    """Validate semantic query-to-dataset mappings returned by the helper.
+
+    Only GPT-only matches need disclosure: literal labels and curated aliases
+    have already been resolved deterministically and do not represent a hidden
+    biological interpretation. A fallback entry is created when the helper
+    resolved a functional phrase but omitted its explanation.
+    """
+    allowed_by_dimension = {
+        "cell_type": list(cell_types or []),
+        "cell_class": list(cell_classes or []),
+        "brain_region": list(regions or []),
+        "region_layer": list(region_layers or []),
+    }
+    semantic_dimensions = set(
+        allowed_by_dimension
+        if semantic_dimensions is None
+        else semantic_dimensions
+    )
+    dimension_aliases = {
+        "region": "brain_region",
+        "brain region": "brain_region",
+        "brain_region": "brain_region",
+        "region layer": "region_layer",
+        "region_layer": "region_layer",
+        "cell type": "cell_type",
+        "cell_type": "cell_type",
+        "cell class": "cell_class",
+        "cell_class": "cell_class",
+    }
+    query_norm = normalize_text(user_input)
+    cleaned = []
+
+    for raw in raw_interpretations or []:
+        if not isinstance(raw, dict):
+            continue
+        raw_dimension = normalize_text(str(raw.get("dimension", "")))
+        dimension = dimension_aliases.get(raw_dimension)
+        if dimension not in semantic_dimensions:
+            continue
+
+        allowed = allowed_by_dimension.get(dimension, [])
+        raw_labels = raw.get("labels") or []
+        if isinstance(raw_labels, str):
+            raw_labels = [raw_labels]
+        labels = validate_controlled_vocabulary(
+            raw_labels,
+            allowed,
+            dimension_name=dimension,
+        )
+        if not labels:
+            continue
+
+        source_phrase = str(raw.get("source_phrase", "")).strip()
+        if source_phrase and normalize_text(source_phrase) not in query_norm:
+            source_phrase = ""
+        source_phrase = source_phrase or _semantic_source_phrase(
+            user_input, dimension
+        )
+        if not source_phrase:
+            source_phrase = "the functional description in the question"
+
+        reason = re.sub(
+            r"\s+",
+            " ",
+            str(raw.get("rationale", "")).strip(),
+        )[:360]
+        reason = re.sub(r"^(?:because|as)\s+", "", reason, flags=re.IGNORECASE)
+        reason = re.sub(r"^The\s+", "the ", reason)
+        reason = re.sub(r"^This\s+", "this ", reason)
+        reason = reason.rstrip(". ") or _default_filter_interpretation_reason(
+            source_phrase, dimension, labels
+        )
+        cleaned.append({
+            "dimension": dimension,
+            "source_phrase": source_phrase,
+            "labels": labels,
+            "rationale": reason,
+        })
+
+    # The structured explanation is optional model output, but disclosing a
+    # semantic filter is not optional. Create a deterministic fallback for a
+    # resolved semantic axis when necessary.
+    covered_dimensions = {item["dimension"] for item in cleaned}
+    for dimension in ["brain_region", "region_layer", "cell_type", "cell_class"]:
+        labels = allowed_by_dimension.get(dimension, [])
+        if (
+            dimension not in semantic_dimensions
+            or not labels
+            or dimension in covered_dimensions
+        ):
+            continue
+        source_phrase = _semantic_source_phrase(user_input, dimension)
+        if not source_phrase:
+            source_phrase = "the functional description in the question"
+        cleaned.append({
+            "dimension": dimension,
+            "source_phrase": source_phrase,
+            "labels": labels,
+            "rationale": _default_filter_interpretation_reason(
+                source_phrase, dimension, labels
+            ),
+        })
+
+    return cleaned
+
+
+def format_filter_interpretation_evidence(interpretations):
+    """Create compact, explicit evidence for the final synthesis model."""
+    if not interpretations:
+        return ""
+    display_names = {
+        "brain_region": "Brain region",
+        "region_layer": "Region layer",
+        "cell_type": "Cell type",
+        "cell_class": "Cell class",
+    }
+    lines = [
+        "SEMANTIC FILTER INTERPRETATION — explain this before expression results:"
+    ]
+    for item in interpretations:
+        labels = ", ".join(item["labels"])
+        lines.append(
+            f"- {display_names.get(item['dimension'], item['dimension'])}: "
+            f'The user phrase "{item["source_phrase"]}" was operationalized '
+            f"as {labels} because {item['rationale']}."
+        )
+    lines.append(
+        "This is an operational mapping to the available VasQ vocabulary, "
+        "not a claim that the selected value is the only biological structure "
+        "related to the broader concept."
+    )
+    return "\n".join(lines)
+
+
+def build_filter_interpretation_section(interpretations):
+    """Render the user-facing explanation guaranteed to precede results."""
+    if not interpretations:
+        return ""
+    display_names = {
+        "brain_region": "Brain region",
+        "region_layer": "Region layer",
+        "cell_type": "Cell type",
+        "cell_class": "Cell class",
+    }
+    lines = ["### How the request was interpreted", ""]
+    has_region_mapping = False
+    for item in interpretations:
+        labels = ", ".join(f"**{label}**" for label in item["labels"])
+        dimension_name = display_names.get(item["dimension"], item["dimension"])
+        lines.append(
+            f'- **{dimension_name}:** I interpreted '
+            f'“{item["source_phrase"]}” as {labels} because '
+            f'{item["rationale"]}. The VasQ calculation therefore used '
+            f'`{dimension_name} = {", ".join(item["labels"])}`.'
+        )
+        has_region_mapping |= item["dimension"] in {"brain_region", "region_layer"}
+    if has_region_mapping:
+        lines.extend([
+            "",
+            (
+                "This is an operational mapping to the regions available in "
+                "VasQ; it does not mean that the selected region is the only "
+                "brain region involved in the broader function."
+            ),
+        ])
+    return "\n".join(lines)
+
+
+def ensure_filter_interpretation_visible(final_message, interpretations):
+    """Prepend the mapping if synthesis omitted the required explanation."""
+    if not interpretations:
+        return final_message
+    first_part = normalize_text((final_message or "")[:1800])
+    has_explanation_language = any(
+        term in first_part
+        for term in ["interpreted", "operationalized", "mapped", "closest matching"]
+    )
+    mentions_every_phrase = all(
+        normalize_text(item["source_phrase"]) in first_part
+        for item in interpretations
+        if item.get("source_phrase")
+    )
+    mentions_every_label = all(
+        all(normalize_text(label) in first_part for label in item.get("labels", []))
+        for item in interpretations
+    )
+    if has_explanation_language and mentions_every_phrase and mentions_every_label:
+        return final_message
+    section = build_filter_interpretation_section(interpretations)
+    return section + "\n\n" + str(final_message or "").lstrip()
 
 def extract_sex_filters(user_input):
     text = normalize_text(user_input)
@@ -1066,6 +1388,7 @@ def matrix_expression(
     genes_override=None,
     web_evidence_text=None,
     kg_evidence_text=None,
+    original_user_input=None,
 ):
     ensure_matrix_expression_data_loaded()
 
@@ -1085,7 +1408,17 @@ def matrix_expression(
     present_genes = [g for g in genes if g in MATRIX_GENE_TO_IDX]
     missing_genes = [g for g in genes if g not in MATRIX_GENE_TO_IDX]
 
-    cell_types, cell_classes, regions, region_layers = resolve_matrix_entities(user_input)
+    (
+        cell_types,
+        cell_classes,
+        regions,
+        region_layers,
+        filter_interpretations,
+    ) = resolve_matrix_entities(
+        user_input,
+        include_interpretations=True,
+        interpretation_input=original_user_input,
+    )
 
     # Literature evidence must not silently narrow the matrix scope. The
     # literature and VasQ comparison is only meaningful when VasQ is allowed to
@@ -1115,6 +1448,12 @@ def matrix_expression(
             f"Cell type: {', '.join(cell_types) if cell_types else 'ALL'}."
         ),
     ]
+
+    filter_interpretation_evidence = format_filter_interpretation_evidence(
+        filter_interpretations
+    )
+    if filter_interpretation_evidence:
+        notes.append(filter_interpretation_evidence)
 
     notes.extend(web_filter_notes)
 
@@ -1318,6 +1657,7 @@ def matrix_expression(
         "text": "\n\n".join(notes + [""] + all_sections),
         "graph_json": plot_json,
         "expression_table": expression_table,
+        "filter_interpretations": filter_interpretations,
     }
 
 
@@ -1769,6 +2109,7 @@ def resolve_dataset_entities_with_gpt(
     available_regions,
     available_cell_classes=None,
     available_region_layers=None,
+    include_interpretations=False,
 ):
     available_cell_types = available_cell_types or []
     available_regions = available_regions or []
@@ -1790,7 +2131,18 @@ def resolve_dataset_entities_with_gpt(
         "comparison; leave that dimension empty so downstream code can group "
         "the complete dataset. Never invent labels. Return JSON only with keys: "
         '{"cell_types": [], "cell_classes": [], "regions": [], '
-        '"region_layers": []}. Only use exact labels from the supplied lists.'
+        '"region_layers": [], "filter_interpretations": []}. Only use exact '
+        "labels from the supplied lists. When a functional or conceptual "
+        "phrase rather than a literal dataset label is mapped to one or more "
+        "labels (for example, 'memory-related region' to 'Hippocampus'), add "
+        "one filter_interpretations object with keys dimension, source_phrase, "
+        "labels, and rationale. source_phrase must be an exact short span from "
+        "the user query; labels must be the exact selected dataset labels; and "
+        "rationale must briefly explain both the biological connection and why "
+        "those labels are the closest available dataset match. Do not imply "
+        "that one selected region is the only structure involved in a broad "
+        "function. Do not add an interpretation object for a literal label or "
+        "a deterministic spelling/abbreviation alias."
     )
 
     user_prompt = (
@@ -1818,6 +2170,7 @@ def resolve_dataset_entities_with_gpt(
         cell_classes = parsed.get("cell_classes", [])
         regions = parsed.get("regions", [])
         region_layers = parsed.get("region_layers", [])
+        filter_interpretations = parsed.get("filter_interpretations", [])
 
         cell_types = validate_controlled_vocabulary(
             cell_types, available_cell_types, dimension_name="cell_type"
@@ -1832,13 +2185,24 @@ def resolve_dataset_entities_with_gpt(
             region_layers, available_region_layers, dimension_name="region_layer"
         )
 
-        return cell_types, cell_classes, regions, region_layers
+        result = (cell_types, cell_classes, regions, region_layers)
+        if include_interpretations:
+            return (
+                *result,
+                filter_interpretations
+                if isinstance(filter_interpretations, list)
+                else [],
+            )
+        return result
 
     except Exception as e:
         logger.exception("GPT dataset entity resolution failed: %s", e)
         # None means the helper failed and allows the caller to use local
         # matching. A successful helper response can intentionally return [].
-        return None, None, None, None
+        result = (None, None, None, None)
+        if include_interpretations:
+            return (*result, [])
+        return result
 
 def _unanimous_value(per_gene_map, genes):
     """A cell-type/region value only counts if EVERY gene in `genes` maps
@@ -3133,7 +3497,13 @@ def analyze_query_intent(user_input, history=None):
         "short follow-ups from recent context, but do "
         "not invent a gene, disease, cell type, or brain region. Include genes "
         "or diseases inherited from context only when the reference is "
-        "unambiguous. Normalize gene symbols to uppercase."
+        "unambiguous. Normalize gene symbols to uppercase. In resolved_question, "
+        "preserve the current user's exact functional and qualitative wording "
+        "and all qualifiers. Only add an unambiguous entity needed to resolve a "
+        "short follow-up; do not translate a phrase such as 'memory-related "
+        "region' into a named brain region, and do not silently replace a broad "
+        "concept with a narrower dataset label. If the current message is "
+        "standalone, copy it verbatim into resolved_question."
     )
     user_prompt = (
         f"Recent conversation:\n{recent_conversation_context(history)}\n\n"
@@ -3722,6 +4092,7 @@ def _chat_impl(user_input, history, should_stop=None):
     vasq_result = None
     vasq_note = ""
     graph_json = None
+    filter_interpretations = []
 
     if intent.get("asks_expression") and intent.get("use_vasq"):
         _raise_if_cancelled(should_stop)
@@ -3734,7 +4105,12 @@ def _chat_impl(user_input, history, should_stop=None):
                     kg_evidence_text=(
                         kg_result if kg_assessment.get("relevant") else None
                     ),
+                    original_user_input=user_input,
                 )
+                if isinstance(vasq_result, dict):
+                    filter_interpretations = list(
+                        vasq_result.get("filter_interpretations") or []
+                    )
                 logger.info("VasQ analysis completed for genes: %s", genes)
             except Exception:
                 logger.exception("VasQ branch failed")
@@ -3930,6 +4306,15 @@ def _chat_impl(user_input, history, should_stop=None):
             "table and never merge distinct region layers, cell types, or brain "
             "regions. Treat the supplied 'Applied matrix filters' line as the "
             "authoritative record of which filters were actually used. Treat "
+            "a supplied 'SEMANTIC FILTER INTERPRETATION' block as mandatory "
+            "reader-facing context. Before stating any expression conclusion, "
+            "explicitly explain the user's functional phrase, which exact "
+            "VasQ label or labels it was mapped to, why that biological and "
+            "dataset-vocabulary mapping was made, and the supplied scope "
+            "caveat. Do not jump directly from a phrase such as 'memory-related "
+            "region' to 'hippocampal' without showing this reasoning. Use the "
+            "heading 'How the request was interpreted' for that explanation. "
+            "Treat "
             "the supplied 'Observed comparison values' list as authoritative "
             "coverage: never claim that a value such as White Matter Tracts is "
             "absent when it appears in that list, even if a capped detail table "
@@ -4023,6 +4408,10 @@ def _chat_impl(user_input, history, should_stop=None):
         drug_result,
     )
     final_message = sanitize_uncited_urls(final_message, known_urls)
+    final_message = ensure_filter_interpretation_visible(
+        final_message,
+        filter_interpretations,
+    )
 
     logger.info("Final message generated: %r", final_message)
     update_history(
