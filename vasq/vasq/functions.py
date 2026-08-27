@@ -33,6 +33,44 @@ from .entity_aliases import (
 logger = logging.getLogger(__name__)
 logger.info("OpenAI SDK version: %s", openai.__version__)
 
+# Background Responses polling performs a short GET every few seconds. httpx
+# logs every successful request at INFO level, which floods Railway logs with
+# repetitive `/v1/responses/resp_... 200 OK` lines. Keep warnings and errors,
+# while leaving VasQ's own stage/submission/completion logs unchanged.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+FINAL_SYNTHESIS_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "vasq_final_answer_with_history",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "answer_markdown": {
+                    "type": "string",
+                    "description": (
+                        "The complete user-visible scientific answer in markdown, "
+                        "including every required inline citation."
+                    ),
+                },
+                "history_summary": {
+                    "type": "string",
+                    "description": (
+                        "A plain-text 2-4 sentence memory note containing the "
+                        "question scope, important entities, filters, and main "
+                        "finding needed to understand a follow-up turn."
+                    ),
+                },
+            },
+            "required": ["answer_markdown", "history_summary"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 
 class TurnBudgetExceeded(TimeoutError):
     """Raised when there is not enough time left to start another stage."""
@@ -120,6 +158,7 @@ def call_api(
     stage_name="chat_completion",
     timeout_seconds=None,
     reserve_seconds=5.0,
+    response_format=None,
 ):
     model = os.getenv("OPENAI_MODEL", "gpt-5.6-terra")
 
@@ -133,6 +172,9 @@ def call_api(
         
         if model.startswith("gpt-5.6"):
             request_args["reasoning_effort"] = "none"
+
+    if response_format is not None:
+        request_args["response_format"] = response_format
             
     timeout_seconds = timeout_seconds or _env_float(
         "OPENAI_CHAT_TIMEOUT_SECONDS", 45
@@ -3463,61 +3505,59 @@ def recent_conversation_context(
     return combined
 
 
-def summarize_turn_for_history(user_input, final_message, max_verbatim_chars=600):
-    """Compact a turn before it goes into `history`.
+def parse_final_synthesis_message(message):
+    """Extract the visible answer and memory note from Structured Output."""
+    refusal = str(getattr(message, "refusal", None) or "").strip()
+    if refusal:
+        raise ValueError(f"Final synthesis was refused: {refusal}")
 
-    `update_history` used to store `final_message` verbatim -- a VasQ answer
-    (a full expression table plus a literature review) is often several
-    thousand characters. Every later turn's intent classification and final
-    synthesis reread the *entire* growing history, so storing raw answers
-    makes each turn's context bigger, and unrelated (long-ago) detail can
-    crowd out the one thing a follow-up actually needs: what was just
-    discussed. Store a short summary instead, so history grows by roughly a
-    fixed, small amount per turn regardless of how detailed the answer was.
+    content = str(getattr(message, "content", None) or "").strip()
+    if not content:
+        raise ValueError("Final synthesis returned empty content")
 
-    Short replies (greetings, brief clarifications) are kept verbatim --
-    they are already compact, so summarizing them would spend a call for no
-    benefit.
-    """
-    text = str(final_message or "").strip()
-    if len(text) <= max_verbatim_chars:
-        return text
-
-    system_prompt = (
-        "Compress an assistant's answer into a short note for the "
-        "conversation's own memory, written so a later turn can resolve a "
-        "follow-up question (e.g. 'what about that gene', 'and in the "
-        "hippocampus?') without rereading the full answer. In 2-4 sentences, "
-        "state: what was asked, which genes, diseases, cell types, and brain "
-        "regions were involved, and the single most important conclusion or "
-        "measured finding. Do not restate full tables, citations, or "
-        "caveats -- keep only what a future turn needs to stay oriented. "
-        "Plain text, no markdown, no headers."
-    )
-    user_prompt = (
-        f"User's question:\n{user_input}\n\n"
-        f"Assistant's full answer:\n{cap_source_text(text, 12000)}"
-    )
     try:
-        response = call_helper_api(
-            system_prompt,
-            user_prompt,
-            stage_name="history_summary",
-            timeout_seconds=_env_float("OPENAI_HISTORY_SUMMARY_TIMEOUT_SECONDS", 20),
-        )
-        summary = str(
-            getattr(response.choices[0].message, "content", None) or ""
-        ).strip()
-        if summary:
-            return summary
-    except Exception:
-        logger.exception(
-            "History summarization failed; falling back to a plain truncation"
-        )
+        payload = json.loads(content)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Final synthesis returned invalid JSON") from exc
 
-    # Fallback: keep the turn discoverable even if summarization fails,
-    # rather than silently dropping it or storing the (huge) raw text.
-    return text[:max_verbatim_chars].rstrip() + " […]"
+    if not isinstance(payload, dict):
+        raise ValueError("Final synthesis JSON is not an object")
+
+    answer = str(payload.get("answer_markdown") or "").strip()
+    history_summary = str(payload.get("history_summary") or "").strip()
+    if not answer:
+        raise ValueError("Final synthesis omitted answer_markdown")
+    if not history_summary:
+        raise ValueError("Final synthesis omitted history_summary")
+    return answer, history_summary
+
+
+def history_entry_from_synthesis(
+    user_input,
+    final_message,
+    generated_summary=None,
+    max_chars=600,
+):
+    """Bound a bundled history note without making another model request."""
+    max_chars = max(8, int(max_chars))
+
+    def bounded(text):
+        text = " ".join(str(text or "").split())
+        if len(text) <= max_chars:
+            return text
+        return text[: max_chars - 4].rstrip() + " […]"
+
+    summary = bounded(generated_summary)
+    if summary:
+        return summary
+
+    # The final call may fail before producing its bundled summary. Keep the
+    # turn discoverable with a deterministic local fallback instead of adding
+    # a history-summary API call after an already degraded response.
+    question = " ".join(str(user_input or "").split())
+    answer = " ".join(str(final_message or "").split())
+    prefix = f"User asked: {question}. Answer: " if question else "Answer: "
+    return bounded(prefix + answer)
 
 
 def is_simple_conversational_message(user_input):
@@ -4098,7 +4138,9 @@ def _chat_impl(user_input, history, should_stop=None):
             "I'm sorry, but I couldn't generate a response."
         )
         update_history(
-            history, "assistant", summarize_turn_for_history(user_input, final_message)
+            history,
+            "assistant",
+            history_entry_from_synthesis(user_input, final_message),
         )
         return final_message, history, None, None
 
@@ -4547,7 +4589,13 @@ def _chat_impl(user_input, history, should_stop=None):
             "do not add or search for drug information. If a source reports "
             "no result, state the limitation briefly rather "
             "than inventing content. Do not mention internal routing or "
-            "implementation details."
+            "implementation details. Put the complete reader-facing answer "
+            "in answer_markdown. Also produce history_summary as 2-4 concise "
+            "plain-text sentences for a future follow-up: state what was "
+            "asked, the important genes/diseases/cell types/brain regions and "
+            "applied filters, and the main conclusion or measured finding. "
+            "Do not put tables, markdown, citations, or implementation details "
+            "in history_summary."
         ),
     }
 
@@ -4576,19 +4624,21 @@ def _chat_impl(user_input, history, should_stop=None):
     })
 
     _raise_if_cancelled(should_stop)
+    generated_history_summary = None
     try:
         final_message_obj = call_api(
             synthesis_messages,
             stage_name="final_synthesis",
             timeout_seconds=_env_float("OPENAI_SYNTHESIS_TIMEOUT_SECONDS", 45),
             reserve_seconds=2,
+            response_format=FINAL_SYNTHESIS_RESPONSE_FORMAT,
         )
-        final_message = getattr(final_message_obj, "content", None) or (
-            "I'm sorry, but I couldn't synthesize the available evidence."
+        final_message, generated_history_summary = (
+            parse_final_synthesis_message(final_message_obj)
         )
     except Exception:
         logger.exception(
-            "Final synthesis failed; returning recovered partial evidence"
+            "Structured final synthesis failed; returning recovered partial evidence"
         )
         final_message = build_partial_response(
             genes,
@@ -4627,7 +4677,13 @@ def _chat_impl(user_input, history, should_stop=None):
 
     logger.info("Final message generated: %r", final_message)
     update_history(
-        history, "assistant", summarize_turn_for_history(user_input, final_message)
+        history,
+        "assistant",
+        history_entry_from_synthesis(
+            user_input,
+            final_message,
+            generated_summary=generated_history_summary,
+        ),
     )
 
     return final_message, history, graph_json, expression_table
