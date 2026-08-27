@@ -12,7 +12,7 @@ import ast
 import logging
 import numpy as np
 from scipy import sparse
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from openai import OpenAI
 
@@ -3639,9 +3639,85 @@ def cap_text_at_line_boundary(text, limit, suffix="[Text truncated]"):
 _URL_PATTERN = re.compile(r'https?://[^\s\])"\'<>]+')
 _MARKDOWN_LINK_PATTERN = re.compile(r'\[([^\]]+)\]\((https?://[^\s)]+)\)')
 
+_DEFAULT_CITATION_DOMAINS = {
+    "pubmed.ncbi.nlm.nih.gov",
+    "pmc.ncbi.nlm.nih.gov",
+    "ncbi.nlm.nih.gov",
+    "clinicaltrials.gov",
+    "fda.gov",
+    "www.fda.gov",
+    "nature.com",
+    "www.nature.com",
+    "science.org",
+    "www.science.org",
+    "cell.com",
+    "www.cell.com",
+    "nejm.org",
+    "www.nejm.org",
+    "thelancet.com",
+    "www.thelancet.com",
+    "jamanetwork.com",
+    "academic.oup.com",
+    "link.springer.com",
+    "onlinelibrary.wiley.com",
+    "biorxiv.org",
+    "www.biorxiv.org",
+    "medrxiv.org",
+    "www.medrxiv.org",
+    "uniprot.org",
+    "www.uniprot.org",
+    "proteinatlas.org",
+    "www.proteinatlas.org",
+    "ebi.ac.uk",
+    "www.ebi.ac.uk",
+}
+_TRACKING_QUERY_KEYS = {
+    "fbclid", "gclid", "mc_cid", "mc_eid", "ref", "source",
+    "utm_campaign", "utm_content", "utm_medium", "utm_source", "utm_term",
+}
+
+
+def _allowed_citation_domains():
+    configured = os.getenv("VASQ_ALLOWED_CITATION_DOMAINS", "")
+    domains = set(_DEFAULT_CITATION_DOMAINS)
+    domains.update(
+        item.strip().lower().lstrip(".")
+        for item in configured.split(",")
+        if item.strip()
+    )
+    return domains
+
+
+def _citation_domain_allowed(url):
+    try:
+        host = (urlparse(url).hostname or "").lower().rstrip(".")
+    except Exception:
+        return False
+    return any(host == domain or host.endswith("." + domain)
+               for domain in _allowed_citation_domains())
+
 
 def _normalize_url(url):
-    return str(url or "").strip().rstrip('.,;:)]}\u00bb\u201d\'"').split("#", 1)[0]
+    """Canonicalize a citation URL for exact, fail-closed comparison."""
+    raw = str(url or "").strip().rstrip('.,;:)]}\u00bb\u201d\'"')
+    try:
+        parsed = urlparse(raw)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return ""
+        host = parsed.hostname.lower().rstrip(".")
+        port = parsed.port
+        netloc = host if not port else f"{host}:{port}"
+        path = re.sub(r"/{2,}", "/", parsed.path or "/")
+        if path != "/":
+            path = path.rstrip("/")
+        query = urlencode(sorted(
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key.lower() not in _TRACKING_QUERY_KEYS
+        ))
+        return urlunparse((parsed.scheme.lower(), netloc, path, "", query, ""))
+    except (TypeError, ValueError):
+        return ""
 
 
 def extract_known_urls(*texts):
@@ -3655,8 +3731,15 @@ def extract_known_urls(*texts):
     for text in texts:
         if not text:
             continue
-        for match in _URL_PATTERN.findall(str(text)):
-            known.add(_normalize_url(match))
+        # Sources merely listed as "consulted" were not attached by the
+        # search tool to a claim and must never enter the final whitelist.
+        claim_bound_text = str(text).split(
+            "\n\nOther sources the search tool consulted", 1
+        )[0]
+        for match in _URL_PATTERN.findall(claim_bound_text):
+            normalized = _normalize_url(match)
+            if normalized and _citation_domain_allowed(normalized):
+                known.add(normalized)
     return known
 
 
@@ -3729,14 +3812,7 @@ def append_missing_gene_literature_links(
         urls = links_by_gene.get(gene, [])
         if not urls:
             continue
-        if any(
-            url in final_urls
-            or any(
-                url.startswith(existing) or existing.startswith(url)
-                for existing in final_urls
-            )
-            for url in urls
-        ):
+        if any(_normalize_url(url) in final_urls for url in urls):
             continue
         citations = " ".join(
             f"[{_source_label(url)}]({url})"
@@ -3766,21 +3842,27 @@ def sanitize_uncited_urls(final_message, known_urls):
     at all -- e.g. a URL the model reconstructed from general training
     knowledge rather than from what was actually retrieved just now.
     """
-    if not final_message or not known_urls:
+    if not final_message:
         return final_message
+
+    canonical_known = {
+        normalized
+        for url in (known_urls or set())
+        if (normalized := _normalize_url(url))
+        and _citation_domain_allowed(normalized)
+    }
 
     def _replace(match):
         label, url = match.group(1), match.group(2)
         normalized = _normalize_url(url)
-        if normalized in known_urls:
-            return match.group(0)
-        # Tolerate minor formatting drift (trailing slash, query string)
-        # the model may introduce while otherwise citing a real source.
-        if any(
-            normalized.startswith(known) or known.startswith(normalized)
-            for known in known_urls
+        # Exact canonical equality only. Prefix matching is unsafe because
+        # two different papers on the same host commonly share a URL prefix.
+        if (
+            normalized in canonical_known
+            and _citation_domain_allowed(normalized)
+            and label == _source_label(url)
         ):
-            return match.group(0)
+            return f"[{label}]({normalized})"
         logger.warning(
             "Stripping a citation URL not found in this turn's evidence: %s",
             url,
