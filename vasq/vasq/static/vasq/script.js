@@ -1177,6 +1177,272 @@ document.addEventListener("DOMContentLoaded", function() {
         }
     }
 
+    function formatExpressionTableValue(columnKey, value) {
+        if (value === null || value === undefined || value === '') return '—';
+        if (columnKey === 'mean_expr') {
+            const number = Number(value);
+            return Number.isFinite(number) ? number.toFixed(3) : String(value);
+        }
+        if (columnKey === 'pct_expr') {
+            const number = Number(value);
+            return Number.isFinite(number) ? number.toFixed(1) + '%' : String(value);
+        }
+        if (columnKey === 'n_cells') {
+            const number = Number(value);
+            return Number.isFinite(number) ? number.toLocaleString() : String(value);
+        }
+        return String(value);
+    }
+
+    async function renderExpressionTable(tableUrl, downloadUrl) {
+        if (!tableUrl) return;
+
+        const card = document.createElement('section');
+        card.className = 'vasq-expression-table-card';
+
+        const headingRow = document.createElement('div');
+        headingRow.className = 'vasq-expression-table-heading';
+
+        const headingBlock = document.createElement('div');
+        const heading = document.createElement('h3');
+        heading.textContent = 'Full VasQ expression table';
+        const description = document.createElement('p');
+        description.textContent = (
+            'All eligible gene × region × cell-type groups. ' +
+            'This table is paged separately and is not sent to the language model.'
+        );
+        headingBlock.appendChild(heading);
+        headingBlock.appendChild(description);
+        headingRow.appendChild(headingBlock);
+
+        if (downloadUrl) {
+            const downloadLink = document.createElement('a');
+            downloadLink.className = 'vasq-expression-download';
+            downloadLink.href = downloadUrl;
+            downloadLink.textContent = 'Download full CSV';
+            downloadLink.setAttribute('download', '');
+            headingRow.appendChild(downloadLink);
+        }
+
+        const controls = document.createElement('div');
+        controls.className = 'vasq-expression-filters';
+
+        const tableScroll = document.createElement('div');
+        tableScroll.className = 'vasq-expression-table-scroll';
+        const table = document.createElement('table');
+        table.className = 'vasq-expression-table';
+        const tableHead = document.createElement('thead');
+        const tableBody = document.createElement('tbody');
+        table.appendChild(tableHead);
+        table.appendChild(tableBody);
+        tableScroll.appendChild(table);
+
+        const footer = document.createElement('div');
+        footer.className = 'vasq-expression-pagination';
+        const rowSummary = document.createElement('span');
+        const previousButton = document.createElement('button');
+        previousButton.type = 'button';
+        previousButton.textContent = 'Previous';
+        const pageSummary = document.createElement('span');
+        const nextButton = document.createElement('button');
+        nextButton.type = 'button';
+        nextButton.textContent = 'Next';
+        footer.appendChild(rowSummary);
+        footer.appendChild(previousButton);
+        footer.appendChild(pageSummary);
+        footer.appendChild(nextButton);
+
+        const status = document.createElement('p');
+        status.className = 'vasq-expression-status';
+        status.textContent = 'Loading full expression table...';
+
+        card.appendChild(headingRow);
+        card.appendChild(controls);
+        card.appendChild(status);
+        card.appendChild(tableScroll);
+        card.appendChild(footer);
+        messagesContainer.appendChild(card);
+
+        const state = {
+            page: 1,
+            pageSize: 50,
+            filters: {},
+            filterSelects: {},
+            controlsInitialized: false,
+            loading: false,
+            totalPages: 1
+        };
+
+        function buildTableHeader(columns) {
+            tableHead.replaceChildren();
+            const row = document.createElement('tr');
+            columns.forEach(function(column) {
+                const header = document.createElement('th');
+                header.textContent = column.label || column.key;
+                row.appendChild(header);
+            });
+            tableHead.appendChild(row);
+        }
+
+        function buildFilterControls(data) {
+            if (state.controlsInitialized) return;
+            state.controlsInitialized = true;
+            controls.replaceChildren();
+
+            const labels = {};
+            (data.columns || []).forEach(function(column) {
+                labels[column.key] = column.label || column.key;
+            });
+
+            (data.filter_keys || []).forEach(function(key) {
+                const wrapper = document.createElement('label');
+                const labelText = document.createElement('span');
+                labelText.textContent = labels[key] || key;
+                const select = document.createElement('select');
+                const allOption = document.createElement('option');
+                allOption.value = '';
+                allOption.textContent = 'All';
+                select.appendChild(allOption);
+
+                ((data.filters || {})[key] || []).forEach(function(value) {
+                    const option = document.createElement('option');
+                    option.value = value;
+                    option.textContent = value;
+                    select.appendChild(option);
+                });
+
+                select.addEventListener('change', function() {
+                    state.filters[key] = select.value;
+                    void loadPage(1);
+                });
+                wrapper.appendChild(labelText);
+                wrapper.appendChild(select);
+                controls.appendChild(wrapper);
+                state.filterSelects[key] = select;
+            });
+
+            const pageSizeWrapper = document.createElement('label');
+            const pageSizeLabel = document.createElement('span');
+            pageSizeLabel.textContent = 'Rows per page';
+            const pageSizeSelect = document.createElement('select');
+            [25, 50, 100].forEach(function(size) {
+                const option = document.createElement('option');
+                option.value = String(size);
+                option.textContent = String(size);
+                option.selected = size === state.pageSize;
+                pageSizeSelect.appendChild(option);
+            });
+            pageSizeSelect.addEventListener('change', function() {
+                state.pageSize = Number(pageSizeSelect.value) || 50;
+                void loadPage(1);
+            });
+            pageSizeWrapper.appendChild(pageSizeLabel);
+            pageSizeWrapper.appendChild(pageSizeSelect);
+            controls.appendChild(pageSizeWrapper);
+        }
+
+        function renderRows(data) {
+            const columns = data.columns || [];
+            tableBody.replaceChildren();
+            if (!(data.rows || []).length) {
+                const row = document.createElement('tr');
+                const cell = document.createElement('td');
+                cell.colSpan = Math.max(1, columns.length);
+                cell.textContent = 'No rows match the selected filters.';
+                cell.className = 'vasq-expression-empty';
+                row.appendChild(cell);
+                tableBody.appendChild(row);
+                return;
+            }
+
+            data.rows.forEach(function(record) {
+                const row = document.createElement('tr');
+                columns.forEach(function(column) {
+                    const cell = document.createElement('td');
+                    cell.textContent = formatExpressionTableValue(
+                        column.key,
+                        record[column.key]
+                    );
+                    if (['mean_expr', 'pct_expr', 'n_cells'].includes(column.key)) {
+                        cell.className = 'vasq-expression-number';
+                    }
+                    row.appendChild(cell);
+                });
+                tableBody.appendChild(row);
+            });
+        }
+
+        async function loadPage(requestedPage) {
+            if (state.loading) return;
+            state.loading = true;
+            previousButton.disabled = true;
+            nextButton.disabled = true;
+            status.hidden = false;
+            status.textContent = 'Loading expression rows...';
+
+            try {
+                const url = new URL(tableUrl, window.location.origin);
+                url.searchParams.set('page', String(requestedPage));
+                url.searchParams.set('page_size', String(state.pageSize));
+                Object.entries(state.filters).forEach(function(entry) {
+                    if (entry[1]) url.searchParams.set(entry[0], entry[1]);
+                });
+
+                const response = await fetch(url.toString(), {
+                    headers: { 'Accept': 'application/json' },
+                    cache: 'no-store'
+                });
+                const data = await response.json().catch(function() {
+                    return {};
+                });
+                if (!response.ok) {
+                    throw new Error(data.response || 'Could not load the table.');
+                }
+
+                buildFilterControls(data);
+                buildTableHeader(data.columns || []);
+                renderRows(data);
+
+                const pagination = data.pagination || {};
+                state.page = Number(pagination.page) || 1;
+                state.totalPages = Number(pagination.total_pages) || 1;
+                const totalRows = Number(pagination.total_rows) || 0;
+                const firstRow = totalRows
+                    ? ((state.page - 1) * state.pageSize) + 1
+                    : 0;
+                const lastRow = Math.min(state.page * state.pageSize, totalRows);
+                rowSummary.textContent = (
+                    `Showing ${firstRow.toLocaleString()}–` +
+                    `${lastRow.toLocaleString()} of ${totalRows.toLocaleString()} rows`
+                );
+                pageSummary.textContent = `Page ${state.page} of ${state.totalPages}`;
+                previousButton.disabled = state.page <= 1;
+                nextButton.disabled = state.page >= state.totalPages;
+                status.hidden = true;
+            } catch (error) {
+                console.error('Could not render expression table:', error);
+                status.hidden = false;
+                status.textContent = error.message || 'Could not load the table.';
+            } finally {
+                state.loading = false;
+                if (!status.hidden) {
+                    previousButton.disabled = true;
+                    nextButton.disabled = true;
+                }
+                scrollToBottom();
+            }
+        }
+
+        previousButton.addEventListener('click', function() {
+            if (state.page > 1) void loadPage(state.page - 1);
+        });
+        nextButton.addEventListener('click', function() {
+            if (state.page < state.totalPages) void loadPage(state.page + 1);
+        });
+
+        await loadPage(1);
+    }
+
     async function sendQuestion(message, options = {}) {
         const startedAt = performance.now();
         const queueIndex = options.queueIndex || null;
@@ -1269,6 +1535,10 @@ document.addEventListener("DOMContentLoaded", function() {
             addChatMessage(answerText, false);
 
             await renderGraph(data.graph_json);
+            await renderExpressionTable(
+                data.expression_table_url,
+                data.expression_table_download_url
+            );
             return {
                 success: true,
                 stopped: false,
