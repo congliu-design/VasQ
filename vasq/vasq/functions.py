@@ -545,11 +545,27 @@ def run_openai_web_search(
             "\n\nOther sources the search tool consulted",
             1,
         )[0]
-        spoke_evidence_used = bool(re.search(
-            r"https?://(?:[^/]+\.)?(?:spoke\.rbvi\.ucsf\.edu|spoke\.ucsf\.edu)(?:/|\b)",
+        claim_bound_urls = re.findall(
+            r"https?://[^\s\])\"'<>]+",
             claim_bound_result,
             flags=re.IGNORECASE,
-        ))
+        )
+
+        def _is_spoke_url(url):
+            try:
+                host = (urlparse(url).hostname or "").lower().rstrip(".")
+            except Exception:
+                return False
+            return host in {"spoke.rbvi.ucsf.edu", "spoke.ucsf.edu"}
+
+        spoke_evidence_used = any(
+            _is_spoke_url(url)
+            for url in claim_bound_urls
+        )
+        non_spoke_evidence_used = any(
+            not _is_spoke_url(url)
+            for url in claim_bound_urls
+        )
 
         if fallback_urls:
             result += (
@@ -562,10 +578,11 @@ def run_openai_web_search(
 
         logger.info(
             "OpenAI Web Search succeeded stage=%s result_length=%s "
-            "spoke_evidence_used=%s request_id=%s",
+            "spoke_evidence_used=%s non_spoke_evidence_used=%s request_id=%s",
             stage_name,
             len(result),
             spoke_evidence_used,
+            non_spoke_evidence_used,
             getattr(response, "_request_id", None),
         )
         return result
@@ -633,12 +650,20 @@ _SPOKE_SOURCE_INSTRUCTION = (
     "required source: if its website or graph API is unavailable, errors, or "
     "does not expose an inspectable relationship, continue with the original "
     "source databases and primary literature without delaying or weakening "
-    "the answer. Never claim that SPOKE supports a relationship unless that "
-    "relationship was directly retrieved in this search. Treat SPOKE graph "
-    "relationships as associations rather than proof of causality, and verify "
-    "important claims against the underlying source database or primary "
-    "literature whenever possible. Do not use SPOKE alone to establish current "
-    "regulatory approval, clinical-development status, or clinical benefit. "
+    "the answer. Even when SPOKE returns relevant data, do not stop searching: "
+    "independently search non-SPOKE authoritative sources such as PubMed, the "
+    "underlying source database, FDA, ClinicalTrials.gov, GWAS Catalog, ChEMBL, "
+    "or another appropriate primary source. Never claim that SPOKE supports a "
+    "relationship unless that relationship was directly retrieved in this "
+    "search. Treat SPOKE graph relationships as associations rather than proof "
+    "of causality. A directly retrieved SPOKE relationship may be reported "
+    "without requiring a separate corroborating source. The independent "
+    "non-SPOKE search is still required to broaden the evidence and obtain "
+    "current literature, regulatory, and clinical information; absence of a "
+    "matching non-SPOKE citation does not invalidate a returned SPOKE graph "
+    "relationship. Use primary regulatory and trial sources, rather than "
+    "SPOKE alone, for current approval, clinical-development status, and "
+    "clinical-benefit claims. "
 )
 
 
@@ -4339,8 +4364,13 @@ def _chat_impl(user_input, history, should_stop=None):
             "that external sources were searched. Treat knowledge-graph "
             "relationships retrieved through Web Search, including SPOKE "
             "relationships, as associations rather than proof of causality. "
-            "Prefer the cited underlying database or primary literature when "
-            "it is supplied. Use web/literature evidence for current "
+            "A SPOKE relationship that was directly retrieved and cited may be "
+            "used without requiring a matching non-SPOKE citation. Do not "
+            "discard or label it uncorroborated solely because independent "
+            "corroboration was not returned. Integrate additional non-SPOKE "
+            "evidence whenever it is supplied, and use primary regulatory or "
+            "trial sources for current approval, clinical-development status, "
+            "and clinical-benefit claims. Use web/literature evidence for current "
             "function, pathway, mechanism, clinical-stage, and regulatory "
             "claims, and preserve its citations. The evidence text may "
             "already contain complete markdown links, e.g. "
