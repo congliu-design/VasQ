@@ -1,5 +1,8 @@
 import contextvars
+import copy
+import hashlib
 import json
+import math
 import threading
 import openai
 import os
@@ -11,6 +14,12 @@ import logging
 import numpy as np
 from scipy import sparse
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from uuid import uuid4
+
+try:
+    import tiktoken
+except ImportError:  # Exact API usage is still reported by OpenAI responses.
+    tiktoken = None
 
 from openai import OpenAI
 
@@ -75,6 +84,53 @@ class TurnBudgetExceeded(TimeoutError):
 
 
 _TURN_DEADLINE = contextvars.ContextVar("vasq_turn_deadline", default=None)
+_TURN_USAGE = contextvars.ContextVar("vasq_turn_usage", default=None)
+_USAGE_REPORT_FILE_LOCK = threading.Lock()
+_TOKEN_ENCODERS = {}
+
+
+# Prompt/context limits are expressed in tokens throughout the runtime path.
+# They can be tuned without editing code. The complete expression table and
+# Plotly payload are returned to the UI separately and do not use these budgets.
+TOKEN_BUDGET_DEFAULTS = {
+    "VASQ_EXPRESSION_EVIDENCE_TOKENS": 5000,
+    "VASQ_GENE_LITERATURE_EVIDENCE_TOKENS": 4500,
+    "VASQ_PRIMARY_SCIENTIFIC_EVIDENCE_TOKENS": 1250,
+    "VASQ_DRUG_EVIDENCE_TOKENS": 1750,
+    "VASQ_MATRIX_HINT_EVIDENCE_TOKENS": 1500,
+    "VASQ_GENE_DERIVATION_EVIDENCE_TOKENS": 2250,
+    "VASQ_PARTIAL_EXPRESSION_TOKENS": 1500,
+    "VASQ_PARTIAL_SCIENTIFIC_TOKENS": 1000,
+    "VASQ_PARTIAL_DRUG_TOKENS": 750,
+    "VASQ_HISTORY_MESSAGE_TOKENS": 200,
+    "VASQ_HISTORY_TOTAL_TOKENS": 1250,
+    "VASQ_STORED_HISTORY_SUMMARY_TOKENS": 300,
+    "VASQ_FILTER_RATIONALE_TOKENS": 90,
+    "VASQ_CHAT_MAX_OUTPUT_TOKENS": 8000,
+    "VASQ_HELPER_MAX_OUTPUT_TOKENS": 1500,
+    "VASQ_WEB_MAX_OUTPUT_TOKENS": 10000,
+}
+
+
+AUTHORITATIVE_EXPRESSION_NOTE = (
+    "Numerical tables and plots are generated directly from the expression "
+    "matrix and constitute the authoritative quantitative results. The "
+    "LLM-generated text is an interpretive summary of these results."
+)
+
+
+# Short-context standard API rates in USD per 1M tokens. Token counts in the
+# report are exact API values; cost is explicitly labeled an estimate because
+# account tier, regional processing, long-context pricing, and future price
+# changes can differ. Override the complete mapping with
+# VASQ_MODEL_PRICING_JSON when needed.
+DEFAULT_MODEL_PRICING_USD_PER_MILLION = {
+    "gpt-5.6-sol": {"input": 4.0, "cached_input": 0.4, "output": 20.0},
+    "gpt-5.6-terra": {"input": 2.0, "cached_input": 0.2, "output": 12.0},
+    "gpt-5.6-luna": {"input": 0.2, "cached_input": 0.02, "output": 1.2},
+    "gpt-4o": {"input": 2.5, "cached_input": 1.25, "output": 10.0},
+}
+DEFAULT_WEB_SEARCH_USD_PER_CALL = 0.01
 
 
 def _env_float(name, default, minimum=1.0):
@@ -111,6 +167,340 @@ def _env_bool(name, default):
 
     logger.warning("Invalid %s=%r; using default=%s", name, raw_value, default)
     return bool(default)
+
+
+def _env_positive_int(name, default, minimum=1, maximum=1_000_000):
+    """Read a positive integer without the retry-count ceiling in _env_int."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s; using default=%s", name, default)
+        value = int(default)
+    return max(int(minimum), min(int(maximum), value))
+
+
+def token_budget(name):
+    """Return one named prompt budget, always measured in model tokens."""
+    return _env_positive_int(name, TOKEN_BUDGET_DEFAULTS[name])
+
+
+def _token_encoder(model=None):
+    """Return a cached tiktoken encoder, or None when it is unavailable.
+
+    API-reported usage remains exact in both cases. tiktoken is used only to
+    enforce pre-request context budgets. The fallback deliberately uses a
+    conservative two UTF-8 bytes-per-token estimate for English and CJK text.
+    """
+    if tiktoken is None:
+        return None
+
+    model = str(model or os.getenv("OPENAI_MODEL", "gpt-5.6-terra"))
+    if model in _TOKEN_ENCODERS:
+        return _TOKEN_ENCODERS[model]
+
+    try:
+        encoder = tiktoken.encoding_for_model(model)
+    except KeyError:
+        encoder = tiktoken.get_encoding("o200k_base")
+    _TOKEN_ENCODERS[model] = encoder
+    return encoder
+
+
+def count_text_tokens(text, model=None):
+    """Count text tokens for local budgeting; API usage is the billing truth."""
+    text = str(text or "")
+    if not text:
+        return 0
+    encoder = _token_encoder(model)
+    if encoder is not None:
+        return len(encoder.encode(text))
+    return max(1, math.ceil(len(text.encode("utf-8")) / 2.0))
+
+
+def _text_prefix_within_token_budget(text, max_tokens, model=None):
+    """Find the longest character-safe prefix within a token budget."""
+    text = str(text or "")
+    max_tokens = max(0, int(max_tokens))
+    if max_tokens == 0 or not text:
+        return ""
+    if count_text_tokens(text, model=model) <= max_tokens:
+        return text
+
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if count_text_tokens(text[:middle], model=model) <= max_tokens:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low]
+
+
+def cap_text_tokens(
+    text,
+    max_tokens,
+    *,
+    suffix="[Text truncated to token budget]",
+    line_boundary=False,
+    keep="start",
+    model=None,
+):
+    """Cap text by tokens without returning an over-budget result."""
+    text = str(text or "").strip()
+    max_tokens = max(0, int(max_tokens))
+    if count_text_tokens(text, model=model) <= max_tokens:
+        return text
+    if max_tokens == 0:
+        return ""
+
+    suffix = str(suffix or "").strip()
+    suffix = _text_prefix_within_token_budget(suffix, max_tokens, model=model)
+    separator = "\n" if suffix else ""
+    reserved = count_text_tokens(separator + suffix, model=model)
+    content_budget = max(0, max_tokens - reserved)
+
+    if keep == "end":
+        reversed_text = text[::-1]
+        clipped = _text_prefix_within_token_budget(
+            reversed_text,
+            content_budget,
+            model=model,
+        )[::-1]
+        if line_boundary and "\n" in clipped:
+            clipped = clipped.split("\n", 1)[-1]
+    else:
+        clipped = _text_prefix_within_token_budget(
+            text,
+            content_budget,
+            model=model,
+        )
+        if line_boundary and "\n" in clipped:
+            clipped = clipped.rsplit("\n", 1)[0]
+
+    clipped = clipped.strip()
+    if keep == "end":
+        result = (suffix + separator + clipped).strip() if clipped else suffix
+    else:
+        result = (clipped + separator + suffix).strip() if clipped else suffix
+    while result and count_text_tokens(result, model=model) > max_tokens:
+        if keep == "end":
+            clipped = clipped[1:].lstrip()
+            result = (suffix + separator + clipped).strip() if clipped else suffix
+        else:
+            clipped = clipped[:-1].rstrip()
+            result = (clipped + separator + suffix).strip() if clipped else suffix
+    return result
+
+
+def _usage_field(value, name, default=0):
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _count_response_web_search_calls(response):
+    count = 0
+    for item in getattr(response, "output", None) or []:
+        item_type = _usage_field(item, "type", "")
+        if item_type == "web_search_call":
+            count += 1
+    return count
+
+
+def _model_pricing(model):
+    pricing = DEFAULT_MODEL_PRICING_USD_PER_MILLION
+    raw_override = os.getenv("VASQ_MODEL_PRICING_JSON", "").strip()
+    if raw_override:
+        try:
+            parsed = json.loads(raw_override)
+            if isinstance(parsed, dict):
+                pricing = parsed
+        except (TypeError, ValueError):
+            logger.warning("Invalid VASQ_MODEL_PRICING_JSON; using defaults")
+
+    model = str(model or "")
+    if model in pricing:
+        return pricing[model]
+    for prefix, rates in pricing.items():
+        if model.startswith(prefix + "-"):
+            return rates
+    return None
+
+
+def _estimated_stage_cost_usd(
+    *,
+    model,
+    input_tokens,
+    cached_input_tokens,
+    output_tokens,
+    web_search_calls,
+):
+    rates = _model_pricing(model)
+    if not rates:
+        return None
+    try:
+        uncached_input = max(0, input_tokens - cached_input_tokens)
+        token_cost = (
+            uncached_input * float(rates["input"])
+            + cached_input_tokens * float(rates["cached_input"])
+            + output_tokens * float(rates["output"])
+        ) / 1_000_000.0
+        search_cost = int(web_search_calls or 0) * float(
+            os.getenv(
+                "VASQ_WEB_SEARCH_USD_PER_CALL",
+                str(DEFAULT_WEB_SEARCH_USD_PER_CALL),
+            )
+        )
+        return round(token_cost + search_cost, 8)
+    except (KeyError, TypeError, ValueError):
+        logger.warning("Invalid pricing rates for model=%s", model)
+        return None
+
+
+def _record_openai_usage(
+    *,
+    stage_name,
+    model,
+    api_kind,
+    usage,
+    request_id=None,
+    web_search_calls=0,
+):
+    """Record exact successful-call usage returned by the OpenAI API."""
+    report = _TURN_USAGE.get()
+    if usage is None:
+        return
+
+    if api_kind == "responses":
+        input_tokens = int(_usage_field(usage, "input_tokens", 0) or 0)
+        output_tokens = int(_usage_field(usage, "output_tokens", 0) or 0)
+        total_tokens = int(
+            _usage_field(usage, "total_tokens", input_tokens + output_tokens)
+            or input_tokens + output_tokens
+        )
+        input_details = _usage_field(usage, "input_tokens_details", {})
+        output_details = _usage_field(usage, "output_tokens_details", {})
+    else:
+        input_tokens = int(_usage_field(usage, "prompt_tokens", 0) or 0)
+        output_tokens = int(_usage_field(usage, "completion_tokens", 0) or 0)
+        total_tokens = int(
+            _usage_field(usage, "total_tokens", input_tokens + output_tokens)
+            or input_tokens + output_tokens
+        )
+        input_details = _usage_field(usage, "prompt_tokens_details", {})
+        output_details = _usage_field(usage, "completion_tokens_details", {})
+
+    cached_input_tokens = int(
+        _usage_field(input_details, "cached_tokens", 0) or 0
+    )
+    reasoning_tokens = int(
+        _usage_field(output_details, "reasoning_tokens", 0) or 0
+    )
+    record = {
+        "stage": str(stage_name),
+        "api": str(api_kind),
+        "model": str(model),
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": total_tokens,
+        "web_search_calls": int(web_search_calls or 0),
+        "request_id": str(request_id) if request_id else None,
+    }
+    record["estimated_cost_usd"] = _estimated_stage_cost_usd(
+        model=model,
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        output_tokens=output_tokens,
+        web_search_calls=web_search_calls,
+    )
+    if report is not None:
+        report["stages"].append(record)
+    logger.info("VASQ_OPENAI_STAGE_USAGE %s", json.dumps(record, sort_keys=True))
+
+
+def _record_prompt_section(name, text, max_tokens=None, model=None):
+    report = _TURN_USAGE.get()
+    if report is None:
+        return
+    item = {
+        "name": str(name),
+        "tokens": count_text_tokens(text, model=model),
+        "counter": "tiktoken" if tiktoken is not None else "conservative_utf8_estimate",
+    }
+    if max_tokens is not None:
+        item["max_tokens"] = int(max_tokens)
+    report["prompt_sections"].append(item)
+
+
+def _begin_turn_usage_report(user_input):
+    report = {
+        "report_version": 1,
+        "turn_id": str(uuid4()),
+        "question_sha256": hashlib.sha256(
+            str(user_input or "").encode("utf-8")
+        ).hexdigest(),
+        "question_characters": len(str(user_input or "")),
+        "started_at_unix": round(time.time(), 3),
+        "stages": [],
+        "prompt_sections": [],
+    }
+    if _env_bool("VASQ_USAGE_INCLUDE_QUESTION", False):
+        report["question"] = str(user_input or "")
+    return report
+
+
+def _finish_turn_usage_report(report, *, status, elapsed_seconds):
+    stages = report.get("stages", [])
+    totals = {
+        key: sum(int(stage.get(key, 0) or 0) for stage in stages)
+        for key in [
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+            "web_search_calls",
+        ]
+    }
+    priced_stages = [
+        stage for stage in stages
+        if stage.get("estimated_cost_usd") is not None
+    ]
+    totals["estimated_cost_usd"] = round(
+        sum(float(stage["estimated_cost_usd"]) for stage in priced_stages),
+        8,
+    )
+    totals["estimated_cost_complete"] = len(priced_stages) == len(stages)
+    report["status"] = str(status)
+    report["elapsed_seconds"] = round(float(elapsed_seconds), 3)
+    report["completed_api_calls"] = len(stages)
+    report["totals"] = totals
+    report["cost_note"] = (
+        "Token counts are exact values returned by the API. Cost is an "
+        "estimate using configured short-context token rates and per-call "
+        "Web Search pricing; billing settings may differ."
+    )
+
+    encoded = json.dumps(report, ensure_ascii=False, sort_keys=True)
+    logger.info("VASQ_OPENAI_TURN_USAGE %s", encoded)
+
+    output_path = os.getenv("VASQ_USAGE_REPORT_PATH", "").strip()
+    if output_path:
+        try:
+            parent = os.path.dirname(os.path.abspath(output_path))
+            os.makedirs(parent, exist_ok=True)
+            with _USAGE_REPORT_FILE_LOCK:
+                with open(output_path, "a", encoding="utf-8") as handle:
+                    handle.write(encoded + "\n")
+        except OSError:
+            logger.exception(
+                "Could not append token-usage report to %s", output_path
+            )
+    return report
 
 
 def _stage_timeout(stage_name, requested_seconds, reserve_seconds=5.0):
@@ -163,6 +553,9 @@ def call_api(
     request_args = {
         "model": model,
         "messages": history,
+        "max_completion_tokens": token_budget(
+            "VASQ_CHAT_MAX_OUTPUT_TOKENS"
+        ),
     }
 
     if functions:
@@ -191,6 +584,14 @@ def call_api(
         max_retries=max_retries,
     ).chat.completions.create(**request_args)
 
+    _record_openai_usage(
+        stage_name=stage_name,
+        model=model,
+        api_kind="chat_completions",
+        usage=getattr(chat_co, "usage", None),
+        request_id=getattr(chat_co, "_request_id", None),
+    )
+
     return chat_co.choices[0].message
 
 
@@ -216,6 +617,9 @@ def call_helper_api(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
+        "max_completion_tokens": token_budget(
+            "VASQ_HELPER_MAX_OUTPUT_TOKENS"
+        ),
     }
 
     # Helper calls are short classification/extraction tasks. GPT-5.6 defaults
@@ -247,10 +651,18 @@ def call_helper_api(
         else _env_int("OPENAI_HELPER_MAX_RETRIES", 1)
     )
     attempt_timeout = max(1.0, resolved_timeout / (resolved_max_retries + 1))
-    return client.with_options(
+    response = client.with_options(
         timeout=attempt_timeout,
         max_retries=resolved_max_retries,
     ).chat.completions.create(**request_args)
+    _record_openai_usage(
+        stage_name=stage_name,
+        model=model,
+        api_kind="chat_completions",
+        usage=getattr(response, "usage", None),
+        request_id=getattr(response, "_request_id", None),
+    )
+    return response
 
 
 logger = logging.getLogger(__name__)
@@ -450,6 +862,7 @@ def run_openai_web_search(
             "tool_choice": "required",
             "include": ["web_search_call.action.sources"],
             "input": search_prompt,
+            "max_output_tokens": token_budget("VASQ_WEB_MAX_OUTPUT_TOKENS"),
         }
 
         # Responses uses the nested `reasoning` request shape. Low effort is
@@ -554,6 +967,18 @@ def run_openai_web_search(
                     getattr(response, "error", None),
                 )
                 return None
+
+        _record_openai_usage(
+            stage_name=stage_name,
+            model=web_model,
+            api_kind="responses",
+            usage=getattr(response, "usage", None),
+            request_id=(
+                getattr(response, "_request_id", None)
+                or getattr(response, "id", None)
+            ),
+            web_search_calls=_count_response_web_search_calls(response),
+        )
 
         result, fallback_urls = _splice_web_search_citations(response)
 
@@ -1493,7 +1918,12 @@ def normalize_filter_interpretations(
             r"\s+",
             " ",
             str(raw.get("rationale", "")).strip(),
-        )[:360]
+        )
+        reason = cap_text_tokens(
+            reason,
+            token_budget("VASQ_FILTER_RATIONALE_TOKENS"),
+            suffix="[…]",
+        )
         reason = re.sub(r"^(?:because|as)\s+", "", reason, flags=re.IGNORECASE)
         reason = re.sub(r"^The\s+", "the ", reason)
         reason = re.sub(r"^This\s+", "this ", reason)
@@ -1788,6 +2218,7 @@ def matrix_expression(
         )
 
     gene_stats = {}
+    gene_cell_type_stats = {}
     gene_plot_scores = {}
     gene_sections = {}
     regional_plot_frames = []
@@ -1797,9 +2228,10 @@ def matrix_expression(
     else:
         effective_cell_indices = MATRIX_META.index.to_numpy()
 
-    # With many genes queried together, the per-gene text below is later
-    # joined and hard-capped by length downstream (cap_source_text on the
-    # full result["text"], applied in _chat_impl before synthesis). A fixed
+    # With many genes queried together, the per-gene compact text below is
+    # token-capped for fallback readability. The final synthesis uses the
+    # separate structured JSON payload built later, not these Markdown tables.
+    # A fixed
     # 40-row table per gene lets the first few genes consume that entire
     # budget, silently cutting every later gene's section down to nothing
     # -- the synthesis model then has no way to know that gene's data
@@ -1847,6 +2279,7 @@ def matrix_expression(
             ["cell_type"],
             min_cells=MIN_CELLS_PER_GROUP,
         )
+        gene_cell_type_stats[gene] = cell_type_stats
         gene_sections[gene] = format_matrix_expression_summary(
             stats,
             gene,
@@ -1945,16 +2378,47 @@ def matrix_expression(
         group_cols=group_cols,
     )
 
+    expression_evidence_payload = build_llm_expression_evidence_payload(
+        genes=present_genes,
+        missing_genes=missing_genes,
+        gene_stats=gene_stats,
+        gene_cell_type_stats=gene_cell_type_stats,
+        group_cols=group_cols,
+        cell_types=cell_types,
+        cell_classes=cell_classes,
+        regions=regions,
+        region_layers=region_layers,
+        filter_interpretations=filter_interpretations,
+        representative_rows_per_gene=rows_per_gene,
+    )
+    expression_evidence_token_budget = token_budget(
+        "VASQ_EXPRESSION_EVIDENCE_TOKENS"
+    )
+    expression_evidence_json = serialize_llm_expression_evidence(
+        expression_evidence_payload,
+        expression_evidence_token_budget,
+        model=os.getenv("OPENAI_MODEL", "gpt-5.6-terra"),
+    )
+    _record_prompt_section(
+        "vasq_expression_evidence_json",
+        expression_evidence_json,
+        max_tokens=expression_evidence_token_budget,
+        model=os.getenv("OPENAI_MODEL", "gpt-5.6-terra"),
+    )
+
     # Cap each gene independently so no early gene can consume the entire
     # synthesis allowance and erase later genes. The deterministic global
     # maximum and cross-region cell-type ranking are placed first in each
     # section, so optional detail rows are what get trimmed first.
-    per_gene_text_limit = max(600, 12000 // gene_count)
+    per_gene_text_limit = max(
+        150,
+        token_budget("VASQ_EXPRESSION_EVIDENCE_TOKENS") // gene_count,
+    )
     all_sections = [
-        cap_text_at_line_boundary(
+        cap_text_at_token_line_boundary(
             gene_sections[g],
             per_gene_text_limit,
-            suffix="[Additional per-gene detail omitted from synthesis text]",
+            suffix="[Additional per-gene detail omitted from compact text]",
         )
         for g in present_genes
         if g in gene_sections
@@ -1962,6 +2426,7 @@ def matrix_expression(
 
     return {
         "text": "\n\n".join(notes + [""] + all_sections),
+        "llm_evidence_json": expression_evidence_json,
         "graph_json": plot_json,
         "expression_table": expression_table,
         "filter_interpretations": filter_interpretations,
@@ -2112,7 +2577,217 @@ def build_expression_table_payload(stats_df, gene_order, group_cols):
         "rows": rows,
         "total_rows": len(rows),
         "minimum_cells_per_group": MIN_CELLS_PER_GROUP,
+        "authoritative_quantitative_result": True,
+        "authority_note": AUTHORITATIVE_EXPRESSION_NOTE,
     }
+
+
+def _expression_row_record(row, dimension_cols):
+    record = {}
+    for col in dimension_cols:
+        value = row.get(col, "")
+        record[col] = "" if pd.isna(value) else str(value)
+    record.update({
+        "mean_log_normalized": round(float(row["mean_expr"]), 6),
+        "expressing_percent": round(100.0 * float(row["pct_expr"]), 2),
+        "n_cells": int(row["n_cells"]),
+    })
+    return record
+
+
+def build_llm_expression_evidence_payload(
+    *,
+    genes,
+    missing_genes,
+    gene_stats,
+    gene_cell_type_stats,
+    group_cols,
+    cell_types,
+    cell_classes,
+    regions,
+    region_layers,
+    filter_interpretations,
+    representative_rows_per_gene,
+):
+    """Build compact JSON evidence; never include the complete UI table."""
+    dimension_labels = {
+        "brain_region": "Brain region",
+        "region_layer": "Region layer",
+        "cell_class": "Cell class",
+        "cell_type": "Cell type",
+    }
+    observed_values = {}
+    for col in group_cols:
+        values = set()
+        for stats in gene_stats.values():
+            if stats is not None and not stats.empty and col in stats.columns:
+                values.update(stats[col].dropna().astype(str).tolist())
+        observed_values[col] = sorted(values)
+
+    payload = {
+        "schema": "vasq_expression_evidence_v1",
+        "evidence_source": "deterministic_local_expression_matrix_calculation",
+        "authority_note": AUTHORITATIVE_EXPRESSION_NOTE,
+        "llm_role": (
+            "Summarize and interpret only these supplied aggregates; do not "
+            "calculate, reconstruct, or invent expression values."
+        ),
+        "complete_table_in_llm_context": False,
+        "measurement_definitions": {
+            "mean_log_normalized": (
+                "Arithmetic mean across all cells in the group, including zeros."
+            ),
+            "expressing_percent": (
+                "Percentage of cells with nonzero expression."
+            ),
+            "n_cells": "Number of cells in the group.",
+        },
+        "minimum_cells_per_group": MIN_CELLS_PER_GROUP,
+        "applied_filters": {
+            "brain_region": regions or "ALL",
+            "region_layer": region_layers or "ALL",
+            "cell_class": cell_classes or "ALL",
+            "cell_type": cell_types or "ALL",
+        },
+        "grouping_dimensions": [
+            {"key": col, "display_name": dimension_labels.get(col, col)}
+            for col in group_cols
+        ],
+        "observed_values_after_filtering": observed_values,
+        "filter_interpretations": filter_interpretations or [],
+        "genes_not_present_in_hvg_matrix": list(missing_genes or []),
+        "genes": [],
+    }
+
+    for gene in genes:
+        stats = gene_stats.get(gene)
+        cell_type_stats = gene_cell_type_stats.get(gene)
+        gene_record = {
+            "gene": gene,
+            "highest_cell_type_pooled_across_regions": None,
+            "highest_requested_comparison_group": None,
+            "representative_comparison_rows": [],
+        }
+
+        if cell_type_stats is not None and not cell_type_stats.empty:
+            ranked_cell_types = cell_type_stats.sort_values(
+                ["mean_expr", "pct_expr", "n_cells"],
+                ascending=[False, False, False],
+            )
+            gene_record["highest_cell_type_pooled_across_regions"] = (
+                _expression_row_record(ranked_cell_types.iloc[0], ["cell_type"])
+            )
+
+        if stats is not None and not stats.empty:
+            ranked = stats.sort_values(
+                ["mean_expr", "pct_expr", "n_cells"],
+                ascending=[False, False, False],
+            )
+            gene_record["eligible_comparison_group_count"] = int(len(ranked))
+            gene_record["highest_requested_comparison_group"] = (
+                _expression_row_record(ranked.iloc[0], group_cols)
+            )
+            representative = select_balanced_expression_rows(
+                stats,
+                group_cols,
+                max_rows=representative_rows_per_gene,
+            )
+            gene_record["representative_comparison_rows"] = [
+                _expression_row_record(row, group_cols)
+                for _, row in representative.iterrows()
+            ]
+
+        payload["genes"].append(gene_record)
+
+    return payload
+
+
+def serialize_llm_expression_evidence(payload, max_tokens, *, model=None):
+    """Serialize valid JSON and shrink optional detail until it fits."""
+    work = copy.deepcopy(payload)
+
+    def encoded():
+        return json.dumps(
+            work,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    serialized = encoded()
+    if count_text_tokens(serialized, model=model) <= max_tokens:
+        return serialized
+
+    # Representative rows are the first thing to remove. The deterministic
+    # peak and pooled top cell type remain for every gene.
+    omitted_rows = 0
+    while count_text_tokens(serialized, model=model) > max_tokens:
+        candidates = [
+            gene for gene in work.get("genes", [])
+            if gene.get("representative_comparison_rows")
+        ]
+        if not candidates:
+            break
+        target = max(
+            candidates,
+            key=lambda gene: len(gene["representative_comparison_rows"]),
+        )
+        target["representative_comparison_rows"].pop()
+        omitted_rows += 1
+        serialized = encoded()
+
+    if omitted_rows:
+        work["token_budget_adjustment"] = {
+            "representative_rows_omitted": omitted_rows,
+            "reason": "expression_evidence_token_budget",
+        }
+        serialized = encoded()
+
+    # Long vocabulary coverage lists are useful context but not quantitative
+    # evidence. Preserve their counts and shorten the lists if necessary.
+    if count_text_tokens(serialized, model=model) > max_tokens:
+        observed = work.get("observed_values_after_filtering", {})
+        work["observed_value_counts"] = {
+            key: len(values) for key, values in observed.items()
+        }
+        for key, values in list(observed.items()):
+            observed[key] = values[:10]
+        work["observed_values_are_complete"] = False
+        serialized = encoded()
+
+    if count_text_tokens(serialized, model=model) > max_tokens:
+        work["observed_values_after_filtering"] = {}
+        work["filter_interpretations"] = [
+            {
+                **item,
+                "rationale": cap_text_tokens(
+                    item.get("rationale", ""),
+                    40,
+                    suffix="[…]",
+                    model=model,
+                ),
+            }
+            for item in work.get("filter_interpretations", [])
+            if isinstance(item, dict)
+        ]
+        serialized = encoded()
+
+    if count_text_tokens(serialized, model=model) > max_tokens:
+        # Last optional reduction: the frontend still receives every complete
+        # row, while the LLM retains only authoritative per-gene headline data.
+        for gene in work.get("genes", []):
+            gene["representative_comparison_rows"] = []
+        serialized = encoded()
+
+    final_tokens = count_text_tokens(serialized, model=model)
+    if final_tokens > max_tokens:
+        logger.warning(
+            "Core expression JSON uses %s tokens, above configured budget=%s; "
+            "keeping valid JSON and every gene instead of truncating it",
+            final_tokens,
+            max_tokens,
+        )
+    return serialized
 
 
 def select_balanced_expression_rows(
@@ -2461,7 +3136,11 @@ def resolve_dataset_entities_with_gpt(
     )
 
     try:
-        response = call_helper_api(system_prompt, user_prompt)
+        response = call_helper_api(
+            system_prompt,
+            user_prompt,
+            stage_name="matrix_entity_resolution",
+        )
 
         raw = response.choices[0].message.content.strip()
         logger.info("GPT dataset entity raw response: %s", raw)
@@ -2601,7 +3280,11 @@ def infer_matrix_hints_from_web_evidence(
         f"Available cell classes: {available_cell_classes}\n\n"
         f"Available brain regions: {available_regions}\n\n"
         f"Available region layers: {available_region_layers}\n\n"
-        f"Literature evidence:\n{cap_source_text(web_result_text, 6000)}"
+        "Literature evidence:\n"
+        + cap_source_text(
+            web_result_text,
+            token_budget("VASQ_MATRIX_HINT_EVIDENCE_TOKENS"),
+        )
     )
 
     try:
@@ -2674,7 +3357,11 @@ def extract_genes(user_input):
     )
 
     try:
-        response = call_helper_api(system_prompt, user_input)
+        response = call_helper_api(
+            system_prompt,
+            user_input,
+            stage_name="explicit_gene_extraction",
+        )
         raw_text = response.choices[0].message.content.strip()
     except Exception:
         # Match the degrade-gracefully pattern used by the other helper/web
@@ -2721,7 +3408,10 @@ def derive_genes_from_first_search(
     if scientific_web_result:
         evidence_parts.append(
             "Web/literature evidence:\n"
-            + cap_source_text(scientific_web_result, 9000)
+            + cap_source_text(
+                scientific_web_result,
+                token_budget("VASQ_GENE_DERIVATION_EVIDENCE_TOKENS"),
+            )
         )
 
     if not evidence_parts:
@@ -2746,7 +3436,11 @@ def derive_genes_from_first_search(
     )
 
     try:
-        response = call_helper_api(system_prompt, user_prompt)
+        response = call_helper_api(
+            system_prompt,
+            user_prompt,
+            stage_name="evidence_gene_derivation",
+        )
         parsed = parse_json_object(response.choices[0].message.content)
         if not parsed:
             raise ValueError("Gene derivation helper returned invalid JSON")
@@ -3534,19 +4228,23 @@ def parse_json_object(raw_text):
 
 
 def recent_conversation_context(
-    history, max_messages=8, max_chars_per_message=800, max_chars=5000
+    history,
+    max_messages=8,
+    max_tokens_per_message=None,
+    max_tokens=None,
 ):
     """Build the short context window analyze_query_intent() uses to resolve
     follow-ups ("what about that gene").
 
-    Each message is capped *individually* before joining. Capping only the
-    joined blob (the previous behavior) let one long assistant reply --
-    a full VasQ table plus a literature review can run several thousand
-    characters -- eat the entire budget on its own, silently dropping the
-    user question that prompted it and every earlier turn. Per-message
-    capping guarantees several recent turns survive regardless of how long
-    any single one of them was.
+    Each message is capped *individually by tokens* before joining. Per-message
+    capping guarantees several recent turns survive regardless of how long any
+    single answer was. The joined context is then capped from the beginning so
+    the most recent messages remain available.
     """
+    max_tokens_per_message = max_tokens_per_message or token_budget(
+        "VASQ_HISTORY_MESSAGE_TOKENS"
+    )
+    max_tokens = max_tokens or token_budget("VASQ_HISTORY_TOTAL_TOKENS")
     messages = []
     for message in (history or [])[-max_messages:]:
         if message.get("role") not in {"user", "assistant"}:
@@ -3554,16 +4252,20 @@ def recent_conversation_context(
         content = str(message.get("content", "")).strip()
         if not content:
             continue
-        if len(content) > max_chars_per_message:
-            content = content[:max_chars_per_message].rstrip() + " […]"
+        content = cap_text_tokens(
+            content,
+            max_tokens_per_message,
+            suffix="[…]",
+        )
         messages.append(f"{message['role']}: {content}")
     combined = "\n".join(messages)
-    # Still cap the overall size as a final safety net, but from the front
-    # now that no single message can dominate it -- keeps the most recent
-    # turns rather than an arbitrary tail cut mid-message.
-    if len(combined) > max_chars:
-        combined = combined[-max_chars:]
-    return combined
+    return cap_text_tokens(
+        combined,
+        max_tokens,
+        suffix="[… earlier context omitted]",
+        line_boundary=True,
+        keep="end",
+    )
 
 
 def parse_final_synthesis_message(message):
@@ -3597,16 +4299,16 @@ def history_entry_from_synthesis(
     user_input,
     final_message,
     generated_summary=None,
-    max_chars=1200,
+    max_tokens=None,
 ):
-    """Bound a bundled history note without making another model request."""
-    max_chars = max(8, int(max_chars))
+    """Token-bound a bundled history note without another model request."""
+    max_tokens = max_tokens or token_budget(
+        "VASQ_STORED_HISTORY_SUMMARY_TOKENS"
+    )
 
     def bounded(text):
         text = " ".join(str(text or "").split())
-        if len(text) <= max_chars:
-            return text
-        return text[: max_chars - 4].rstrip() + " […]"
+        return cap_text_tokens(text, max_tokens, suffix="[…]")
 
     summary = bounded(generated_summary)
     if summary:
@@ -3742,7 +4444,11 @@ def analyze_query_intent(user_input, history=None):
     )
 
     try:
-        response = call_helper_api(system_prompt, user_prompt)
+        response = call_helper_api(
+            system_prompt,
+            user_prompt,
+            stage_name="intent_analysis",
+        )
         raw = response.choices[0].message.content
         parsed = parse_json_object(raw)
         if not parsed:
@@ -3792,15 +4498,38 @@ def retrieved_text_graph_and_table(result):
     return str(result), None, None
 
 
-def cap_source_text(text, limit):
-    text = str(text or "").strip()
-    if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + "\n[Source text truncated]"
+def cap_source_text(text, max_tokens, *, model=None):
+    """Cap one evidence source by model tokens, never by characters."""
+    return cap_text_tokens(
+        text,
+        max_tokens,
+        suffix="[Source text truncated to token budget]",
+        line_boundary=True,
+        model=model,
+    )
+
+
+def cap_text_at_token_line_boundary(
+    text,
+    max_tokens,
+    suffix="[Text truncated to token budget]",
+    *,
+    model=None,
+):
+    return cap_text_tokens(
+        text,
+        max_tokens,
+        suffix=suffix,
+        line_boundary=True,
+        model=model,
+    )
 
 
 def cap_text_at_line_boundary(text, limit, suffix="[Text truncated]"):
-    """Cap text without cutting a Markdown row or consuming another gene."""
+    """Legacy character-based helper retained for external callers/tests.
+
+    Runtime prompt construction uses cap_text_at_token_line_boundary instead.
+    """
     text = str(text or "").strip()
     limit = max(0, int(limit))
     if len(text) <= limit:
@@ -4074,17 +4803,27 @@ def build_partial_response(
         sections.append("Associated genes:\n" + ", ".join(genes))
     if vasq_text:
         sections.append(
-            "VasQ expression results:\n" + cap_source_text(vasq_text, 6000)
+            "VasQ expression results:\n"
+            + cap_source_text(
+                vasq_text,
+                token_budget("VASQ_PARTIAL_EXPRESSION_TOKENS"),
+            )
         )
     if scientific_web_result:
         sections.append(
             "Scientific evidence:\n"
-            + cap_source_text(scientific_web_result, 4000)
+            + cap_source_text(
+                scientific_web_result,
+                token_budget("VASQ_PARTIAL_SCIENTIFIC_TOKENS"),
+            )
         )
     if drug_result:
         sections.append(
             "Drug and small-molecule evidence:\n"
-            + cap_source_text(drug_result, 3000)
+            + cap_source_text(
+                drug_result,
+                token_budget("VASQ_PARTIAL_DRUG_TOKENS"),
+            )
         )
     if len(sections) == 1:
         sections.append(
@@ -4361,6 +5100,11 @@ def _chat_impl(user_input, history, should_stop=None):
     vasq_text, graph_json, expression_table = retrieved_text_graph_and_table(
         vasq_result
     )
+    vasq_llm_evidence_json = (
+        str(vasq_result.get("llm_evidence_json", "") or "")
+        if isinstance(vasq_result, dict)
+        else ""
+    )
 
     # Branch C: optional second Web Search. Only run it when the user actually
     # asked for drugs/therapeutics; a disease or gene alone is not sufficient.
@@ -4405,19 +5149,44 @@ def _chat_impl(user_input, history, should_stop=None):
             + ", ".join(genes)
         )
 
-    if vasq_text:
+    if vasq_llm_evidence_json:
         evidence_parts.append(
-            "VASQ EXPRESSION OR MARKER DATA:\n"
-            + cap_source_text(vasq_text, 15000)
+            "VASQ DETERMINISTIC EXPRESSION EVIDENCE (JSON):\n"
+            + vasq_llm_evidence_json
+        )
+    elif vasq_text:
+        # Compatibility fallback for a non-matrix/legacy result. Current
+        # matrix_expression() always supplies the structured JSON above.
+        expression_budget = token_budget("VASQ_EXPRESSION_EVIDENCE_TOKENS")
+        compact_vasq_text = cap_source_text(vasq_text, expression_budget)
+        _record_prompt_section(
+            "legacy_vasq_expression_text",
+            compact_vasq_text,
+            max_tokens=expression_budget,
+        )
+        evidence_parts.append(
+            "VASQ LEGACY COMPACT EXPRESSION EVIDENCE:\n" + compact_vasq_text
         )
     elif vasq_note:
         evidence_parts.append("VASQ STATUS:\n" + vasq_note)
 
     if not direct_vasq_only:
         if gene_literature_result:
+            literature_budget = token_budget(
+                "VASQ_GENE_LITERATURE_EVIDENCE_TOKENS"
+            )
+            compact_gene_literature = cap_source_text(
+                gene_literature_result,
+                literature_budget,
+            )
+            _record_prompt_section(
+                "gene_literature_evidence",
+                compact_gene_literature,
+                max_tokens=literature_budget,
+            )
             evidence_parts.append(
                 "GENE-BY-GENE SCIENTIFIC LITERATURE EVIDENCE:\n"
-                + cap_source_text(gene_literature_result, 18000)
+                + compact_gene_literature
             )
         else:
             evidence_parts.append(
@@ -4426,9 +5195,21 @@ def _chat_impl(user_input, history, should_stop=None):
             )
 
         if scientific_web_result:
+            scientific_budget = token_budget(
+                "VASQ_PRIMARY_SCIENTIFIC_EVIDENCE_TOKENS"
+            )
+            compact_scientific_evidence = cap_source_text(
+                scientific_web_result,
+                scientific_budget,
+            )
+            _record_prompt_section(
+                "primary_scientific_evidence",
+                compact_scientific_evidence,
+                max_tokens=scientific_budget,
+            )
             evidence_parts.append(
                 "PRIMARY SCIENTIFIC WEB EVIDENCE USED TO IDENTIFY GENES:\n"
-                + cap_source_text(scientific_web_result, 5000)
+                + compact_scientific_evidence
             )
         elif not gene_literature_result:
             evidence_parts.append(
@@ -4437,9 +5218,19 @@ def _chat_impl(user_input, history, should_stop=None):
 
     if not direct_vasq_only and asks_drugs:
         if drug_result:
+            drug_budget = token_budget("VASQ_DRUG_EVIDENCE_TOKENS")
+            compact_drug_evidence = cap_source_text(
+                drug_result,
+                drug_budget,
+            )
+            _record_prompt_section(
+                "drug_evidence",
+                compact_drug_evidence,
+                max_tokens=drug_budget,
+            )
             evidence_parts.append(
                 "DRUG AND SMALL-MOLECULE EVIDENCE:\n"
-                + cap_source_text(drug_result, 7000)
+                + compact_drug_evidence
             )
         else:
             evidence_parts.append(
@@ -4448,6 +5239,7 @@ def _chat_impl(user_input, history, should_stop=None):
             )
 
     evidence_package = "\n\n".join(evidence_parts)
+    _record_prompt_section("final_evidence_package", evidence_package)
 
     synthesis_instruction = {
         "role": "system",
@@ -4484,17 +5276,29 @@ def _chat_impl(user_input, history, should_stop=None):
             "drop any of them. If a claim has no such link, do not "
             "invent one from memory -- state it without a citation. Use VasQ only for measured "
             "brain-vasculature expression claims; distinguish matrix mean "
-            "expression from marker rank/score. When the web/literature "
+            "expression from marker rank/score. The block headed 'VASQ "
+            "DETERMINISTIC EXPRESSION EVIDENCE (JSON)' is the only expression "
+            "evidence available to you. It contains compact aggregates for "
+            "summarization, never the full cell-by-gene matrix or complete "
+            "expression table. Never calculate a value from prose, reconstruct "
+            "an omitted row, or infer a quantitative relationship that is not "
+            "explicitly represented in that JSON. The complete numerical table "
+            "and plots are generated separately by deterministic Python code. "
+            "Include this exact reader-facing statement once in the expression "
+            "section: 'Numerical tables and plots are generated directly from "
+            "the expression matrix and constitute the authoritative quantitative "
+            "results. The LLM-generated text is an interpretive summary of these "
+            "results.' When the web/literature "
             "evidence reports a cell type a gene is known to be associated "
             "with (a marker gene, atlas data, or cell-type-specific "
             "function) and the VasQ matrix also reports that gene's "
-            "measured expression by cell type, use the supplied 'Overall "
-            "cell-type ranking across all matched regions' to decide whether "
+            "measured expression by cell type, use the JSON field "
+            "highest_cell_type_pooled_across_regions to decide whether "
             "the VasQ result agrees or disagrees with the literature-reported "
             "cell type. That ranking is computed directly from all matched "
             "cells and is the authoritative cell-type comparison. Report the "
-            "supplied 'Global maximum among all eligible requested comparison "
-            "groups' separately as the most specific requested-group peak "
+            "JSON field highest_requested_comparison_group separately as the "
+            "most specific requested-group peak "
             "(region-specific when Brain region is one of the dimensions). "
             "When that peak is a single region x cell-type group, do not use "
             "it to decide overall cell-type agreement. Note a discrepancy "
@@ -4523,7 +5327,7 @@ def _chat_impl(user_input, history, should_stop=None):
             "list of incidental database-discovered genes. If gene-specific "
             "evidence is unavailable for one gene, state that only for that "
             "gene. In section (2), do not jump directly from a generic matrix "
-            "description to tables and plots. Before any detailed table, give "
+            "description to the separately generated tables and plots. Give "
             "every analyzed gene one concise interpretation bullet stating "
             "its top overall VasQ cell type, its most specific requested-group "
             "peak, and whether the cell-type result agrees with the cited "
@@ -4535,9 +5339,9 @@ def _chat_impl(user_input, history, should_stop=None):
             "Preserve every "
             "comparison dimension present in the VasQ "
             "table and never merge distinct region layers, cell types, or brain "
-            "regions. Treat the supplied 'Applied matrix filters' line as the "
+            "regions. Treat the JSON applied_filters object as the "
             "authoritative record of which filters were actually used. Treat "
-            "a supplied 'SEMANTIC FILTER INTERPRETATION' block as mandatory "
+            "each JSON filter_interpretations item as mandatory "
             "reader-facing context. Before stating any expression conclusion, "
             "explicitly explain the user's functional phrase, which exact "
             "VasQ label or labels it was mapped to, why that biological and "
@@ -4546,13 +5350,17 @@ def _chat_impl(user_input, history, should_stop=None):
             "region' to 'hippocampal' without showing this reasoning. Use the "
             "heading 'How the request was interpreted' for that explanation. "
             "Treat "
-            "the supplied 'Observed comparison values' list as authoritative "
+            "the JSON observed_values_after_filtering lists as authoritative "
             "coverage: never claim that a value such as White Matter Tracts is "
             "absent when it appears in that list, even if a capped detail table "
-            "shows only some rows. Use reader-facing dimension columns named Brain region, "
-            "Region layer, Cell class, and Cell type when each is present, "
-            "followed by Mean expression (log-normalized), Expressing cells, "
-            "and Cells analyzed (n). Never reconstruct, infer, or display a "
+            "shows only some representative rows. Do not reproduce a detailed "
+            "expression table in the narrative; the complete authoritative "
+            "table is returned separately. A compact summary table is allowed "
+            "only when every displayed value appears explicitly in the JSON. "
+            "Use reader-facing dimension names Brain region, Region layer, Cell "
+            "class, and Cell type when present, followed by Mean expression "
+            "(log-normalized), Expressing cells, and Cells analyzed (n). Never "
+            "reconstruct, infer, or display a "
             f"group with fewer than {MIN_CELLS_PER_GROUP} cells. Convert "
             "pct_expr fractions to percentages (for "
             "example, 0.15 becomes 15.0%); never expose pct_expr or n as "
@@ -4580,7 +5388,11 @@ def _chat_impl(user_input, history, should_stop=None):
     # past turns synthesis rereads every time -- a safety net for very long
     # sessions, on top of (not instead of) storing summaries rather than raw
     # answers.
-    max_synthesis_history = _env_int("VASQ_SYNTHESIS_HISTORY_MESSAGES", 20)
+    max_synthesis_history = _env_positive_int(
+        "VASQ_SYNTHESIS_HISTORY_MESSAGES",
+        20,
+        maximum=100,
+    )
     if history and history[0].get("role") == "system":
         past_turns = history[1:]
         if len(past_turns) > max_synthesis_history:
@@ -4599,6 +5411,10 @@ def _chat_impl(user_input, history, should_stop=None):
             + evidence_package
         ),
     })
+    _record_prompt_section(
+        "final_synthesis_messages_local_estimate",
+        json.dumps(synthesis_messages, ensure_ascii=False),
+    )
 
     _raise_if_cancelled(should_stop)
     generated_history_summary = None
@@ -4669,15 +5485,22 @@ def chat(user_input, history, should_stop=None):
     """Run one synchronous chat turn inside a hard wall-clock budget."""
     budget_seconds = _env_float("VASQ_TURN_BUDGET_SECONDS", 600)
     started_at = time.monotonic()
+    usage_report = _begin_turn_usage_report(user_input)
+    usage_token = _TURN_USAGE.set(usage_report)
     deadline_token = _TURN_DEADLINE.set(started_at + budget_seconds)
+    turn_status = "failed"
     logger.info("VasQ turn started budget=%.1fs", budget_seconds)
 
     try:
-        return _chat_impl(user_input, history, should_stop=should_stop)
+        result = _chat_impl(user_input, history, should_stop=should_stop)
+        turn_status = "completed"
+        return result
     except ChatCancelled:
+        turn_status = "cancelled"
         logger.info("VasQ turn stopped by user")
         raise
     except Exception:
+        turn_status = "failed_with_fallback"
         logger.exception("VasQ turn failed before a normal response was produced")
         safe_history = history if history is not None else []
         if not any(
@@ -4694,5 +5517,11 @@ def chat(user_input, history, should_stop=None):
         return fallback, safe_history, None, None
     finally:
         elapsed = time.monotonic() - started_at
+        _finish_turn_usage_report(
+            usage_report,
+            status=turn_status,
+            elapsed_seconds=elapsed,
+        )
         logger.info("VasQ turn finished elapsed=%.1fs", elapsed)
+        _TURN_USAGE.reset(usage_token)
         _TURN_DEADLINE.reset(deadline_token)
