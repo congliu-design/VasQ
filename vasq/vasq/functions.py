@@ -410,7 +410,8 @@ def run_openai_web_search(
         )
         logger.info(
             "Calling OpenAI Web Search stage=%s model=%s context=%s "
-            "timeout=%.1fs background=%s spoke_policy=consider_when_relevant",
+            "timeout=%.1fs background=%s "
+            "database_policy=select_authoritative_sources_by_question_type",
             stage_name,
             web_model,
             search_context_size,
@@ -551,19 +552,36 @@ def run_openai_web_search(
             flags=re.IGNORECASE,
         )
 
-        def _is_spoke_url(url):
+        def _database_source_name(url):
             try:
                 host = (urlparse(url).hostname or "").lower().rstrip(".")
+                path = (urlparse(url).path or "").lower()
             except Exception:
-                return False
-            return host in {"spoke.rbvi.ucsf.edu", "spoke.ucsf.edu"}
+                return None
 
-        spoke_evidence_used = any(
-            _is_spoke_url(url)
+            if host == "opentargets.org" or host.endswith(".opentargets.org"):
+                return "OpenTargets"
+            if (
+                host == "monarchinitiative.org"
+                or host.endswith(".monarchinitiative.org")
+            ):
+                return "Monarch"
+            if host == "reactome.org" or host.endswith(".reactome.org"):
+                return "Reactome"
+            if host == "ebi.ac.uk" or host.endswith(".ebi.ac.uk"):
+                if "chembl" in host or path.startswith("/chembl"):
+                    return "ChEMBL"
+                if "gwas" in host or path.startswith("/gwas"):
+                    return "GWASCatalog"
+            return None
+
+        database_sources_used = sorted({
+            source_name
             for url in claim_bound_urls
-        )
-        non_spoke_evidence_used = any(
-            not _is_spoke_url(url)
+            if (source_name := _database_source_name(url))
+        })
+        other_web_evidence_used = any(
+            _database_source_name(url) is None
             for url in claim_bound_urls
         )
 
@@ -578,11 +596,11 @@ def run_openai_web_search(
 
         logger.info(
             "OpenAI Web Search succeeded stage=%s result_length=%s "
-            "spoke_evidence_used=%s non_spoke_evidence_used=%s request_id=%s",
+            "database_evidence_used=%s other_web_evidence_used=%s request_id=%s",
             stage_name,
             len(result),
-            spoke_evidence_used,
-            non_spoke_evidence_used,
+            database_sources_used or ["none"],
+            other_web_evidence_used,
             getattr(response, "_request_id", None),
         )
         return result
@@ -616,7 +634,7 @@ def search_openai_web(user_input):
         "question. Prioritize peer-reviewed literature, PubMed, FDA, "
         "ClinicalTrials.gov, and authoritative medical sources. "
         "Provide source citations. "
-        + _SPOKE_SOURCE_INSTRUCTION
+        + _BIOMEDICAL_DATABASE_SOURCE_INSTRUCTION
         + "\n\n"
         f"Question: {user_input}",
         stage_name="generic_biomedical_web_search",
@@ -640,29 +658,28 @@ _STRICT_SOURCE_INSTRUCTION = (
 )
 
 
-_SPOKE_SOURCE_INSTRUCTION = (
+_BIOMEDICAL_DATABASE_SOURCE_INSTRUCTION = (
     "For questions involving relationships among genes, proteins, diseases, "
     "compounds or drugs, pathways, biological processes, tissues, or cell "
-    "types, consider the official SPOKE knowledge graph "
-    "(https://spoke.rbvi.ucsf.edu/) as an optional supplementary discovery "
-    "source. Attempt to use SPOKE only through an official SPOKE page or API "
-    "result that is directly accessible during this search. SPOKE is not a "
-    "required source: if its website or graph API is unavailable, errors, or "
-    "does not expose an inspectable relationship, continue with the original "
-    "source databases and primary literature without delaying or weakening "
-    "the answer. Even when SPOKE returns relevant data, do not stop searching: "
-    "independently search non-SPOKE authoritative sources such as PubMed, the "
-    "underlying source database, FDA, ClinicalTrials.gov, GWAS Catalog, ChEMBL, "
-    "or another appropriate primary source. Never claim that SPOKE supports a "
-    "relationship unless that relationship was directly retrieved in this "
-    "search. Treat SPOKE graph relationships as associations rather than proof "
-    "of causality. A directly retrieved SPOKE relationship may be reported "
-    "without requiring a separate corroborating source. The independent "
-    "non-SPOKE search is still required to broaden the evidence and obtain "
-    "current literature, regulatory, and clinical information; absence of a "
-    "matching non-SPOKE citation does not invalidate a returned SPOKE graph "
-    "relationship. Use primary regulatory and trial sources, rather than "
-    "SPOKE alone, for current approval, clinical-development status, and "
+    "types, select supplementary databases by question type. Prioritize Open "
+    "Targets and Monarch for gene- or target-disease relationships; GWAS "
+    "Catalog for human genetic and variant-trait associations; ChEMBL for "
+    "compound-target binding, mechanism, bioactivity, and drug-development "
+    "records; and Reactome for curated pathways and molecular processes. Use "
+    "only an official database page or API result that is directly accessible "
+    "during this search, and cite the exact retrieved page near the supported "
+    "claim. These databases are supplementary discovery sources, not mandatory "
+    "sources. If one is unavailable or exposes no inspectable result, continue "
+    "with the other appropriate databases, PubMed, primary literature, FDA, "
+    "and ClinicalTrials.gov without delaying or weakening the answer. Do not "
+    "stop after finding a database record: continue searching other relevant "
+    "authoritative websites and primary literature. Treat target-disease and "
+    "genetic associations as associations rather than proof of causality unless "
+    "the retrieved evidence establishes causality. Treat ChEMBL bioactivity as "
+    "experimental target evidence rather than proof of clinical efficacy, and "
+    "Reactome pathway membership as functional context rather than proof of a "
+    "disease relationship. Use FDA, EMA, ClinicalTrials.gov, or another primary "
+    "regulatory or trial source for current approval, development status, and "
     "clinical-benefit claims. "
 )
 
@@ -690,7 +707,7 @@ def search_scientific_web(user_input):
         "Search the live web to answer this biomedical question. "
         + pathway_instruction
         + _STRICT_SOURCE_INSTRUCTION
-        + _SPOKE_SOURCE_INSTRUCTION
+        + _BIOMEDICAL_DATABASE_SOURCE_INSTRUCTION
         + "Provide source citations and distinguish established evidence from "
         "hypotheses. Search from the original question directly.\n\n"
         + f"Question: {user_input}",
@@ -749,7 +766,7 @@ def search_gene_literature_evidence(user_input, genes, diseases=None):
             "omitting the gene or borrowing a citation from another gene. "
             "Keep the result compact enough that all genes retain coverage. "
             + _STRICT_SOURCE_INSTRUCTION
-            + _SPOKE_SOURCE_INSTRUCTION
+            + _BIOMEDICAL_DATABASE_SOURCE_INSTRUCTION
             + "\n\nExact genes: "
             + ", ".join(genes)
             + f"\n\nOriginal question: {user_input}"
@@ -772,7 +789,7 @@ def search_gene_fallback(user_input):
             "evidence and citations from authoritative genetics resources "
             "or peer-reviewed literature. Do not invent associations.\n\n"
             + _STRICT_SOURCE_INSTRUCTION
-            + _SPOKE_SOURCE_INSTRUCTION
+            + _BIOMEDICAL_DATABASE_SOURCE_INSTRUCTION
             + f"\nQuestion: {user_input}"
         ),
         stage_name="gene_fallback_web_search",
@@ -809,7 +826,7 @@ def search_drugs_and_small_molecules(user_input, genes=None, diseases=None):
         "FDA/EMA labels, ClinicalTrials.gov, PubMed, peer-reviewed literature, "
         "and authoritative company trial records. "
         + _STRICT_SOURCE_INSTRUCTION
-        + _SPOKE_SOURCE_INSTRUCTION
+        + _BIOMEDICAL_DATABASE_SOURCE_INSTRUCTION
         + "Use current information, "
         "provide source citations, and explicitly state when no reliable "
         "direct small-molecule match is found.\n\n"
@@ -3759,8 +3776,9 @@ _DEFAULT_CITATION_DOMAINS = {
     "www.uniprot.org",
     "proteinatlas.org",
     "www.proteinatlas.org",
-    "spoke.rbvi.ucsf.edu",
-    "spoke.ucsf.edu",
+    "opentargets.org",
+    "monarchinitiative.org",
+    "reactome.org",
     "ebi.ac.uk",
     "www.ebi.ac.uk",
 }
@@ -4089,9 +4107,10 @@ def _chat_impl(user_input, history, should_stop=None):
     scientific_web_result = None
 
     # Branch A: unless this is a direct VasQ-only request, run a
-    # function/pathway-oriented Web Search. The search prompt considers SPOKE
-    # when relevant, but SPOKE is optional and must not block primary-source
-    # retrieval when its public graph API is unavailable.
+    # function/pathway-oriented Web Search. The prompt selects Open Targets,
+    # Monarch, GWAS Catalog, ChEMBL, and Reactome by question type, while
+    # keeping every database optional so primary-source retrieval is not
+    # blocked by an unavailable database.
     if direct_vasq_only:
         logger.info(
             "Direct VasQ matrix request detected; skipping OpenAI Web Search"
@@ -4361,16 +4380,17 @@ def _chat_impl(user_input, history, should_stop=None):
             "package supplied after the conversation. Integrate only relevant "
             "evidence. When SOURCE SCOPE says VasQ matrix data only, do not "
             "introduce external scientific claims and do not imply "
-            "that external sources were searched. Treat knowledge-graph "
-            "relationships retrieved through Web Search, including SPOKE "
-            "relationships, as associations rather than proof of causality. "
-            "A SPOKE relationship that was directly retrieved and cited may be "
-            "used without requiring a matching non-SPOKE citation. Do not "
-            "discard or label it uncorroborated solely because independent "
-            "corroboration was not returned. Integrate additional non-SPOKE "
-            "evidence whenever it is supplied, and use primary regulatory or "
-            "trial sources for current approval, clinical-development status, "
-            "and clinical-benefit claims. Use web/literature evidence for current "
+            "that external sources were searched. Treat target-disease and "
+            "genetic associations retrieved from Open Targets, Monarch, or "
+            "GWAS Catalog as associations rather than proof of causality unless "
+            "the supplied evidence establishes causality. Treat ChEMBL "
+            "bioactivity as experimental target evidence rather than proof of "
+            "clinical efficacy, and Reactome pathway membership as functional "
+            "context rather than proof of a disease relationship. Integrate "
+            "additional literature and authoritative database evidence whenever "
+            "it is supplied, and use primary regulatory or trial sources for "
+            "current approval, clinical-development status, and clinical-benefit "
+            "claims. Use web/literature evidence for current "
             "function, pathway, mechanism, clinical-stage, and regulatory "
             "claims, and preserve its citations. The evidence text may "
             "already contain complete markdown links, e.g. "
@@ -4423,8 +4443,8 @@ def _chat_impl(user_input, history, should_stop=None):
             "function or cell-type context. Preserve at least one exact inline "
             "literature link for each gene whenever its gene-by-gene evidence "
             "supplies one. Do not replace these gene-specific explanations "
-            "with one generic knowledge-graph paragraph, and do not append a "
-            "larger list of incidental SPOKE or knowledge-graph genes. If gene-specific "
+            "with one generic database paragraph, and do not append a larger "
+            "list of incidental database-discovered genes. If gene-specific "
             "evidence is unavailable for one gene, state that only for that "
             "gene. In section (2), do not jump directly from a generic matrix "
             "description to tables and plots. Before any detailed table, give "
