@@ -393,6 +393,7 @@ def run_openai_web_search(
     *,
     stage_name="web_search",
     search_context_size="high",
+    allowed_domains=None,
 ):
     try:
         timeout_seconds = _stage_timeout(
@@ -408,26 +409,44 @@ def run_openai_web_search(
         http_timeout = _env_float(
             "OPENAI_WEB_HTTP_TIMEOUT_SECONDS", 30, minimum=5
         )
+        normalized_allowed_domains = list(dict.fromkeys(
+            str(domain).strip().lower()
+            .removeprefix("https://")
+            .removeprefix("http://")
+            .rstrip("/")
+            for domain in (allowed_domains or [])
+            if str(domain).strip()
+        ))
+
         logger.info(
             "Calling OpenAI Web Search stage=%s model=%s context=%s "
             "timeout=%.1fs background=%s "
-            "database_policy=select_authoritative_sources_by_question_type",
+            "database_policy=select_authoritative_sources_by_question_type "
+            "allowed_domains=%s",
             stage_name,
             web_model,
             search_context_size,
             timeout_seconds,
             use_background,
+            normalized_allowed_domains or ["unrestricted"],
         )
+
+        web_search_tool = {
+            "type": "web_search",
+            "search_context_size": search_context_size,
+            "external_web_access": True,
+        }
+        if normalized_allowed_domains:
+            # Domain filters are supported by the Responses API web_search
+            # tool. Restrict only the stage that explicitly requests them;
+            # scientific and gene searches remain open-web searches.
+            web_search_tool["filters"] = {
+                "allowed_domains": normalized_allowed_domains,
+            }
 
         request_args = {
             "model": web_model,
-            "tools": [
-                {
-                    "type": "web_search",
-                    "search_context_size": search_context_size,
-                    "external_web_access": True,
-                }
-            ],
+            "tools": [web_search_tool],
             "tool_choice": "required",
             "include": ["web_search_call.action.sources"],
             "input": search_prompt,
@@ -568,6 +587,13 @@ def run_openai_web_search(
                 return "Monarch"
             if host == "reactome.org" or host.endswith(".reactome.org"):
                 return "Reactome"
+            if (
+                host == "guidetopharmacology.org"
+                or host.endswith(".guidetopharmacology.org")
+            ):
+                return "GuideToPharmacology"
+            if host == "pubchem.ncbi.nlm.nih.gov":
+                return "PubChem"
             if host == "ebi.ac.uk" or host.endswith(".ebi.ac.uk"):
                 if "chembl" in host or path.startswith("/chembl"):
                     return "ChEMBL"
@@ -585,6 +611,23 @@ def run_openai_web_search(
             for url in claim_bound_urls
         )
 
+        def _source_domain(url):
+            try:
+                return (urlparse(url).hostname or "").lower().rstrip(".")
+            except Exception:
+                return ""
+
+        claim_evidence_domains = sorted({
+            domain
+            for url in claim_bound_urls
+            if (domain := _source_domain(url))
+        })
+        consulted_domains = sorted({
+            domain
+            for url in fallback_urls
+            if (domain := _source_domain(url))
+        })
+
         if fallback_urls:
             result += (
                 "\n\nOther sources the search tool consulted, not tied to a "
@@ -596,11 +639,14 @@ def run_openai_web_search(
 
         logger.info(
             "OpenAI Web Search succeeded stage=%s result_length=%s "
-            "database_evidence_used=%s other_web_evidence_used=%s request_id=%s",
+            "database_evidence_used=%s other_web_evidence_used=%s "
+            "claim_evidence_domains=%s consulted_domains=%s request_id=%s",
             stage_name,
             len(result),
             database_sources_used or ["none"],
             other_web_evidence_used,
+            claim_evidence_domains or ["none"],
+            consulted_domains or ["none"],
             getattr(response, "_request_id", None),
         )
         return result
@@ -665,7 +711,9 @@ _BIOMEDICAL_DATABASE_SOURCE_INSTRUCTION = (
     "Targets and Monarch for gene- or target-disease relationships; GWAS "
     "Catalog for human genetic and variant-trait associations; ChEMBL for "
     "compound-target binding, mechanism, bioactivity, and drug-development "
-    "records; and Reactome for curated pathways and molecular processes. Use "
+    "records; Guide to Pharmacology for curated ligand-target and mechanism "
+    "information; PubChem for compound identity and bioactivity records; and "
+    "Reactome for curated pathways and molecular processes. Use "
     "only an official database page or API result that is directly accessible "
     "during this search, and cite the exact retrieved page near the supported "
     "claim. These databases are supplementary discovery sources, not mandatory "
@@ -681,6 +729,27 @@ _BIOMEDICAL_DATABASE_SOURCE_INSTRUCTION = (
     "disease relationship. Use FDA, EMA, ClinicalTrials.gov, or another primary "
     "regulatory or trial source for current approval, development status, and "
     "clinical-benefit claims. "
+)
+
+
+# Drug Search is deliberately constrained to a broad set of authoritative
+# drug, target, publication, trial, and regulatory sources. This makes source
+# selection observable and reproducible without relying on the model to obey a
+# prompt-only preference. The list still spans multiple independent websites;
+# it is not a single-database search. Domain filtering includes subdomains.
+_DRUG_SEARCH_ALLOWED_DOMAINS = (
+    # Structured drug/target resources.
+    "ebi.ac.uk",                  # ChEMBL
+    "opentargets.org",           # Open Targets Platform
+    "guidetopharmacology.org",   # IUPHAR/BPS Guide to Pharmacology
+    "pubchem.ncbi.nlm.nih.gov",  # PubChem
+    # Primary literature and clinical/regulatory evidence.
+    "pubmed.ncbi.nlm.nih.gov",
+    "clinicaltrials.gov",
+    "fda.gov",
+    "dailymed.nlm.nih.gov",
+    "ema.europa.eu",
+    "pmda.go.jp",
 )
 
 
@@ -823,8 +892,14 @@ def search_drugs_and_small_molecules(user_input, genes=None, diseases=None):
         "a disease treatment as directly targeting a gene unless the evidence "
         "supports that relationship. Distinguish small molecules from "
         "antibodies, nucleic-acid therapies, and other modalities. Prioritize "
-        "FDA/EMA labels, ClinicalTrials.gov, PubMed, peer-reviewed literature, "
-        "and authoritative company trial records. "
+        "ChEMBL, Open Targets, Guide to Pharmacology, and PubChem for "
+        "structured drug-target evidence, and FDA/EMA/PMDA labels, DailyMed, "
+        "ClinicalTrials.gov, and PubMed for regulatory, clinical, and "
+        "peer-reviewed evidence. Actively check both source groups when they "
+        "are relevant. If a structured database has no record for a biologic, "
+        "fusion protein, or delivery platform, say so briefly and continue "
+        "with the regulatory, trial, and literature sources rather than "
+        "inventing a database match. "
         + _STRICT_SOURCE_INSTRUCTION
         + _BIOMEDICAL_DATABASE_SOURCE_INSTRUCTION
         + "Use current information, "
@@ -836,6 +911,7 @@ def search_drugs_and_small_molecules(user_input, genes=None, diseases=None):
         # Drug searches can fan out across many entities. Medium context keeps
         # the optional branch bounded; override via env when high is required.
         search_context_size=os.getenv("OPENAI_DRUG_SEARCH_CONTEXT_SIZE", "medium"),
+        allowed_domains=_DRUG_SEARCH_ALLOWED_DOMAINS,
     )
 
 
