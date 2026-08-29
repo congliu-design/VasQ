@@ -422,49 +422,6 @@ def _record_openai_usage(
     logger.info("VASQ_OPENAI_STAGE_USAGE %s", json.dumps(record, sort_keys=True))
 
 
-def _begin_web_search_event(stage_name, model):
-    """Track Web Search attempts even when no final usage object is returned.
-
-    The Responses API can remain queued until our stage deadline and then be
-    cancelled. Those attempts previously disappeared from the turn report,
-    making a timed-out search look as though no search had been attempted.
-    """
-    report = _TURN_USAGE.get()
-    if report is None:
-        return None
-    event = {
-        "stage": str(stage_name),
-        "model": str(model),
-        "status": "started",
-        "started_at_unix": round(time.time(), 3),
-    }
-    report.setdefault("search_events", []).append(event)
-    return event
-
-
-def _finish_web_search_event(event, status, started_at, **details):
-    if event is None:
-        return
-    event["status"] = str(status)
-    event["elapsed_seconds"] = round(
-        max(0.0, time.monotonic() - started_at),
-        3,
-    )
-    for key, value in details.items():
-        if value is not None:
-            event[str(key)] = value
-
-
-def latest_web_search_status(stage_name):
-    report = _TURN_USAGE.get()
-    if report is None:
-        return None
-    for event in reversed(report.get("search_events", [])):
-        if event.get("stage") == stage_name:
-            return str(event.get("status") or "unknown")
-    return None
-
-
 def _record_prompt_section(name, text, max_tokens=None, model=None):
     report = _TURN_USAGE.get()
     if report is None:
@@ -489,7 +446,6 @@ def _begin_turn_usage_report(user_input):
         "question_characters": len(str(user_input or "")),
         "started_at_unix": round(time.time(), 3),
         "stages": [],
-        "search_events": [],
         "prompt_sections": [],
     }
     if _env_bool("VASQ_USAGE_INCLUDE_QUESTION", False):
@@ -499,7 +455,6 @@ def _begin_turn_usage_report(user_input):
 
 def _finish_turn_usage_report(report, *, status, elapsed_seconds):
     stages = report.get("stages", [])
-    search_events = report.get("search_events", [])
     totals = {
         key: sum(int(stage.get(key, 0) or 0) for stage in stages)
         for key in [
@@ -519,37 +474,15 @@ def _finish_turn_usage_report(report, *, status, elapsed_seconds):
         sum(float(stage["estimated_cost_usd"]) for stage in priced_stages),
         8,
     )
-    unmeasured_search_attempt = any(
-        event.get("status") != "completed"
-        for event in search_events
-    )
-    totals["estimated_cost_complete"] = (
-        len(priced_stages) == len(stages)
-        and not unmeasured_search_attempt
-    )
-    completed_searches = sum(
-        event.get("status") == "completed"
-        for event in search_events
-    )
-    if not search_events:
-        report["retrieval_status"] = "not_requested"
-    elif completed_searches == len(search_events):
-        report["retrieval_status"] = "completed"
-    elif completed_searches:
-        report["retrieval_status"] = "partial"
-    else:
-        report["retrieval_status"] = "failed"
+    totals["estimated_cost_complete"] = len(priced_stages) == len(stages)
     report["status"] = str(status)
     report["elapsed_seconds"] = round(float(elapsed_seconds), 3)
     report["completed_api_calls"] = len(stages)
-    report["web_search_attempts"] = len(search_events)
     report["totals"] = totals
     report["cost_note"] = (
         "Token counts are exact values returned by the API. Cost is an "
         "estimate using configured short-context token rates and per-call "
-        "Web Search pricing; billing settings may differ. When "
-        "estimated_cost_complete is false, at least one attempted search "
-        "returned no final usage object and may be absent from this estimate."
+        "Web Search pricing; billing settings may differ."
     )
 
     encoded = json.dumps(report, ensure_ascii=False, sort_keys=True)
@@ -875,28 +808,14 @@ def run_openai_web_search(
     allowed_domains=None,
     model=None,
     reasoning_effort=None,
-    timeout_seconds=None,
-    reserve_seconds=None,
 ):
-    web_model = model or os.getenv("OPENAI_WEB_MODEL", "gpt-5.6-sol")
-    search_started_at = time.monotonic()
-    search_event = _begin_web_search_event(stage_name, web_model)
     try:
-        requested_timeout = (
-            float(timeout_seconds)
-            if timeout_seconds is not None
-            else _env_float("OPENAI_WEB_TIMEOUT_SECONDS", 600)
-        )
-        resolved_reserve = (
-            float(reserve_seconds)
-            if reserve_seconds is not None
-            else _env_float("VASQ_SYNTHESIS_RESERVE_SECONDS", 50)
-        )
-        stage_timeout_seconds = _stage_timeout(
+        timeout_seconds = _stage_timeout(
             stage_name,
-            requested_timeout,
-            reserve_seconds=resolved_reserve,
+            _env_float("OPENAI_WEB_TIMEOUT_SECONDS", 600),
+            reserve_seconds=_env_float("VASQ_SYNTHESIS_RESERVE_SECONDS", 50),
         )
+        web_model = model or os.getenv("OPENAI_WEB_MODEL", "gpt-5.6-sol")
         use_background = _env_bool("OPENAI_WEB_BACKGROUND", True)
         poll_interval = _env_float(
             "OPENAI_WEB_POLL_INTERVAL_SECONDS", 2, minimum=0.5
@@ -921,7 +840,7 @@ def run_openai_web_search(
             stage_name,
             web_model,
             search_context_size,
-            stage_timeout_seconds,
+            timeout_seconds,
             use_background,
             normalized_allowed_domains or ["unrestricted"],
         )
@@ -967,14 +886,14 @@ def run_openai_web_search(
             # A background create/retrieve request should return quickly. The
             # much longer scientific-search limit is enforced by the polling
             # deadline below, rather than by one fragile HTTP connection.
-            timeout=min(stage_timeout_seconds, http_timeout)
+            timeout=min(timeout_seconds, http_timeout)
             if use_background
-            else stage_timeout_seconds,
+            else timeout_seconds,
             # A Web Search retry can repeat a large and expensive tool call.
             # Default to no retry; it can be enabled explicitly if desired.
             max_retries=_env_int("OPENAI_WEB_MAX_RETRIES", 0),
         )
-        stage_deadline = time.monotonic() + stage_timeout_seconds
+        stage_deadline = time.monotonic() + timeout_seconds
         response = web_client.responses.create(**request_args)
 
         if use_background:
@@ -984,15 +903,7 @@ def run_openai_web_search(
                     "OpenAI Web Search background response has no id stage=%s",
                     stage_name,
                 )
-                _finish_web_search_event(
-                    search_event,
-                    "invalid_response",
-                    search_started_at,
-                )
                 return None
-
-            if search_event is not None:
-                search_event["response_id"] = str(response_id)
 
             logger.info(
                 "OpenAI Web Search background task submitted stage=%s "
@@ -1019,15 +930,9 @@ def run_openai_web_search(
                     logger.warning(
                         "OpenAI Web Search reached its %.1fs stage deadline "
                         "stage=%s response_id=%s",
-                        stage_timeout_seconds,
+                        timeout_seconds,
                         stage_name,
                         response_id,
-                    )
-                    _finish_web_search_event(
-                        search_event,
-                        "timed_out",
-                        search_started_at,
-                        response_id=str(response_id),
                     )
                     return None
 
@@ -1067,13 +972,6 @@ def run_openai_web_search(
                     status,
                     getattr(response, "error", None),
                 )
-                _finish_web_search_event(
-                    search_event,
-                    "incomplete",
-                    search_started_at,
-                    response_id=str(response_id),
-                    response_status=str(status or "unknown"),
-                )
                 return None
 
         _record_openai_usage(
@@ -1092,11 +990,6 @@ def run_openai_web_search(
 
         if not result:
             logger.warning("OpenAI Web Search returned no text")
-            _finish_web_search_event(
-                search_event,
-                "no_text",
-                search_started_at,
-            )
             return None
 
         claim_bound_result = result.split(
@@ -1187,32 +1080,16 @@ def run_openai_web_search(
             consulted_domains or ["none"],
             getattr(response, "_request_id", None),
         )
-        _finish_web_search_event(
-            search_event,
-            "completed",
-            search_started_at,
-            web_search_calls=_count_response_web_search_calls(response),
-        )
         return result
 
     except TurnBudgetExceeded as exc:
         logger.warning("OpenAI Web Search skipped: %s", exc)
-        _finish_web_search_event(
-            search_event,
-            "skipped_budget",
-            search_started_at,
-        )
         return None
     except openai.APITimeoutError:
         logger.warning(
             "OpenAI Web Search timed out stage=%s; continuing with partial evidence",
             stage_name,
             exc_info=True,
-        )
-        _finish_web_search_event(
-            search_event,
-            "timed_out",
-            search_started_at,
         )
         return None
     except (openai.APIConnectionError, openai.RateLimitError):
@@ -1221,19 +1098,9 @@ def run_openai_web_search(
             stage_name,
             exc_info=True,
         )
-        _finish_web_search_event(
-            search_event,
-            "unavailable",
-            search_started_at,
-        )
         return None
     except Exception:
         logger.exception("OpenAI Web Search failed stage=%s", stage_name)
-        _finish_web_search_event(
-            search_event,
-            "failed",
-            search_started_at,
-        )
         return None
 
 
@@ -1317,7 +1184,7 @@ _DRUG_SEARCH_ALLOWED_DOMAINS = (
 )
 
 
-def search_scientific_web(user_input, *, reserve_seconds=None):
+def search_scientific_web(user_input):
     """First search: establish scientific knowledge and candidate genes."""
     pathway_instruction = (
         "Pay particular attention to molecular function, biological pathways, "
@@ -1348,20 +1215,10 @@ def search_scientific_web(user_input, *, reserve_seconds=None):
         search_context_size=os.getenv(
             "OPENAI_SCIENTIFIC_SEARCH_CONTEXT_SIZE", "medium"
         ),
-        timeout_seconds=_env_float(
-            "OPENAI_SCIENTIFIC_TIMEOUT_SECONDS", 120
-        ),
-        reserve_seconds=reserve_seconds,
     )
 
 
-def search_gene_literature_evidence(
-    user_input,
-    genes,
-    diseases=None,
-    *,
-    reserve_seconds=None,
-):
+def search_gene_literature_evidence(user_input, genes, diseases=None):
     """Retrieve compact, cited evidence for every prioritized expression gene.
 
     The primary search runs before the final gene list exists, so it is good at
@@ -1422,13 +1279,9 @@ def search_gene_literature_evidence(
         reasoning_effort=os.getenv(
             "OPENAI_HELPER_REASONING_EFFORT", "none"
         ),
-        timeout_seconds=_env_float(
-            "OPENAI_GENE_LITERATURE_TIMEOUT_SECONDS", 90
-        ),
-        reserve_seconds=reserve_seconds,
     )
     
-def search_gene_fallback(user_input, *, reserve_seconds=None):
+def search_gene_fallback(user_input):
     """Focused fallback when the main scientific search returns no genes."""
 
     return run_openai_web_search(
@@ -1445,19 +1298,9 @@ def search_gene_fallback(user_input, *, reserve_seconds=None):
         ),
         stage_name="gene_fallback_web_search",
         search_context_size="low",
-        timeout_seconds=_env_float(
-            "OPENAI_GENE_FALLBACK_TIMEOUT_SECONDS", 60
-        ),
-        reserve_seconds=reserve_seconds,
     )
 
-def search_drugs_and_small_molecules(
-    user_input,
-    genes=None,
-    diseases=None,
-    *,
-    reserve_seconds=None,
-):
+def search_drugs_and_small_molecules(user_input, genes=None, diseases=None):
     """Search current drug/small-molecule evidence for genes or diseases."""
     genes = [str(x).upper().strip() for x in (genes or []) if str(x).strip()]
     diseases = [str(x).strip() for x in (diseases or []) if str(x).strip()]
@@ -1504,8 +1347,6 @@ def search_drugs_and_small_molecules(
         # the optional branch bounded; override via env when high is required.
         search_context_size=os.getenv("OPENAI_DRUG_SEARCH_CONTEXT_SIZE", "medium"),
         allowed_domains=_DRUG_SEARCH_ALLOWED_DOMAINS,
-        timeout_seconds=_env_float("OPENAI_DRUG_TIMEOUT_SECONDS", 120),
-        reserve_seconds=reserve_seconds,
     )
 
 
@@ -3672,32 +3513,34 @@ def wrap_plot_label(value, max_chars=22, max_lines=3):
     return "<br>".join(lines)
 
 
-def marker_size_from_expressing_fraction(pct_expr_series):
-    """Return fixed-scale percentages for Plotly's area-based dot sizing.
-
-    ``pct_expr`` is the fraction of cells with nonzero expression within the
-    exact plotted population, such as capillary endothelial cells in DLPFC.
-    Keeping the returned scale fixed at 0--100 makes a 60% group the same dot
-    size in every figure instead of rescaling it against whichever groups
-    happen to share the current plot.
+def marker_size_from_cell_counts(n_cells_series, *, min_size=4.0, max_size=17.0):
+    """Map cell counts to dot diameters on a log scale, normalized to the
+    min/max actually present in this plot. Cell counts routinely span two
+    to three orders of magnitude (tens to tens of thousands) in a single
+    plot, so a linear or sqrt scale would make everything but the single
+    largest group look identically tiny; log compresses that range into a
+    readable size gradient instead.
     """
-    fractions = np.clip(pct_expr_series.to_numpy(dtype=float), 0.0, 1.0)
-    return (100.0 * fractions).round(2).tolist()
+    counts = np.clip(n_cells_series.to_numpy(dtype=float), 1.0, None)
+    log_counts = np.log10(counts)
+    log_min, log_max = log_counts.min(), log_counts.max()
+    if log_max > log_min:
+        normalized = (log_counts - log_min) / (log_max - log_min)
+    else:
+        # Every group in this plot has (about) the same cell count.
+        normalized = np.ones_like(log_counts)
+    return (min_size + (max_size - min_size) * normalized).round(1).tolist()
 
 
 def matrix_plot_marker(plot_df, *, showscale=True, color_max=None):
-    """Shared encoding: color=mean expression, area=% expressing cells."""
+    """Shared dot-matrix encoding: color=mean expression, size=cells analyzed."""
     if color_max is None:
         positive = plot_df.loc[plot_df["mean_expr"] > 0, "mean_expr"]
         color_max = float(positive.quantile(0.95)) if not positive.empty else 1.0
     color_max = max(float(color_max), 0.001)
     return {
-        "size": marker_size_from_expressing_fraction(plot_df["pct_expr"]),
-        "sizemode": "area",
-        # Plotly's recommended area-mode reference for a fixed 0--100 input
-        # scale and a maximum rendered diameter of approximately 24 px.
-        "sizeref": 2.0 * 100.0 / (24.0 ** 2),
-        "sizemin": 2,
+        "size": marker_size_from_cell_counts(plot_df["n_cells"]),
+        "sizemode": "diameter",
         "color": plot_df["mean_expr"].astype(float).tolist(),
         "cmin": 0,
         "cmax": color_max,
@@ -3790,7 +3633,7 @@ def build_single_gene_cell_type_matrix(plot_df, comparison_cols):
                 "text": (
                     f"<b>{gene} expression: region × cell type</b>"
                     "<br><span style='font-size:12px;color:#64748b'>"
-                    "Color = mean expression · Size = expressing cells (%)"
+                    "Color = mean expression · Size = cells analyzed"
                     f" · Groups require ≥{MIN_CELLS_PER_GROUP} cells</span>"
                 ),
                 "x": 0.02,
@@ -3981,7 +3824,7 @@ def build_cell_type_gene_panels(plot_df, gene_order, comparison_cols):
                 "<b>VasQ expression by cell type</b>"
                 "<br><span style='font-size:12px;color:#64748b'>"
                 "Each panel is one cell type · x = region · y = gene · "
-                "Color = mean expression · Size = expressing cells (%)"
+                "Color = mean expression · Size = cells analyzed"
                 f" · Groups require ≥{MIN_CELLS_PER_GROUP} cells</span>"
             ),
             "x": 0.02,
@@ -4113,8 +3956,8 @@ def build_matrix_expression_plot(
 
     x_values = plot_df["_comparison_label"].tolist()
     y_values = plot_df["gene"].tolist()
-    marker_sizes = marker_size_from_expressing_fraction(
-        plot_df["pct_expr"]
+    marker_sizes = marker_size_from_cell_counts(
+        plot_df["n_cells"], min_size=6.0, max_size=24.0
     )
 
     color_values = plot_df["mean_expr"].tolist()
@@ -4159,9 +4002,7 @@ def build_matrix_expression_plot(
                 "hoverinfo": "text",
                 "marker": {
                     "size": marker_sizes,
-                    "sizemode": "area",
-                    "sizeref": 2.0 * 100.0 / (24.0 ** 2),
-                    "sizemin": 2,
+                    "sizemode": "diameter",
                     "color": color_values,
                     "cmin": 0,
                     "cmax": color_max,
@@ -4187,7 +4028,7 @@ def build_matrix_expression_plot(
                 "text": (
                     f"<b>VasQ expression by {dimension_title}</b>"
                     "<br><span style='font-size:12px;color:#64748b'>"
-                    "Color = mean expression · Size = expressing cells (%)"
+                    "Color = mean expression · Size = cells analyzed"
                     f" · Groups require ≥{MIN_CELLS_PER_GROUP} cells"
                     "</span>"
                 ),
@@ -5035,52 +4876,6 @@ def _raise_if_cancelled(should_stop):
         raise ChatCancelled("Chat request stopped by user.")
 
 
-def should_run_primary_scientific_search(intent, direct_vasq_only):
-    """Avoid a redundant broad search for a drug-only question.
-
-    The drug search already covers structured drug/target resources, primary
-    literature, trials, and regulatory sources. Running the broad discovery
-    search first used to let that optional stage consume the entire turn
-    budget before the drug-specific search could start.
-    """
-    if direct_vasq_only:
-        return False
-    asks_drugs = bool((intent or {}).get("asks_drugs"))
-    asks_expression = bool((intent or {}).get("asks_expression"))
-    return not (asks_drugs and not asks_expression)
-
-
-def web_search_failure_note(stage_name, evidence_scope):
-    status = latest_web_search_status(stage_name) or "not_completed"
-    readable_status = {
-        "timed_out": "timed out",
-        "skipped_budget": "was skipped because the remaining turn budget was too short",
-        "incomplete": "ended before completion",
-        "invalid_response": "returned an invalid background response",
-        "no_text": "completed without usable text",
-        "unavailable": "was unavailable because of an API, connection, or rate-limit error",
-        "failed": "failed with an unexpected error",
-        "not_completed": "did not complete",
-    }.get(status, f"did not complete (status={status})")
-    return (
-        f"The {evidence_scope} retrieval {readable_status} and supplied no "
-        "usable evidence. This is a technical retrieval failure, not evidence "
-        "that no relevant scientific result, drug, or compound exists. The "
-        "reader should be asked to retry rather than given a negative "
-        "scientific conclusion."
-    )
-
-
-def build_drug_retrieval_failure_response():
-    return (
-        "The drug and literature search did not complete successfully, so "
-        "VasQ cannot provide an evidence-based drug answer for this turn. "
-        "This is a retrieval failure—not evidence that no relevant drug, "
-        "compound, BBB-targeting strategy, or transcytosis mechanism exists. "
-        "Please retry the request."
-    )
-
-
 
 def _chat_impl(user_input, history, should_stop=None):
     _raise_if_cancelled(should_stop)
@@ -5092,15 +4887,6 @@ def _chat_impl(user_input, history, should_stop=None):
 
     # Resolve the current turn against prior context before adding it to history.
     intent = analyze_query_intent(user_input, history)
-    rule_intent = fallback_query_intent(user_input)
-    if rule_intent.get("asks_drugs") and not intent.get("asks_drugs"):
-        # A classifier false negative must never bypass retrieval for an
-        # explicit drug/therapy/compound question.
-        logger.warning(
-            "Intent helper missed explicit drug wording; applying rule override"
-        )
-        intent["asks_drugs"] = True
-        intent["is_scientific"] = True
     _raise_if_cancelled(should_stop)
     update_history(history, "user", user_input)
 
@@ -5127,13 +4913,6 @@ def _chat_impl(user_input, history, should_stop=None):
     user_supplied_genes = list(intent.get("genes") or [])
     genes = user_supplied_genes[:]
     diseases = intent.get("diseases") or []
-    asks_drugs = bool(intent.get("asks_drugs"))
-    synthesis_reserve_seconds = _env_float(
-        "VASQ_SYNTHESIS_RESERVE_SECONDS", 50
-    )
-    drug_timeout_seconds = _env_float(
-        "OPENAI_DRUG_TIMEOUT_SECONDS", 120
-    )
 
     # An explicit VasQ-matrix-only request should not spend several minutes on
     # Web Search. An equally explicit request for web/literature
@@ -5149,16 +4928,6 @@ def _chat_impl(user_input, history, should_stop=None):
         intent["use_vasq"] = True
     logger.info("Direct VasQ-only routing=%s", direct_vasq_only)
 
-    run_primary_scientific_search = should_run_primary_scientific_search(
-        intent,
-        direct_vasq_only,
-    )
-    downstream_search_reserve = synthesis_reserve_seconds
-    if asks_drugs:
-        # Keep a complete drug-search allowance available even if an earlier
-        # scientific/gene stage is slow.
-        downstream_search_reserve += drug_timeout_seconds
-
     scientific_web_result = None
 
     # Branch A: unless this is a direct VasQ-only request, run a
@@ -5170,17 +4939,12 @@ def _chat_impl(user_input, history, should_stop=None):
         logger.info(
             "Direct VasQ matrix request detected; skipping OpenAI Web Search"
         )
-    elif not run_primary_scientific_search:
-        logger.info(
-            "Drug-first routing: skipping redundant broad scientific search"
-        )
     else:
         _raise_if_cancelled(should_stop)
         try:
             logger.info("Web Search stage 1/2: scientific knowledge and genes")
             scientific_web_result = search_scientific_web(
-                resolved_question,
-                reserve_seconds=downstream_search_reserve,
+                resolved_question
             )
         except Exception:
             logger.exception("Scientific Web Search branch failed")
@@ -5207,7 +4971,7 @@ def _chat_impl(user_input, history, should_stop=None):
     # the same matrix_expression() pipeline) needs genes but the primary
     # search did not resolve any.
     needs_gene_fallback = (
-        run_primary_scientific_search
+        not direct_vasq_only
         and intent.get("asks_expression")
         and not user_supplied_genes
         and not genes
@@ -5223,8 +4987,7 @@ def _chat_impl(user_input, history, should_stop=None):
     
         try:
             fallback_web_result = search_gene_fallback(
-                resolved_question,
-                reserve_seconds=downstream_search_reserve,
+                resolved_question
             )
         except Exception:
             logger.exception(
@@ -5280,7 +5043,7 @@ def _chat_impl(user_input, history, should_stop=None):
     # collapsing ten genes into one generic disease-association paragraph.
     gene_literature_result = None
     needs_gene_literature = (
-        run_primary_scientific_search
+        not direct_vasq_only
         and bool(genes)
         and bool(
             diseases
@@ -5299,7 +5062,6 @@ def _chat_impl(user_input, history, should_stop=None):
                 resolved_question,
                 genes,
                 diseases=diseases,
-                reserve_seconds=downstream_search_reserve,
             )
         except Exception:
             logger.exception("Gene-by-gene literature search failed")
@@ -5357,6 +5119,7 @@ def _chat_impl(user_input, history, should_stop=None):
     # Branch C: optional second Web Search. Only run it when the user actually
     # asked for drugs/therapeutics; a disease or gene alone is not sufficient.
     drug_result = None
+    asks_drugs = bool(intent.get("asks_drugs"))
     if not direct_vasq_only and asks_drugs:
         _raise_if_cancelled(should_stop)
         try:
@@ -5369,7 +5132,6 @@ def _chat_impl(user_input, history, should_stop=None):
                 resolved_question,
                 genes=genes,
                 diseases=diseases,
-                reserve_seconds=synthesis_reserve_seconds,
             )
         except Exception:
             logger.exception("Drug/small-molecule Web Search branch failed")
@@ -5436,13 +5198,10 @@ def _chat_impl(user_input, history, should_stop=None):
                 "GENE-BY-GENE SCIENTIFIC LITERATURE EVIDENCE:\n"
                 + compact_gene_literature
             )
-        elif needs_gene_literature:
+        else:
             evidence_parts.append(
-                "GENE-BY-GENE LITERATURE RETRIEVAL FAILURE:\n"
-                + web_search_failure_note(
-                    "gene_literature_web_search",
-                    "gene-by-gene literature",
-                )
+                "GENE-BY-GENE LITERATURE STATUS:\n"
+                "No usable gene-specific literature evidence was returned."
             )
 
         if scientific_web_result:
@@ -5462,13 +5221,9 @@ def _chat_impl(user_input, history, should_stop=None):
                 "PRIMARY SCIENTIFIC WEB EVIDENCE:\n"
                 + compact_scientific_evidence
             )
-        elif run_primary_scientific_search and not gene_literature_result:
+        elif not gene_literature_result:
             evidence_parts.append(
-                "SCIENTIFIC WEB RETRIEVAL FAILURE:\n"
-                + web_search_failure_note(
-                    "scientific_web_search",
-                    "primary scientific Web Search",
-                )
+                "SCIENTIFIC WEB STATUS:\nNo usable web evidence was returned."
             )
 
     if not direct_vasq_only and asks_drugs:
@@ -5489,11 +5244,8 @@ def _chat_impl(user_input, history, should_stop=None):
             )
         else:
             evidence_parts.append(
-                "DRUG SEARCH RETRIEVAL FAILURE:\n"
-                + web_search_failure_note(
-                    "drug_web_search",
-                    "drug and small-molecule",
-                )
+                "DRUG SEARCH STATUS:\n"
+                "No usable drug or small-molecule search result was returned."
             )
 
     evidence_package = "\n\n".join(evidence_parts)
@@ -5504,19 +5256,7 @@ def _chat_impl(user_input, history, should_stop=None):
         "content": (
             "Answer the user's scientific question directly using the evidence "
             "package supplied after the conversation. Integrate only relevant "
-            "evidence. Begin with the substantive answer. Do not announce the "
-            "answer's format or length with meta-language such as 'short "
-            "report', 'brief report', 'concise summary', 'quick overview', or "
-            "'here is a summary'. Do not use those phrases as headings either; "
-            "use only descriptive headings tied to the scientific content. "
-            "Any evidence block headed 'RETRIEVAL FAILURE' describes a "
-            "technical search failure, not a negative scientific finding. "
-            "When such a block is the only relevant evidence, state plainly "
-            "that retrieval did not complete and ask the reader to retry. "
-            "Never convert it into claims such as 'no drug exists', 'no "
-            "specific drug can be identified', or 'the literature reports no "
-            "result'. "
-            "When SOURCE SCOPE says VasQ matrix data only, do not "
+            "evidence. When SOURCE SCOPE says VasQ matrix data only, do not "
             "introduce external scientific claims and do not imply "
             "that external sources were searched. Treat target-disease and "
             "genetic associations retrieved from Open Targets, Monarch, or "
@@ -5688,49 +5428,31 @@ def _chat_impl(user_input, history, should_stop=None):
 
     _raise_if_cancelled(should_stop)
     generated_history_summary = None
-    drug_retrieval_failed_without_other_evidence = (
-        asks_drugs
-        and not drug_result
-        and not scientific_web_result
-        and not gene_literature_result
-        and not vasq_llm_evidence_json
-    )
-    if drug_retrieval_failed_without_other_evidence:
-        # Do not pay for a synthesis call whose only possible input is a
-        # technical failure notice, and do not let a model rephrase that
-        # failure as a scientific claim that no matching drug exists.
-        final_message = build_drug_retrieval_failure_response()
-        generated_history_summary = (
-            "The user asked a drug or therapeutic question, but the live "
-            "drug/literature retrieval did not complete. No scientific "
-            "negative conclusion was drawn; the request should be retried."
+    try:
+        final_message_obj = call_api(
+            synthesis_messages,
+            stage_name="final_synthesis",
+            timeout_seconds=_env_float("OPENAI_SYNTHESIS_TIMEOUT_SECONDS", 45),
+            reserve_seconds=2,
+            response_format=FINAL_SYNTHESIS_RESPONSE_FORMAT,
         )
-    else:
-        try:
-            final_message_obj = call_api(
-                synthesis_messages,
-                stage_name="final_synthesis",
-                timeout_seconds=_env_float("OPENAI_SYNTHESIS_TIMEOUT_SECONDS", 45),
-                reserve_seconds=2,
-                response_format=FINAL_SYNTHESIS_RESPONSE_FORMAT,
-            )
-            final_message, generated_history_summary = (
-                parse_final_synthesis_message(final_message_obj)
-            )
-        except Exception:
-            logger.exception(
-                "Structured final synthesis failed; returning recovered partial evidence"
-            )
-            final_message = build_partial_response(
-                genes,
-                vasq_text,
-                "\n\n".join(
-                    part
-                    for part in [gene_literature_result, scientific_web_result]
-                    if part
-                ),
-                drug_result=drug_result,
-            )
+        final_message, generated_history_summary = (
+            parse_final_synthesis_message(final_message_obj)
+        )
+    except Exception:
+        logger.exception(
+            "Structured final synthesis failed; returning recovered partial evidence"
+        )
+        final_message = build_partial_response(
+            genes,
+            vasq_text,
+            "\n\n".join(
+                part
+                for part in [gene_literature_result, scientific_web_result]
+                if part
+            ),
+            drug_result=drug_result,
+        )
     _raise_if_cancelled(should_stop)
 
     # The synthesis prompt asks the model to preserve inline citations, but a
