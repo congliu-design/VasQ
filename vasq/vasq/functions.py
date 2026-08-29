@@ -806,6 +806,8 @@ def run_openai_web_search(
     stage_name="web_search",
     search_context_size="high",
     allowed_domains=None,
+    model=None,
+    reasoning_effort=None,
 ):
     try:
         timeout_seconds = _stage_timeout(
@@ -813,7 +815,7 @@ def run_openai_web_search(
             _env_float("OPENAI_WEB_TIMEOUT_SECONDS", 600),
             reserve_seconds=_env_float("VASQ_SYNTHESIS_RESERVE_SECONDS", 50),
         )
-        web_model = os.getenv("OPENAI_WEB_MODEL", "gpt-5.6-sol")
+        web_model = model or os.getenv("OPENAI_WEB_MODEL", "gpt-5.6-sol")
         use_background = _env_bool("OPENAI_WEB_BACKGROUND", True)
         poll_interval = _env_float(
             "OPENAI_WEB_POLL_INTERVAL_SECONDS", 2, minimum=0.5
@@ -870,7 +872,11 @@ def run_openai_web_search(
         # medium-effort latency. This remains configurable for harder searches.
         if web_model.startswith("gpt-5.6"):
             request_args["reasoning"] = {
-                "effort": os.getenv("OPENAI_WEB_REASONING_EFFORT", "low")
+                "effort": (
+                    reasoning_effort
+                    if reasoning_effort is not None
+                    else os.getenv("OPENAI_WEB_REASONING_EFFORT", "low")
+                )
             }
 
         if use_background:
@@ -1268,6 +1274,10 @@ def search_gene_literature_evidence(user_input, genes, diseases=None):
         stage_name="gene_literature_web_search",
         search_context_size=os.getenv(
             "OPENAI_GENE_LITERATURE_CONTEXT_SIZE", "high"
+        ),
+        model=os.getenv("OPENAI_HELPER_MODEL", "gpt-5.6-luna"),
+        reasoning_effort=os.getenv(
+            "OPENAI_HELPER_REASONING_EFFORT", "none"
         ),
     )
     
