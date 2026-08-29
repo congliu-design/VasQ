@@ -5207,7 +5207,7 @@ def _chat_impl(user_input, history, should_stop=None):
                 max_tokens=scientific_budget,
             )
             evidence_parts.append(
-                "PRIMARY SCIENTIFIC WEB EVIDENCE USED TO IDENTIFY GENES:\n"
+                "PRIMARY SCIENTIFIC WEB EVIDENCE:\n"
                 + compact_scientific_evidence
             )
         elif not gene_literature_result:
