@@ -4384,8 +4384,7 @@ def fallback_query_intent(user_input):
             term in lowered
             for term in [
                 "not in vasculature", "non-vascular", "nonvascular",
-                "liver", "kidney", "lung", "heart", "blood plasma",
-                "gray matter", "grey matter", "parenchyma",
+                "liver", "kidney", "lung", "heart", "blood plasma", "parenchyma",
             ]
         ),
         "genes": genes,
