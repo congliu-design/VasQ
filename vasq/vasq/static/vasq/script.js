@@ -1628,8 +1628,8 @@ document.addEventListener("DOMContentLoaded", function() {
                 return;
             }
 
-            if (questions.length > 50) {
-                addQueueStatus('A queue can contain at most 50 questions.');
+            if (questions.length > 20) {
+                addQueueStatus('A queue can contain at most 20 questions.');
                 return;
             }
 
