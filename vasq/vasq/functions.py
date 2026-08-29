@@ -4965,6 +4965,7 @@ def _chat_impl(user_input, history, should_stop=None):
         and intent.get("asks_expression")
         and not user_supplied_genes
         and not genes
+        and scientific_web_result is None
     )
     
     if needs_gene_fallback:
