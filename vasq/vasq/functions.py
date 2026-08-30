@@ -3185,7 +3185,7 @@ def resolve_dataset_entities_with_gpt(
     
         "Return JSON only with keys: "
         '{"cell_types": [], "cell_classes": [], "regions": [], '
-        '"region_layers": [], "filter_interpretations": []}. Only use exact labels "
+        '"region_layers": [], "filter_interpretations": []}. Only use exact labels '
         "from the supplied lists. When mapping a functional or conceptual phrase "
         "rather than a literal label, add one filter_interpretations object with "
         "keys dimension, source_phrase, labels, and rationale. source_phrase must "
