@@ -4569,11 +4569,13 @@ def analyze_query_intent(user_input, history=None):
         model_use_vasq = bool(
             parsed.get("use_vasq", False)
         )
-
         # ------------------------------------------------------------
-        # Build positive VasQ/brain-context vocabulary directly from
-        # entity_aliases.py. This avoids maintaining a separate,
-        # incomplete hard-coded brain-region list here.
+        # Build two separate vocabularies:
+        # 1. explicit brain-region/layer context
+        # 2. cell types supported by the VasQ dataset
+        #
+        # A supported cell type such as "endothelial cell" does not,
+        # by itself, prove that the user is asking about brain tissue.
         # ------------------------------------------------------------
         from .entity_aliases import (
             BRAIN_REGION_ALIAS_GROUPS,
@@ -4582,8 +4584,8 @@ def analyze_query_intent(user_input, history=None):
             CELL_TYPE_MULTI_ALIAS_GROUPS,
             REGION_LAYER_ALIAS_GROUPS,
         )
-
-        brain_context_terms = {
+        
+        explicit_brain_terms = {
             "brain",
             "brain region",
             "brain regions",
@@ -4606,48 +4608,69 @@ def analyze_query_intent(user_input, history=None):
             "occipital lobes",
             "memory related region",
             "memory related regions",
+            "neurovascular",
+        }
+        
+        dataset_cell_type_terms = {
             "glia",
             "glial",
             "glial cell",
             "glial cells",
-            "neurovascular",
         }
-
-        alias_groups = (
-            CELL_TYPE_ALIAS_GROUPS,
-            CELL_TYPE_MULTI_ALIAS_GROUPS,
-            CELL_CLASS_ALIAS_GROUPS,
-            REGION_LAYER_ALIAS_GROUPS,
-            BRAIN_REGION_ALIAS_GROUPS,
-        )
-
-        for alias_group in alias_groups:
-            for canonical, aliases in alias_group.items():
+        
+        
+        def add_alias_group_terms(target, alias_groups):
+            for canonical, aliases in alias_groups.items():
                 canonical_values = (
                     canonical
                     if isinstance(canonical, tuple)
                     else (canonical,)
                 )
-
+        
                 for canonical_value in canonical_values:
-                    normalized = normalize_text(
-                        canonical_value
-                    )
+                    normalized = normalize_text(canonical_value)
                     if normalized:
-                        brain_context_terms.add(normalized)
-
+                        target.add(normalized)
+        
                 for alias in aliases:
                     normalized = normalize_text(alias)
                     if normalized:
-                        brain_context_terms.add(normalized)
-
+                        target.add(normalized)
+        
+        
+        # Only actual brain regions and region layers provide explicit
+        # evidence that the question concerns brain tissue.
+        add_alias_group_terms(
+            explicit_brain_terms,
+            REGION_LAYER_ALIAS_GROUPS,
+        )
+        add_alias_group_terms(
+            explicit_brain_terms,
+            BRAIN_REGION_ALIAS_GROUPS,
+        )
+        
+        # Cell types are kept separately because endothelial cells,
+        # fibroblasts, macrophages, etc. also occur outside the brain.
+        add_alias_group_terms(
+            dataset_cell_type_terms,
+            CELL_TYPE_ALIAS_GROUPS,
+        )
+        add_alias_group_terms(
+            dataset_cell_type_terms,
+            CELL_TYPE_MULTI_ALIAS_GROUPS,
+        )
+        add_alias_group_terms(
+            dataset_cell_type_terms,
+            CELL_CLASS_ALIAS_GROUPS,
+        )
+        
         normalized_input = normalize_text(user_input)
-
-        # Remove extracted disease names before checking tissue scope.
-        # For example, "kidney disease genes expressed in brain" should
-        # not be treated as a request for kidney-tissue expression.
+        
+        # Remove extracted disease names before determining tissue scope.
+        # For example, "kidney disease genes expressed in the brain"
+        # should not automatically be interpreted as kidney expression.
         tissue_scope_text = normalized_input
-
+        
         for disease in diseases:
             normalized_disease = normalize_text(disease)
             if normalized_disease:
@@ -4655,33 +4678,40 @@ def analyze_query_intent(user_input, history=None):
                     normalized_disease,
                     " ",
                 )
-
+        
         tissue_scope_text = re.sub(
             r"\s+",
             " ",
             tissue_scope_text,
         ).strip()
-
+        
+        
         def contains_complete_term(text, term):
             if not text or not term:
                 return False
-
+        
             return re.search(
                 rf"(?<!\w){re.escape(term)}(?!\w)",
                 text,
             ) is not None
-
-        has_brain_context = any(
+        
+        
+        has_explicit_brain_region = any(
             contains_complete_term(
                 tissue_scope_text,
                 term,
             )
-            for term in brain_context_terms
+            for term in explicit_brain_terms
         )
-
-        # This is now only a guard for explicit cross-organ or
-        # non-brain expression requests. It is not the primary method
-        # used to decide whether a question belongs to VasQ.
+        
+        has_dataset_cell_type = any(
+            contains_complete_term(
+                tissue_scope_text,
+                term,
+            )
+            for term in dataset_cell_type_terms
+        )
+        
         non_brain_scope_terms = {
             "liver",
             "hepatic",
@@ -4697,6 +4727,7 @@ def analyze_query_intent(user_input, history=None):
             "peripheral blood",
             "skin",
             "muscle",
+            "skeletal muscle",
             "pancreas",
             "pancreatic",
             "intestine",
@@ -4716,7 +4747,7 @@ def analyze_query_intent(user_input, history=None):
             "placenta",
             "placental",
         }
-
+        
         has_non_brain_context = any(
             contains_complete_term(
                 tissue_scope_text,
@@ -4724,9 +4755,9 @@ def analyze_query_intent(user_input, history=None):
             )
             for term in non_brain_scope_terms
         )
-
+        
         cross_tissue_comparison = (
-            has_brain_context
+            has_explicit_brain_region
             and has_non_brain_context
             and bool(
                 re.search(
@@ -4737,32 +4768,38 @@ def analyze_query_intent(user_input, history=None):
                 )
             )
         )
-
+        
         # ------------------------------------------------------------
         # Deterministic final use_vasq routing
         # ------------------------------------------------------------
         if not asks_expression:
             use_vasq = False
-
+        
+        elif has_non_brain_context and not has_explicit_brain_region:
+            # Examples:
+            # "CAV1 expression in lung endothelial cells"
+            # "SLC2A1 expression in kidney cells"
+            use_vasq = False
+        
         elif cross_tissue_comparison:
-            # VasQ cannot supply the non-brain side.
+            # Examples:
+            # "Compare CLDN5 in brain and kidney endothelial cells"
             use_vasq = False
-
-        elif has_brain_context:
-            # Positive brain/dataset aliases override Luna's previous
-            # false negatives for cortex, white matter, hippocampal
-            # glia, midbrain, and cerebral lobes.
+        
+        elif has_explicit_brain_region:
+            # Examples:
+            # cortex, white matter, hippocampus, midbrain, DLPFC
             use_vasq = True
-
-        elif has_non_brain_context:
-            use_vasq = False
-
+        
+        elif has_dataset_cell_type:
+            # No other organ was specified, and the cell type exists in VasQ.
+            use_vasq = True
+        
         else:
-            # For questions without an explicit tissue, preserve the
-            # model classification. The prompt instructs Luna that
-            # gene-free brain marker/transporter questions can still
-            # use VasQ.
+            # Preserve Luna's classification when neither tissue nor a
+            # VasQ-supported cell type is identifiable.
             use_vasq = model_use_vasq
+   
 
         return {
             "is_scientific": bool(
