@@ -964,6 +964,13 @@ def run_openai_web_search(
 
             status = getattr(response, "status", None)
             if status != "completed":
+                if status == "incomplete":
+                    print(
+                        "OpenAI Web Search incomplete details "
+                        f"stage={stage_name} response_id={response_id} "
+                        f"details={getattr(response, 'incomplete_details', None)!r}",
+                        flush=True,
+                    )
                 logger.warning(
                     "OpenAI Web Search ended without completion stage=%s "
                     "response_id=%s status=%s error=%r",
