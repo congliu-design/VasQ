@@ -4460,7 +4460,6 @@ def fallback_query_intent(user_input):
         "resolved_question": text.strip(),
     }
 
-
 def analyze_query_intent(user_input, history=None):
     """Resolve scientific intent and entities once for all retrieval branches."""
     if is_simple_conversational_message(user_input):
@@ -4477,36 +4476,59 @@ def analyze_query_intent(user_input, history=None):
     system_prompt = (
         "Classify a conversation turn for a biomedical/neuroscience research "
         "assistant. Return JSON only with keys: is_scientific (boolean), "
-        "asks_expression (boolean), asks_drugs "
-        "(boolean), genes (array of human gene symbols), diseases (array of "
-        "disease/condition names), use_vasq (boolean), and resolved_question "
-        "(string). Set asks_drugs only when the current question explicitly "
-        "asks about drugs, compounds, treatments, therapies, modulators, or "
-        "clinical candidates; the mere presence of a disease or gene is not "
-        "enough. A greeting, "
-        "thanks, casual chat, or "
-        "app/meta question is not scientific. Set asks_expression only when "
-        "the user is asking about measured gene expression, expression "
-        "differences, expressing-cell percentage, regional/cell-type "
-        "distribution, or marker/rank/top-gene questions -- all of these are "
-        "answered from the same measured expression matrix. Set use_vasq "
-        "when asks_expression is true and the "
-        "question concerns brain vasculature, vascular cell types/regions, or "
-        "does not specify a different tissue; set it false when the user "
-        "explicitly asks about a non-vascular or other-organ tissue. Resolve "
-        "short follow-ups from recent context, but do "
-        "not invent a gene, disease, cell type, or brain region. Include genes "
-        "or diseases inherited from context only when the reference is "
-        "unambiguous. Normalize gene symbols to uppercase. In resolved_question, "
-        "preserve the current user's exact functional and qualitative wording "
-        "and all qualifiers. Only add an unambiguous entity needed to resolve a "
-        "short follow-up; do not translate a phrase such as 'memory-related "
-        "region' into a named brain region, and do not silently replace a broad "
-        "concept with a narrower dataset label. If the current message is "
-        "standalone, copy it verbatim into resolved_question."
+        "asks_expression (boolean), asks_drugs (boolean), genes (array of "
+        "human gene symbols), diseases (array of disease/condition names), "
+        "use_vasq (boolean), and resolved_question (string). "
+
+        "Set asks_drugs only when the current question explicitly asks about "
+        "drugs, compounds, treatments, therapies, modulators, inhibitors, "
+        "agonists, antagonists, or clinical candidates. The mere presence of "
+        "a disease or gene is not sufficient. "
+
+        "Set asks_expression when the user asks about measured gene expression, "
+        "expression differences, expressing-cell percentages, regional or "
+        "cell-type distribution, marker ranking, top genes, cell-type "
+        "enrichment, regional enrichment, or regional specificity. Marker, "
+        "rank, enrichment, and top-gene questions are answered through the "
+        "same expression-matrix workflow. "
+
+        "Drug intent and expression intent are independent. Set both "
+        "asks_drugs and asks_expression to true when the question explicitly "
+        "asks for both drug information and gene-expression information. "
+
+        "Set use_vasq to true for brain-related expression questions. This "
+        "includes questions about brain regions, brain-region layers, gray "
+        "matter, white matter, cortex, hippocampus, midbrain, cerebral lobes, "
+        "brain vasculature, vascular cells, glial cells, neurons, marker genes, "
+        "regional specificity, and cell-type or region enrichment. The user "
+        "does not need to explicitly mention brain vasculature or provide a "
+        "gene. Gene-free marker, transporter, or disease-enrichment questions "
+        "can first obtain candidate genes and then query the VasQ matrix. "
+
+        "Set use_vasq to false when asks_expression is false or when the user "
+        "explicitly requests expression only in a non-brain organ or tissue. "
+        "For a comparison requiring both brain and a non-brain organ, set "
+        "use_vasq to false because VasQ cannot provide the non-brain side of "
+        "the comparison. "
+
+        "A greeting, thanks, casual conversation, or app/meta question is not "
+        "scientific. Resolve short follow-ups using recent context, but do not "
+        "invent a gene, disease, cell type, or brain region. Include genes or "
+        "diseases inherited from context only when the reference is "
+        "unambiguous. Normalize human gene symbols to uppercase. "
+
+        "In resolved_question, preserve the current user's exact functional "
+        "and qualitative wording and all qualifiers. Only add an unambiguous "
+        "entity needed to resolve a short follow-up. Do not translate a phrase "
+        "such as 'memory-related region' into a named brain region, and do not "
+        "silently replace a broad concept with a narrower dataset label. If "
+        "the current message is standalone, copy it verbatim into "
+        "resolved_question."
     )
+
     user_prompt = (
-        f"Recent conversation:\n{recent_conversation_context(history)}\n\n"
+        f"Recent conversation:\n"
+        f"{recent_conversation_context(history)}\n\n"
         f"Current user message:\n{user_input}"
     )
 
@@ -4518,34 +4540,251 @@ def analyze_query_intent(user_input, history=None):
         )
         raw = response.choices[0].message.content
         parsed = parse_json_object(raw)
+
         if not parsed:
-            raise ValueError("Intent helper did not return a JSON object")
+            raise ValueError(
+                "Intent helper did not return a JSON object"
+            )
 
         genes = [
-            str(x).upper().strip()
-            for x in parsed.get("genes", [])
-            if str(x).strip()
+            str(value).upper().strip()
+            for value in parsed.get("genes", [])
+            if str(value).strip()
         ]
+        genes = list(dict.fromkeys(genes))
+
         diseases = [
-            str(x).strip()
-            for x in parsed.get("diseases", [])
-            if str(x).strip()
+            str(value).strip()
+            for value in parsed.get("diseases", [])
+            if str(value).strip()
         ]
+        diseases = list(dict.fromkeys(diseases))
+
+        asks_expression = bool(
+            parsed.get("asks_expression", False)
+        )
+        asks_drugs = bool(
+            parsed.get("asks_drugs", False)
+        )
+        model_use_vasq = bool(
+            parsed.get("use_vasq", False)
+        )
+
+        # ------------------------------------------------------------
+        # Build positive VasQ/brain-context vocabulary directly from
+        # entity_aliases.py. This avoids maintaining a separate,
+        # incomplete hard-coded brain-region list here.
+        # ------------------------------------------------------------
+        from .entity_aliases import (
+            BRAIN_REGION_ALIAS_GROUPS,
+            CELL_CLASS_ALIAS_GROUPS,
+            CELL_TYPE_ALIAS_GROUPS,
+            CELL_TYPE_MULTI_ALIAS_GROUPS,
+            REGION_LAYER_ALIAS_GROUPS,
+        )
+
+        brain_context_terms = {
+            "brain",
+            "brain region",
+            "brain regions",
+            "brain tissue",
+            "brain vasculature",
+            "blood brain barrier",
+            "bbb",
+            "cerebral",
+            "cerebrum",
+            "gray matter",
+            "grey matter",
+            "white matter",
+            "frontal lobe",
+            "frontal lobes",
+            "parietal lobe",
+            "parietal lobes",
+            "temporal lobe",
+            "temporal lobes",
+            "occipital lobe",
+            "occipital lobes",
+            "memory related region",
+            "memory related regions",
+            "glia",
+            "glial",
+            "glial cell",
+            "glial cells",
+            "neurovascular",
+        }
+
+        alias_groups = (
+            CELL_TYPE_ALIAS_GROUPS,
+            CELL_TYPE_MULTI_ALIAS_GROUPS,
+            CELL_CLASS_ALIAS_GROUPS,
+            REGION_LAYER_ALIAS_GROUPS,
+            BRAIN_REGION_ALIAS_GROUPS,
+        )
+
+        for alias_group in alias_groups:
+            for canonical, aliases in alias_group.items():
+                canonical_values = (
+                    canonical
+                    if isinstance(canonical, tuple)
+                    else (canonical,)
+                )
+
+                for canonical_value in canonical_values:
+                    normalized = normalize_text(
+                        canonical_value
+                    )
+                    if normalized:
+                        brain_context_terms.add(normalized)
+
+                for alias in aliases:
+                    normalized = normalize_text(alias)
+                    if normalized:
+                        brain_context_terms.add(normalized)
+
+        normalized_input = normalize_text(user_input)
+
+        # Remove extracted disease names before checking tissue scope.
+        # For example, "kidney disease genes expressed in brain" should
+        # not be treated as a request for kidney-tissue expression.
+        tissue_scope_text = normalized_input
+
+        for disease in diseases:
+            normalized_disease = normalize_text(disease)
+            if normalized_disease:
+                tissue_scope_text = tissue_scope_text.replace(
+                    normalized_disease,
+                    " ",
+                )
+
+        tissue_scope_text = re.sub(
+            r"\s+",
+            " ",
+            tissue_scope_text,
+        ).strip()
+
+        def contains_complete_term(text, term):
+            if not text or not term:
+                return False
+
+            return re.search(
+                rf"(?<!\w){re.escape(term)}(?!\w)",
+                text,
+            ) is not None
+
+        has_brain_context = any(
+            contains_complete_term(
+                tissue_scope_text,
+                term,
+            )
+            for term in brain_context_terms
+        )
+
+        # This is now only a guard for explicit cross-organ or
+        # non-brain expression requests. It is not the primary method
+        # used to decide whether a question belongs to VasQ.
+        non_brain_scope_terms = {
+            "liver",
+            "hepatic",
+            "hepatocyte",
+            "hepatocytes",
+            "kidney",
+            "renal",
+            "lung",
+            "pulmonary",
+            "heart",
+            "cardiac",
+            "blood plasma",
+            "peripheral blood",
+            "skin",
+            "muscle",
+            "pancreas",
+            "pancreatic",
+            "intestine",
+            "intestinal",
+            "colon",
+            "colonic",
+            "stomach",
+            "gastric",
+            "spleen",
+            "splenic",
+            "bone",
+            "bone marrow",
+            "adipose",
+            "fat tissue",
+            "retina",
+            "retinal",
+            "placenta",
+            "placental",
+        }
+
+        has_non_brain_context = any(
+            contains_complete_term(
+                tissue_scope_text,
+                term,
+            )
+            for term in non_brain_scope_terms
+        )
+
+        cross_tissue_comparison = (
+            has_brain_context
+            and has_non_brain_context
+            and bool(
+                re.search(
+                    r"\b("
+                    r"compare|comparison|versus|vs|between|both"
+                    r")\b|\band\b",
+                    tissue_scope_text,
+                )
+            )
+        )
+
+        # ------------------------------------------------------------
+        # Deterministic final use_vasq routing
+        # ------------------------------------------------------------
+        if not asks_expression:
+            use_vasq = False
+
+        elif cross_tissue_comparison:
+            # VasQ cannot supply the non-brain side.
+            use_vasq = False
+
+        elif has_brain_context:
+            # Positive brain/dataset aliases override Luna's previous
+            # false negatives for cortex, white matter, hippocampal
+            # glia, midbrain, and cerebral lobes.
+            use_vasq = True
+
+        elif has_non_brain_context:
+            use_vasq = False
+
+        else:
+            # For questions without an explicit tissue, preserve the
+            # model classification. The prompt instructs Luna that
+            # gene-free brain marker/transporter questions can still
+            # use VasQ.
+            use_vasq = model_use_vasq
+
         return {
-            "is_scientific": bool(parsed.get("is_scientific", False)),
-            "asks_expression": bool(parsed.get("asks_expression", False)),
-            "asks_drugs": bool(parsed.get("asks_drugs", False)),
-            "use_vasq": bool(parsed.get("use_vasq", False)),
-            "genes": list(dict.fromkeys(genes)),
-            "diseases": list(dict.fromkeys(diseases)),
+            "is_scientific": bool(
+                parsed.get("is_scientific", False)
+            ),
+            "asks_expression": asks_expression,
+            "asks_drugs": asks_drugs,
+            "use_vasq": use_vasq,
+            "genes": genes,
+            "diseases": diseases,
             "resolved_question": str(
-                parsed.get("resolved_question") or user_input
+                parsed.get("resolved_question")
+                or user_input
             ).strip(),
         }
-    except Exception:
-        logger.exception("Scientific intent analysis failed; using rules")
-        return fallback_query_intent(user_input)
 
+    except Exception:
+        logger.exception(
+            "Scientific intent analysis failed; using rules"
+        )
+        return fallback_query_intent(user_input)
+        
 
 def ensure_chat_initialized(history):
     """Initialize each conversation independently; avoid process-global routing."""
