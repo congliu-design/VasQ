@@ -810,6 +810,26 @@ def run_openai_web_search(
     reasoning_effort=None,
 ):
     try:
+        # Web Search supplies evidence to the final Sol synthesis; it should
+        # return a compact evidence package rather than a second long-form
+        # answer. Appending this at the shared entry point applies the same
+        # bounded format to scientific, gene-literature, fallback, and drug
+        # searches without changing their stage-specific retrieval prompts.
+        search_prompt = (
+            str(search_prompt).rstrip()
+            + "\n\nOUTPUT REQUIREMENTS FOR DOWNSTREAM SYNTHESIS:\n"
+            "Return a concise, structured evidence package, not a long "
+            "user-facing narrative. Use short descriptive headings and "
+            "compact bullets or records. Include only findings directly "
+            "relevant to the question. For each finding, state the entity, "
+            "relationship or mechanism, evidence/status, and an inline "
+            "citation to the exact retrieved source. Combine duplicate "
+            "findings, avoid repeated background explanations, and state "
+            "important uncertainty briefly. Aim to keep the complete "
+            "response within 4,000 output tokens; the final Sol model will "
+            "integrate this evidence into the user-facing answer."
+        )
+
         timeout_seconds = _stage_timeout(
             stage_name,
             _env_float("OPENAI_WEB_TIMEOUT_SECONDS", 600),
@@ -971,15 +991,35 @@ def run_openai_web_search(
                         f"details={getattr(response, 'incomplete_details', None)!r}",
                         flush=True,
                     )
-                logger.warning(
-                    "OpenAI Web Search ended without completion stage=%s "
-                    "response_id=%s status=%s error=%r",
-                    stage_name,
-                    response_id,
-                    status,
-                    getattr(response, "error", None),
-                )
-                return None
+                    partial_result, _ = _splice_web_search_citations(response)
+                    if partial_result and partial_result.strip():
+                        logger.warning(
+                            "OpenAI Web Search incomplete; preserving partial "
+                            "output for final synthesis stage=%s response_id=%s "
+                            "characters=%s",
+                            stage_name,
+                            response_id,
+                            len(partial_result),
+                        )
+                    else:
+                        logger.warning(
+                            "OpenAI Web Search ended incomplete with no usable "
+                            "partial output stage=%s response_id=%s error=%r",
+                            stage_name,
+                            response_id,
+                            getattr(response, "error", None),
+                        )
+                        return None
+                else:
+                    logger.warning(
+                        "OpenAI Web Search ended without completion stage=%s "
+                        "response_id=%s status=%s error=%r",
+                        stage_name,
+                        response_id,
+                        status,
+                        getattr(response, "error", None),
+                    )
+                    return None
 
         _record_openai_usage(
             stage_name=stage_name,
