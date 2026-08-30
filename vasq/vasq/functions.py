@@ -3175,13 +3175,15 @@ def resolve_dataset_entities_with_gpt(
         "without subtype-specific evidence. For example, cells lining blood "
         "vessels map to the Endothelial class, while smallest exchange vessels map "
         "to Capillary, not Fenestrated_Capillary unless fenestration is indicated. "
-    
+
         "Return a label only when the user asks to include or filter on it. Ignore "
-        "labels used only as examples, in negations or exclusions, or in questions "
-        "about data availability. Obey 'do not filter', 'no filter', 'without "
-        "filtering', and equivalent instructions. Return multiple labels only when "
-        "multiple values are explicitly requested. For an all-values comparison, "
-        "leave that dimension empty. Never invent labels. "
+        "entities mentioned only as examples, negations, exclusions, contrasts, or "
+        "in questions about data availability. An entity introduced only after "
+        "'not', 'excluding', 'except', 'instead of', or 'rather than' is not a "
+        "requested filter. Obey 'do not filter', 'no filter', 'without filtering', "
+        "and equivalent instructions. Return multiple labels only when multiple "
+        "values are explicitly requested. For an all-values comparison, leave that "
+        "dimension empty. Never invent labels. "
     
         "Return JSON only with keys: "
         '{"cell_types": [], "cell_classes": [], "regions": [], '
