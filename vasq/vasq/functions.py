@@ -3165,34 +3165,34 @@ def resolve_dataset_entities_with_gpt(
     available_regions = available_regions or []
     available_cell_classes = available_cell_classes or []
     available_region_layers = available_region_layers or []
+    
     system_prompt = (
-        "Map explicitly requested biological entities to labels from a fixed "
-        "dataset schema. Resolve cell types, cell classes, brain regions, and "
-        "region layers independently. Preserve qualifiers and prefer the most "
-        "specific reliable label. Return a label only when the user asks to "
-        "include or filter on that value. A value mentioned only as an example "
-        "to report when present, in a negated clause, in an exclusion, or in a "
-        "question about dataset availability is not a filter. In particular, "
-        "obey phrases such as 'do not filter', 'no filter', 'without filtering', "
-        "'report when present', and 'whether the data are limited to'. Return "
-        "multiple labels in a dimension when the user asks to compare multiple "
-        "named values. Do not add every "
-        "available value merely because the user asks for an all-values "
-        "comparison; leave that dimension empty so downstream code can group "
-        "the complete dataset. Never invent labels. Return JSON only with keys: "
+        "Map explicitly requested biological entities to exact labels from the "
+        "supplied dataset schema. Resolve cell types, cell classes, brain regions, "
+        "and region layers independently. Preserve the specificity of the user's "
+        "wording: select the most specific label directly supported by the query, "
+        "but do not expand a broad class into child labels or infer a subtype "
+        "without subtype-specific evidence. For example, cells lining blood "
+        "vessels map to the Endothelial class, while smallest exchange vessels map "
+        "to Capillary, not Fenestrated_Capillary unless fenestration is indicated. "
+    
+        "Return a label only when the user asks to include or filter on it. Ignore "
+        "labels used only as examples, in negations or exclusions, or in questions "
+        "about data availability. Obey 'do not filter', 'no filter', 'without "
+        "filtering', and equivalent instructions. Return multiple labels only when "
+        "multiple values are explicitly requested. For an all-values comparison, "
+        "leave that dimension empty. Never invent labels. "
+    
+        "Return JSON only with keys: "
         '{"cell_types": [], "cell_classes": [], "regions": [], '
-        '"region_layers": [], "filter_interpretations": []}. Only use exact '
-        "labels from the supplied lists. When a functional or conceptual "
-        "phrase rather than a literal dataset label is mapped to one or more "
-        "labels (for example, 'memory-related region' to 'Hippocampus'), add "
-        "one filter_interpretations object with keys dimension, source_phrase, "
-        "labels, and rationale. source_phrase must be an exact short span from "
-        "the user query; labels must be the exact selected dataset labels; and "
-        "rationale must briefly explain both the biological connection and why "
-        "those labels are the closest available dataset match. Do not imply "
-        "that one selected region is the only structure involved in a broad "
-        "function. Do not add an interpretation object for a literal label or "
-        "a deterministic spelling/abbreviation alias."
+        '"region_layers": [], "filter_interpretations": []}. Only use exact labels "
+        "from the supplied lists. When mapping a functional or conceptual phrase "
+        "rather than a literal label, add one filter_interpretations object with "
+        "keys dimension, source_phrase, labels, and rationale. source_phrase must "
+        "be an exact span from the query, labels must be exact dataset labels, and "
+        "rationale must briefly explain the mapping without implying that the "
+        "selected label is the only structure involved. Do not add an interpretation "
+        "for literal labels or deterministic spelling/abbreviation aliases."
     )
 
     user_prompt = (
