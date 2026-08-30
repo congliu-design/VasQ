@@ -4508,10 +4508,16 @@ def analyze_query_intent(user_input, history=None):
         # ------------------------------------------------------------
         # 3. Gene and disease extraction
         # ------------------------------------------------------------
-        "Genes must contain only explicitly mentioned human gene symbols or gene "
-        "symbols inherited unambiguously from recent context. Normalize gene "
-        "symbols to uppercase. Do not infer candidate genes from a disease, "
-        "biological function, pathway, cell type, or therapeutic target. "
+        "Include a human gene symbol in genes when the user explicitly asks about "
+        "that gene, its expression, function, disease association, pathway role, or "
+        "when it is presented as a direct molecular or therapeutic target. Do not "
+        "include a symbol merely because it appears incidentally inside a mechanism, "
+        "delivery route, or adjective phrase such as 'LRP1-mediated transport' or "
+        "'TFRC-mediated transcytosis', unless the question separately asks about "
+        "LRP1 or TFRC itself. Preserve such mechanistic terms unchanged in "
+        "resolved_question. Include genes inherited from recent context only when "
+        "the reference is unambiguous. Normalize extracted gene symbols to uppercase, "
+        "and do not infer genes that are not explicitly requested or mentioned. "
     
         "Diseases must contain only named diseases, disorders, syndromes, or "
         "clinically recognized conditions. Do not place genes, proteins, peptides, "
