@@ -4473,7 +4473,7 @@ def analyze_query_intent(user_input, history=None):
             "resolved_question": user_input.strip(),
         }
 
-   system_prompt = (
+    system_prompt = (
         "Classify a conversation turn for a biomedical/neuroscience research "
         "assistant. Return JSON only with these keys: is_scientific (boolean), "
         "asks_expression (boolean), asks_drugs (boolean), genes (array of human "
@@ -4844,6 +4844,7 @@ def analyze_query_intent(user_input, history=None):
             "Scientific intent analysis failed; using rules"
         )
         return fallback_query_intent(user_input)
+
         
 
 def ensure_chat_initialized(history):
