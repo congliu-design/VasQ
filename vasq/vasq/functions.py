@@ -3513,34 +3513,32 @@ def wrap_plot_label(value, max_chars=22, max_lines=3):
     return "<br>".join(lines)
 
 
-def marker_size_from_cell_counts(n_cells_series, *, min_size=4.0, max_size=17.0):
-    """Map cell counts to dot diameters on a log scale, normalized to the
-    min/max actually present in this plot. Cell counts routinely span two
-    to three orders of magnitude (tens to tens of thousands) in a single
-    plot, so a linear or sqrt scale would make everything but the single
-    largest group look identically tiny; log compresses that range into a
-    readable size gradient instead.
+def marker_size_from_expressing_fraction(pct_expr_series):
+    """Return fixed-scale percentages for Plotly's area-based dot sizing.
+
+    ``pct_expr`` is the fraction of cells with nonzero expression within the
+    exact plotted population, such as capillary endothelial cells in DLPFC.
+    Keeping the returned scale fixed at 0--100 makes a 60% group the same dot
+    size in every figure instead of rescaling it against whichever groups
+    happen to share the current plot.
     """
-    counts = np.clip(n_cells_series.to_numpy(dtype=float), 1.0, None)
-    log_counts = np.log10(counts)
-    log_min, log_max = log_counts.min(), log_counts.max()
-    if log_max > log_min:
-        normalized = (log_counts - log_min) / (log_max - log_min)
-    else:
-        # Every group in this plot has (about) the same cell count.
-        normalized = np.ones_like(log_counts)
-    return (min_size + (max_size - min_size) * normalized).round(1).tolist()
+    fractions = np.clip(pct_expr_series.to_numpy(dtype=float), 0.0, 1.0)
+    return (100.0 * fractions).round(2).tolist()
 
 
 def matrix_plot_marker(plot_df, *, showscale=True, color_max=None):
-    """Shared dot-matrix encoding: color=mean expression, size=cells analyzed."""
+    """Shared encoding: color=mean expression, area=% expressing cells."""
     if color_max is None:
         positive = plot_df.loc[plot_df["mean_expr"] > 0, "mean_expr"]
         color_max = float(positive.quantile(0.95)) if not positive.empty else 1.0
     color_max = max(float(color_max), 0.001)
     return {
-        "size": marker_size_from_cell_counts(plot_df["n_cells"]),
-        "sizemode": "diameter",
+        "size": marker_size_from_expressing_fraction(plot_df["pct_expr"]),
+        "sizemode": "area",
+        # Plotly's recommended area-mode reference for a fixed 0--100 input
+        # scale and a maximum rendered diameter of approximately 24 px.
+        "sizeref": 2.0 * 100.0 / (24.0 ** 2),
+        "sizemin": 2,
         "color": plot_df["mean_expr"].astype(float).tolist(),
         "cmin": 0,
         "cmax": color_max,
@@ -3633,7 +3631,7 @@ def build_single_gene_cell_type_matrix(plot_df, comparison_cols):
                 "text": (
                     f"<b>{gene} expression: region × cell type</b>"
                     "<br><span style='font-size:12px;color:#64748b'>"
-                    "Color = mean expression · Size = cells analyzed"
+                    "Color = mean expression · Size = expressing cells (%)"
                     f" · Groups require ≥{MIN_CELLS_PER_GROUP} cells</span>"
                 ),
                 "x": 0.02,
@@ -3824,7 +3822,7 @@ def build_cell_type_gene_panels(plot_df, gene_order, comparison_cols):
                 "<b>VasQ expression by cell type</b>"
                 "<br><span style='font-size:12px;color:#64748b'>"
                 "Each panel is one cell type · x = region · y = gene · "
-                "Color = mean expression · Size = cells analyzed"
+                "Color = mean expression · Size = expressing cells (%)"
                 f" · Groups require ≥{MIN_CELLS_PER_GROUP} cells</span>"
             ),
             "x": 0.02,
@@ -3956,8 +3954,8 @@ def build_matrix_expression_plot(
 
     x_values = plot_df["_comparison_label"].tolist()
     y_values = plot_df["gene"].tolist()
-    marker_sizes = marker_size_from_cell_counts(
-        plot_df["n_cells"], min_size=6.0, max_size=24.0
+    marker_sizes = marker_size_from_expressing_fraction(
+        plot_df["pct_expr"]
     )
 
     color_values = plot_df["mean_expr"].tolist()
@@ -4002,7 +4000,9 @@ def build_matrix_expression_plot(
                 "hoverinfo": "text",
                 "marker": {
                     "size": marker_sizes,
-                    "sizemode": "diameter",
+                    "sizemode": "area",
+                    "sizeref": 2.0 * 100.0 / (24.0 ** 2),
+                    "sizemin": 2,
                     "color": color_values,
                     "cmin": 0,
                     "cmax": color_max,
@@ -4028,7 +4028,7 @@ def build_matrix_expression_plot(
                 "text": (
                     f"<b>VasQ expression by {dimension_title}</b>"
                     "<br><span style='font-size:12px;color:#64748b'>"
-                    "Color = mean expression · Size = cells analyzed"
+                    "Color = mean expression · Size = expressing cells (%)"
                     f" · Groups require ≥{MIN_CELLS_PER_GROUP} cells"
                     "</span>"
                 ),
@@ -5256,7 +5256,12 @@ def _chat_impl(user_input, history, should_stop=None):
         "content": (
             "Answer the user's scientific question directly using the evidence "
             "package supplied after the conversation. Integrate only relevant "
-            "evidence. When SOURCE SCOPE says VasQ matrix data only, do not "
+            "evidence. Begin with the substantive answer. Do not announce the "
+            "answer's format or length with meta-language such as 'short "
+            "report', 'brief report', 'concise summary', 'quick overview', or "
+            "'here is a summary'. Do not use those phrases as headings either; "
+            "use only descriptive headings tied to the scientific content. "
+            "When SOURCE SCOPE says VasQ matrix data only, do not "
             "introduce external scientific claims and do not imply "
             "that external sources were searched. Treat target-disease and "
             "genetic associations retrieved from Open Targets, Monarch, or "
