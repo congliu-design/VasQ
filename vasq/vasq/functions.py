@@ -4473,57 +4473,80 @@ def analyze_query_intent(user_input, history=None):
             "resolved_question": user_input.strip(),
         }
 
-    system_prompt = (
+   system_prompt = (
         "Classify a conversation turn for a biomedical/neuroscience research "
-        "assistant. Return JSON only with keys: is_scientific (boolean), "
-        "asks_expression (boolean), asks_drugs (boolean), genes (array of "
-        "human gene symbols), diseases (array of disease/condition names), "
+        "assistant. Return JSON only with these keys: is_scientific (boolean), "
+        "asks_expression (boolean), asks_drugs (boolean), genes (array of human "
+        "gene symbols), diseases (array of disease or condition names), "
         "use_vasq (boolean), and resolved_question (string). "
-
-        "Set asks_drugs only when the current question explicitly asks about "
-        "drugs, compounds, treatments, therapies, modulators, inhibitors, "
-        "agonists, antagonists, or clinical candidates. The mere presence of "
-        "a disease or gene is not sufficient. "
-
-        "Set asks_expression when the user asks about measured gene expression, "
-        "expression differences, expressing-cell percentages, regional or "
-        "cell-type distribution, marker ranking, top genes, cell-type "
-        "enrichment, regional enrichment, or regional specificity. Marker, "
-        "rank, enrichment, and top-gene questions are answered through the "
-        "same expression-matrix workflow. "
-
-        "Drug intent and expression intent are independent. Set both "
-        "asks_drugs and asks_expression to true when the question explicitly "
-        "asks for both drug information and gene-expression information. "
-
-        "Set use_vasq to true for brain-related expression questions. This "
-        "includes questions about brain regions, brain-region layers, gray "
-        "matter, white matter, cortex, hippocampus, midbrain, cerebral lobes, "
-        "brain vasculature, vascular cells, glial cells, neurons, marker genes, "
-        "regional specificity, and cell-type or region enrichment. The user "
-        "does not need to explicitly mention brain vasculature or provide a "
-        "gene. Gene-free marker, transporter, or disease-enrichment questions "
-        "can first obtain candidate genes and then query the VasQ matrix. "
-
-        "Set use_vasq to false when asks_expression is false or when the user "
-        "explicitly requests expression only in a non-brain organ or tissue. "
-        "For a comparison requiring both brain and a non-brain organ, set "
-        "use_vasq to false because VasQ cannot provide the non-brain side of "
-        "the comparison. "
-
-        "A greeting, thanks, casual conversation, or app/meta question is not "
-        "scientific. Resolve short follow-ups using recent context, but do not "
-        "invent a gene, disease, cell type, or brain region. Include genes or "
-        "diseases inherited from context only when the reference is "
-        "unambiguous. Normalize human gene symbols to uppercase. "
-
-        "In resolved_question, preserve the current user's exact functional "
-        "and qualitative wording and all qualifiers. Only add an unambiguous "
-        "entity needed to resolve a short follow-up. Do not translate a phrase "
-        "such as 'memory-related region' into a named brain region, and do not "
-        "silently replace a broad concept with a narrower dataset label. If "
-        "the current message is standalone, copy it verbatim into "
-        "resolved_question."
+    
+        # ------------------------------------------------------------
+        # 1. Scientific intent
+        # ------------------------------------------------------------
+        "Set is_scientific to true when the current question requests biomedical "
+        "or neuroscience knowledge, including questions about genes, diseases, "
+        "pathways, biological mechanisms, drugs, brain regions, cell types, or "
+        "gene expression. Greetings, thanks, casual conversation, and questions "
+        "about the VasQ application itself are not scientific. "
+    
+        # ------------------------------------------------------------
+        # 2. Expression and drug intent
+        # ------------------------------------------------------------
+        "Set asks_expression to true when the user asks about measured gene "
+        "expression, expression differences, expressing-cell percentages, "
+        "regional or cell-type distributions, marker ranking, top genes, "
+        "cell-type or regional enrichment, or regional specificity. Marker, "
+        "ranking, enrichment, and top-gene questions use the same expression-"
+        "matrix workflow. "
+    
+        "Set asks_drugs to true only when the user explicitly asks about drugs, "
+        "compounds, treatments, therapies, modulators, inhibitors, agonists, "
+        "antagonists, or clinical candidates. A disease or gene alone does not "
+        "imply drug intent. Expression and drug intent are independent; set both "
+        "to true when both types of information are explicitly requested. "
+    
+        # ------------------------------------------------------------
+        # 3. Gene and disease extraction
+        # ------------------------------------------------------------
+        "Genes must contain only explicitly mentioned human gene symbols or gene "
+        "symbols inherited unambiguously from recent context. Normalize gene "
+        "symbols to uppercase. Do not infer candidate genes from a disease, "
+        "biological function, pathway, cell type, or therapeutic target. "
+    
+        "Diseases must contain only named diseases, disorders, syndromes, or "
+        "clinically recognized conditions. Do not place genes, proteins, peptides, "
+        "receptors, biomarkers, pathological molecules, pathways, cell types, "
+        "brain regions, or therapeutic targets in diseases. Amyloid beta, Aβ, "
+        "tau, alpha-synuclein, and the BBB are not diseases. "
+    
+        # ------------------------------------------------------------
+        # 4. VasQ routing
+        # ------------------------------------------------------------
+        "Set use_vasq to true when asks_expression is true and the requested "
+        "expression scope concerns the brain, a brain region or layer, a "
+        "VasQ-supported brain cell type, or does not explicitly specify another "
+        "organ. This includes gene-free marker, transporter, top-gene, and "
+        "disease-enrichment questions, because candidate genes can be obtained "
+        "before querying the VasQ matrix. "
+    
+        "Set use_vasq to false when asks_expression is false, when expression is "
+        "requested exclusively in a non-brain organ or tissue, or when the "
+        "requested comparison requires both brain and non-brain expression data "
+        "that the VasQ matrix cannot provide. "
+    
+        # ------------------------------------------------------------
+        # 5. Follow-ups and resolved question
+        # ------------------------------------------------------------
+        "Resolve short follow-up questions using recent conversation context. "
+        "Inherit a gene or disease only when the reference is unambiguous, and do "
+        "not invent a gene, disease, cell type, or brain region. "
+    
+        "In resolved_question, preserve the user's functional wording, qualitative "
+        "terms, and all qualifiers. Add only an entity required to resolve an "
+        "unambiguous follow-up. Do not translate phrases such as 'memory-related "
+        "region' into a named brain region or replace a broad concept with a "
+        "narrower dataset label. If the current message is standalone, copy it "
+        "verbatim into resolved_question."
     )
 
     user_prompt = (
