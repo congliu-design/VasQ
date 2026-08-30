@@ -5121,6 +5121,21 @@ def _raise_if_cancelled(should_stop):
         raise ChatCancelled("Chat request stopped by user.")
 
 
+def should_run_primary_scientific_search(intent, direct_vasq_only):
+    """Return False for a drug-only request that can go straight to Branch C.
+
+    The dedicated drug search already covers drug/target databases, primary
+    literature, trials, and regulatory sources. Running the broad scientific
+    discovery search first is useful for expression questions that need genes,
+    but redundant for a request that asks only for drugs or therapeutics.
+    """
+    if direct_vasq_only:
+        return False
+    asks_drugs = bool((intent or {}).get("asks_drugs"))
+    asks_expression = bool((intent or {}).get("asks_expression"))
+    return not (asks_drugs and not asks_expression)
+
+
 
 def _chat_impl(user_input, history, should_stop=None):
     _raise_if_cancelled(should_stop)
@@ -5132,6 +5147,15 @@ def _chat_impl(user_input, history, should_stop=None):
 
     # Resolve the current turn against prior context before adding it to history.
     intent = analyze_query_intent(user_input, history)
+    rule_intent = fallback_query_intent(user_input)
+    if rule_intent.get("asks_drugs") and not intent.get("asks_drugs"):
+        # Deterministic protection against an intent-model false negative for
+        # explicit drug/therapy/compound wording.
+        logger.warning(
+            "Intent helper missed explicit drug wording; applying rule override"
+        )
+        intent["asks_drugs"] = True
+        intent["is_scientific"] = True
     _raise_if_cancelled(should_stop)
     update_history(history, "user", user_input)
 
@@ -5158,6 +5182,7 @@ def _chat_impl(user_input, history, should_stop=None):
     user_supplied_genes = list(intent.get("genes") or [])
     genes = user_supplied_genes[:]
     diseases = intent.get("diseases") or []
+    asks_drugs = bool(intent.get("asks_drugs"))
 
     # An explicit VasQ-matrix-only request should not spend several minutes on
     # Web Search. An equally explicit request for web/literature
@@ -5173,6 +5198,16 @@ def _chat_impl(user_input, history, should_stop=None):
         intent["use_vasq"] = True
     logger.info("Direct VasQ-only routing=%s", direct_vasq_only)
 
+    run_primary_scientific_search = should_run_primary_scientific_search(
+        intent,
+        direct_vasq_only,
+    )
+    drug_first_only = (
+        not direct_vasq_only
+        and asks_drugs
+        and not bool(intent.get("asks_expression"))
+    )
+
     scientific_web_result = None
 
     # Branch A: unless this is a direct VasQ-only request, run a
@@ -5183,6 +5218,11 @@ def _chat_impl(user_input, history, should_stop=None):
     if direct_vasq_only:
         logger.info(
             "Direct VasQ matrix request detected; skipping OpenAI Web Search"
+        )
+    elif drug_first_only:
+        logger.info(
+            "Drug-first routing: skipping broad scientific discovery and "
+            "going directly to the drug-specific Web Search"
         )
     else:
         _raise_if_cancelled(should_stop)
@@ -5216,7 +5256,7 @@ def _chat_impl(user_input, history, should_stop=None):
     # the same matrix_expression() pipeline) needs genes but the primary
     # search did not resolve any.
     needs_gene_fallback = (
-        not direct_vasq_only
+        run_primary_scientific_search
         and intent.get("asks_expression")
         and not user_supplied_genes
         and not genes
@@ -5288,7 +5328,7 @@ def _chat_impl(user_input, history, should_stop=None):
     # collapsing ten genes into one generic disease-association paragraph.
     gene_literature_result = None
     needs_gene_literature = (
-        not direct_vasq_only
+        run_primary_scientific_search
         and bool(genes)
         and bool(
             diseases
@@ -5364,15 +5404,21 @@ def _chat_impl(user_input, history, should_stop=None):
     # Branch C: optional second Web Search. Only run it when the user actually
     # asked for drugs/therapeutics; a disease or gene alone is not sufficient.
     drug_result = None
-    asks_drugs = bool(intent.get("asks_drugs"))
     if not direct_vasq_only and asks_drugs:
         _raise_if_cancelled(should_stop)
         try:
-            logger.info(
-                "Web Search stage 2/2: drugs for genes=%s diseases=%s",
-                genes,
-                diseases,
-            )
+            if drug_first_only:
+                logger.info(
+                    "Drug-first Web Search: genes=%s diseases=%s",
+                    genes,
+                    diseases,
+                )
+            else:
+                logger.info(
+                    "Web Search stage 2/2: drugs for genes=%s diseases=%s",
+                    genes,
+                    diseases,
+                )
             drug_result = search_drugs_and_small_molecules(
                 resolved_question,
                 genes=genes,
@@ -5395,13 +5441,14 @@ def _chat_impl(user_input, history, should_stop=None):
         )
 
     if genes:
+        if direct_vasq_only:
+            gene_list_heading = "GENES USED FOR VASQ ANALYSIS:\n"
+        elif drug_first_only and user_supplied_genes:
+            gene_list_heading = "GENES EXPLICITLY PROVIDED BY THE USER:\n"
+        else:
+            gene_list_heading = "GENE LIST DERIVED FROM THE FIRST SEARCH:\n"
         evidence_parts.append(
-            (
-                "GENES USED FOR VASQ ANALYSIS:\n"
-                if direct_vasq_only
-                else "GENE LIST DERIVED FROM THE FIRST SEARCH:\n"
-            )
-            + ", ".join(genes)
+            gene_list_heading + ", ".join(genes)
         )
 
     if vasq_llm_evidence_json:
@@ -5443,7 +5490,7 @@ def _chat_impl(user_input, history, should_stop=None):
                 "GENE-BY-GENE SCIENTIFIC LITERATURE EVIDENCE:\n"
                 + compact_gene_literature
             )
-        else:
+        elif needs_gene_literature:
             evidence_parts.append(
                 "GENE-BY-GENE LITERATURE STATUS:\n"
                 "No usable gene-specific literature evidence was returned."
@@ -5466,7 +5513,7 @@ def _chat_impl(user_input, history, should_stop=None):
                 "PRIMARY SCIENTIFIC WEB EVIDENCE:\n"
                 + compact_scientific_evidence
             )
-        elif not gene_literature_result:
+        elif run_primary_scientific_search and not gene_literature_result:
             evidence_parts.append(
                 "SCIENTIFIC WEB STATUS:\nNo usable web evidence was returned."
             )
