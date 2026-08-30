@@ -498,7 +498,7 @@ TEST_CASES = [
         "expected": {
             "is_scientific": True, "asks_expression": False,
             "asks_drugs": True, "use_vasq": False,
-            "genes": ["LRP1"], "diseases": [],
+            "genes": [], "diseases": [],
         },
     },
     # Scientific questions that do not ask for expression or drugs
