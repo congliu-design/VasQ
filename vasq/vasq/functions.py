@@ -95,8 +95,8 @@ _TOKEN_ENCODERS = {}
 TOKEN_BUDGET_DEFAULTS = {
     "VASQ_EXPRESSION_EVIDENCE_TOKENS": 5000,
     "VASQ_GENE_LITERATURE_EVIDENCE_TOKENS": 4500,
-    "VASQ_PRIMARY_SCIENTIFIC_EVIDENCE_TOKENS": 1250,
-    "VASQ_DRUG_EVIDENCE_TOKENS": 1750,
+    "VASQ_PRIMARY_SCIENTIFIC_EVIDENCE_TOKENS": 3000,
+    "VASQ_DRUG_EVIDENCE_TOKENS": 3000,
     "VASQ_MATRIX_HINT_EVIDENCE_TOKENS": 1500,
     "VASQ_GENE_DERIVATION_EVIDENCE_TOKENS": 2250,
     "VASQ_PARTIAL_EXPRESSION_TOKENS": 1500,
@@ -819,13 +819,24 @@ def run_openai_web_search(
             str(search_prompt).rstrip()
             + "\n\nOUTPUT REQUIREMENTS FOR DOWNSTREAM SYNTHESIS:\n"
             "Return a concise, structured evidence package, not a long "
-            "user-facing narrative. Use short descriptive headings and "
-            "compact bullets or records. Include only findings directly "
-            "relevant to the question. For each finding, state the entity, "
-            "relationship or mechanism, evidence/status, and an inline "
-            "citation to the exact retrieved source. Combine duplicate "
-            "findings, avoid repeated background explanations, and state "
-            "important uncertainty briefly. Aim to keep the complete "
+            "user-facing narrative. For scientific findings and therapeutic "
+            "candidates, use one repeated block per candidate-evidence "
+            "relationship in exactly this form:\n\n"
+            "EVIDENCE RECORD: <candidate or entity>\n"
+            "- Finding: <directly relevant relationship or mechanism>\n"
+            "- Evidence/status: <evidence type, development status, and brief "
+            "uncertainty>\n"
+            "- Source: <inline markdown citation to the exact retrieved "
+            "source>\n\n"
+            "Keep each record at or below 90 words. If one candidate has "
+            "multiple distinct findings, create additional records with the "
+            "same candidate name. Include every explicitly requested entity; "
+            "otherwise report at most 12 candidates. Do not place unique "
+            "candidate evidence only in a preamble or summary table. If a "
+            "stage-specific instruction requires another exact repeated "
+            "heading such as 'GENE: SYMBOL', preserve that required heading. "
+            "Combine duplicates, avoid repeated background explanations, and "
+            "keep important uncertainty brief. Aim to keep the complete "
             "response within 4,000 output tokens; the final Sol model will "
             "integrate this evidence into the user-facing answer."
         )
@@ -4565,6 +4576,193 @@ def cap_source_text(text, max_tokens, *, model=None):
     )
 
 
+_EVIDENCE_RECORD_HEADER_RE = re.compile(
+    r"(?im)^(?:#{1,6}\s*)?(?:[-*]\s*)?(?:\*\*)?"
+    r"EVIDENCE\s+RECORD\s*:\s*.+$"
+)
+
+
+def _split_evidence_records(text):
+    """Return ordered ``(candidate, complete_record)`` Web evidence blocks."""
+    text = str(text or "").strip()
+    # The consulted-source appendix is deliberately not claim-bound and must
+    # not be treated as evidence merely because it follows the last record.
+    claim_bound_text = text.split(
+        "\n\nOther sources the search tool consulted",
+        1,
+    )[0].strip()
+    matches = list(_EVIDENCE_RECORD_HEADER_RE.finditer(claim_bound_text))
+    records = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(
+            claim_bound_text
+        )
+        record = claim_bound_text[match.start():end].strip()
+        header = match.group(0)
+        candidate = re.sub(
+            r"(?i)^.*?EVIDENCE\s+RECORD\s*:\s*",
+            "",
+            header,
+        ).strip(" #*\t")
+        candidate_key = re.sub(r"\s+", " ", candidate).casefold()
+        if candidate_key and record:
+            records.append((candidate_key, record))
+    return records
+
+
+def _first_record_field(lines, label):
+    prefix = re.compile(rf"(?i)^\s*[-*]?\s*{re.escape(label)}\s*:\s*(.*)$")
+    for line in lines:
+        match = prefix.match(line)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _fit_primary_evidence_record(record, max_tokens, *, model=None):
+    """Keep one minimal, citation-bearing record inside a fair-share budget."""
+    record = str(record or "").strip()
+    if count_text_tokens(record, model=model) <= max_tokens:
+        return record
+
+    lines = [line.strip() for line in record.splitlines() if line.strip()]
+    header = lines[0] if lines else "EVIDENCE RECORD: Unnamed candidate"
+    finding = _first_record_field(lines, "Finding")
+    evidence = _first_record_field(lines, "Evidence/status")
+    source = _first_record_field(lines, "Source")
+
+    if not source:
+        source_line = next(
+            (line for line in lines if "http://" in line or "https://" in line),
+            "",
+        )
+        source = source_line.lstrip("-* ")
+
+    # Preserve one exact retrieved citation. If the source field contains a
+    # long list, the first inline citation is sufficient for the primary
+    # candidate record; extra sources remain eligible as later records.
+    markdown_link = _MARKDOWN_LINK_PATTERN.search(source)
+    if markdown_link:
+        source = markdown_link.group(0)
+    elif source:
+        url_match = _URL_PATTERN.search(source)
+        if url_match:
+            source = url_match.group(0)
+
+    finding = finding or "Relevant candidate relationship reported by the search."
+    evidence = evidence or "See the cited retrieved source; uncertainty retained."
+    source = source or "No claim-bound source returned for this record."
+
+    fixed = f"{header}\n- Source: {source}"
+    fixed_tokens = count_text_tokens(fixed, model=model)
+    remaining = max(0, int(max_tokens) - fixed_tokens - 12)
+    finding_budget = max(1, int(remaining * 0.6))
+    evidence_budget = max(1, remaining - finding_budget)
+    finding = _text_prefix_within_token_budget(
+        finding,
+        finding_budget,
+        model=model,
+    ).rstrip(" ,;:")
+    evidence = _text_prefix_within_token_budget(
+        evidence,
+        evidence_budget,
+        model=model,
+    ).rstrip(" ,;:")
+    compact = (
+        f"{header}\n"
+        f"- Finding: {finding or 'Relevant relationship.'}\n"
+        f"- Evidence/status: {evidence or 'See cited evidence.'}\n"
+        f"- Source: {source}"
+    )
+    return cap_text_tokens(
+        compact,
+        max_tokens,
+        suffix="",
+        line_boundary=True,
+        model=model,
+    )
+
+
+def compact_structured_web_evidence(text, max_tokens, *, model=None):
+    """Fairly compact structured Web evidence without favoring early items.
+
+    The first complete record for every candidate is selected before any
+    candidate receives a second record. Extra records are then added in their
+    original order while budget remains. Legacy/non-conforming search output
+    safely falls back to the previous prefix cap.
+    """
+    text = str(text or "").strip()
+    max_tokens = max(0, int(max_tokens))
+    if count_text_tokens(text, model=model) <= max_tokens:
+        return text
+
+    records = _split_evidence_records(text)
+    if not records:
+        logger.warning(
+            "Structured Web evidence contained no EVIDENCE RECORD blocks; "
+            "using legacy token cap"
+        )
+        return cap_source_text(text, max_tokens, model=model)
+
+    first_by_candidate = {}
+    extras = []
+    for candidate_key, record in records:
+        if candidate_key not in first_by_candidate:
+            first_by_candidate[candidate_key] = record
+        else:
+            extras.append(record)
+
+    primary_records = list(first_by_candidate.values())
+    note_template = (
+        "[Structured evidence compacted: retained {records} record(s) across "
+        "{candidates} candidate(s); omitted {omitted} additional record(s).]"
+    )
+    note = note_template.format(
+        records=len(primary_records),
+        candidates=len(primary_records),
+        omitted=max(0, len(records) - len(primary_records)),
+    )
+    note_tokens = count_text_tokens("\n\n" + note, model=model)
+    content_budget = max(0, max_tokens - note_tokens)
+    separator_tokens = max(0, len(primary_records) - 1) * count_text_tokens(
+        "\n\n",
+        model=model,
+    )
+    record_budget = max(0, content_budget - separator_tokens)
+    fair_share = max(1, record_budget // max(1, len(primary_records)))
+
+    selected = [
+        _fit_primary_evidence_record(record, fair_share, model=model)
+        for record in primary_records
+    ]
+    selected = [record for record in selected if record.strip()]
+
+    # Only after every candidate has one record may later evidence consume the
+    # remaining allowance.
+    for record in extras:
+        trial = "\n\n".join(selected + [record])
+        if count_text_tokens(trial + "\n\n" + note, model=model) <= max_tokens:
+            selected.append(record)
+
+    note = note_template.format(
+        records=len(selected),
+        candidates=len(primary_records),
+        omitted=max(0, len(records) - len(selected)),
+    )
+    result = "\n\n".join(selected + [note]).strip()
+    if count_text_tokens(result, model=model) > max_tokens:
+        # Defensive final guard for unusual tokenizer boundaries. Normal
+        # structured records should already fit through fair-share allocation.
+        result = cap_text_tokens(
+            result,
+            max_tokens,
+            suffix="[Structured evidence compacted to token budget]",
+            line_boundary=True,
+            model=model,
+        )
+    return result
+
+
 def cap_text_at_token_line_boundary(
     text,
     max_tokens,
@@ -5255,7 +5453,7 @@ def _chat_impl(user_input, history, should_stop=None):
             scientific_budget = token_budget(
                 "VASQ_PRIMARY_SCIENTIFIC_EVIDENCE_TOKENS"
             )
-            compact_scientific_evidence = cap_source_text(
+            compact_scientific_evidence = compact_structured_web_evidence(
                 scientific_web_result,
                 scientific_budget,
             )
@@ -5276,7 +5474,7 @@ def _chat_impl(user_input, history, should_stop=None):
     if not direct_vasq_only and asks_drugs:
         if drug_result:
             drug_budget = token_budget("VASQ_DRUG_EVIDENCE_TOKENS")
-            compact_drug_evidence = cap_source_text(
+            compact_drug_evidence = compact_structured_web_evidence(
                 drug_result,
                 drug_budget,
             )
