@@ -171,6 +171,41 @@ document.addEventListener("DOMContentLoaded", function() {
             .replace('T', '_');
     }
 
+    function safeQuestionPdfFilename(question, questionNumber) {
+        const normalizedQuestion = String(question || '')
+            .normalize('NFKC')
+            .replace(/[\u0000-\u001f\u007f<>:"/\\|?*]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .replace(/[. ]+$/g, '')
+            .trim();
+        const fallback = 'VasQ-report';
+        const maximumQuestionLength = 140;
+        let questionPart = normalizedQuestion || fallback;
+
+        if (questionPart.length > maximumQuestionLength) {
+            questionPart = questionPart
+                .slice(0, maximumQuestionLength)
+                .replace(/[. ]+$/g, '')
+                .trim();
+        }
+
+        return `question${questionNumber}-${questionPart || fallback}.pdf`;
+    }
+
+    function triggerBlobDownload(blob, filename) {
+        const url = window.URL.createObjectURL(blob);
+        const link = document.createElement('a');
+
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        window.setTimeout(function() {
+            window.URL.revokeObjectURL(url);
+        }, 1000);
+    }
+
     function waitForImages(element) {
         const images = Array.from(element.querySelectorAll('img'));
 
@@ -252,7 +287,7 @@ document.addEventListener("DOMContentLoaded", function() {
                 format: 'png',
                 width: width,
                 height: height,
-                scale: 2
+                scale: 3
             });
             const image = document.createElement('img');
             image.src = dataUrl;
@@ -375,7 +410,12 @@ document.addEventListener("DOMContentLoaded", function() {
         });
     }
 
-    async function downloadMessageRangeAsPdf(startNode, endNode, filename) {
+    async function createMessageRangePdf(
+        startNode,
+        endNode,
+        filename,
+        reportMetadata = null
+    ) {
         if (!startNode || !endNode) {
             throw new Error('There are no messages to export.');
         }
@@ -397,11 +437,30 @@ document.addEventListener("DOMContentLoaded", function() {
         exportDocument.style.width = exportWidth + 'px';
         exportHost.appendChild(exportDocument);
 
+        if (reportMetadata) {
+            const reportHeader = document.createElement('header');
+            const reportTitle = document.createElement('h1');
+            const reportQuestion = document.createElement('p');
+
+            reportHeader.className = 'vasq-pdf-report-header';
+            reportTitle.textContent = `Question ${reportMetadata.questionNumber}`;
+            reportQuestion.textContent = reportMetadata.question;
+            reportHeader.appendChild(reportTitle);
+            reportHeader.appendChild(reportQuestion);
+            exportDocument.appendChild(reportHeader);
+        }
+
         let currentNode = startNode;
         let reachedEnd = false;
 
         while (currentNode) {
-            if (currentNode.classList.contains('vasq-plot-card')) {
+            if (
+                reportMetadata &&
+                currentNode === startNode &&
+                currentNode.classList.contains('user-message')
+            ) {
+                // The report header already contains the full question.
+            } else if (currentNode.classList.contains('vasq-plot-card')) {
                 exportDocument.appendChild(
                     await clonePlotForPdf(currentNode, plotWidth)
                 );
@@ -448,14 +507,18 @@ document.addEventListener("DOMContentLoaded", function() {
                 exportDocument.scrollWidth,
                 exportDocument.scrollHeight
             );
-            const canvasScale = Math.min(2, 28000 / longestSide);
+            // Each queue item is rendered separately, so ordinary reports can
+            // stay near 300 DPI instead of shrinking an entire batch into one
+            // low-resolution canvas. The upper dimension guard prevents
+            // browser canvas failures for unusually long reports.
+            const canvasScale = Math.min(3, 30000 / longestSide);
 
             const opt = {
                 margin: [10, 10, 10, 10],
                 filename: filename,
-                image: { type: 'jpeg', quality: 0.98 },
+                image: { type: 'png', quality: 1 },
                 html2canvas: {
-                    scale: Math.max(0.5, canvasScale),
+                    scale: Math.max(1, canvasScale),
                     useCORS: true,
                     backgroundColor: '#ffffff',
                     logging: false,
@@ -519,11 +582,29 @@ document.addEventListener("DOMContentLoaded", function() {
                 }
             };
 
-            await html2pdf().set(opt).from(exportDocument).save();
+            return await html2pdf()
+                .set(opt)
+                .from(exportDocument)
+                .toPdf()
+                .outputPdf('blob');
         } finally {
             exportHost.remove();
         }
+    }
 
+    async function downloadMessageRangeAsPdf(
+        startNode,
+        endNode,
+        filename,
+        reportMetadata = null
+    ) {
+        const pdfBlob = await createMessageRangePdf(
+            startNode,
+            endNode,
+            filename,
+            reportMetadata
+        );
+        triggerBlobDownload(pdfBlob, filename);
         return filename;
     }
 
@@ -999,6 +1080,7 @@ document.addEventListener("DOMContentLoaded", function() {
             messageElement.textContent = messageText;
             scrollToBottom();
         }
+        return messageElement;
     }
     
     function addTemporaryMessage(messageText) {
@@ -1131,7 +1213,8 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     async function renderGraph(graphJsonValue) {
-        if (!graphJsonValue) return;
+        const renderedGraphs = [];
+        if (!graphJsonValue) return renderedGraphs;
 
         try {
             const parsedGraphs = typeof graphJsonValue === 'string'
@@ -1154,6 +1237,7 @@ document.addEventListener("DOMContentLoaded", function() {
                     'VasQ gene expression across brain regions'
                 );
                 messagesContainer.appendChild(graphDiv);
+                renderedGraphs.push(graphDiv);
                 await Plotly.newPlot(
                     graphDiv,
                     graphJson.data,
@@ -1175,6 +1259,7 @@ document.addEventListener("DOMContentLoaded", function() {
             console.error('Could not render graph:', error);
             addChatMessage('The answer was returned, but its graph could not be rendered.', false);
         }
+        return renderedGraphs;
     }
 
     function formatExpressionTableValue(columnKey, value) {
@@ -1195,7 +1280,7 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     async function renderExpressionTable(tableUrl, downloadUrl) {
-        if (!tableUrl) return;
+        if (!tableUrl) return null;
 
         const card = document.createElement('section');
         card.className = 'vasq-expression-table-card';
@@ -1441,6 +1526,7 @@ document.addEventListener("DOMContentLoaded", function() {
         });
 
         await loadPage(1);
+        return card;
     }
 
     async function sendQuestion(message, options = {}) {
@@ -1465,7 +1551,7 @@ document.addEventListener("DOMContentLoaded", function() {
         activeRequest = requestState;
         if (!isQueueRequest) setStopControl(true);
 
-        addChatMessage(prefix + message, true);
+        const firstReportNode = addChatMessage(prefix + message, true);
         const thinkingMessage = addTemporaryMessage(
             queueIndex && queueTotal
                 ? `Running question ${queueIndex} of ${queueTotal}...`
@@ -1544,7 +1630,9 @@ document.addEventListener("DOMContentLoaded", function() {
                 stopped: false,
                 answer: answerText,
                 hasGraph: Boolean(data.graph_json),
-                elapsedSeconds: secondsSince(startedAt)
+                elapsedSeconds: secondsSince(startedAt),
+                firstReportNode: firstReportNode,
+                lastReportNode: messagesContainer.lastElementChild
             };
         } catch (error) {
             if (error.name === 'AbortError') {
@@ -1554,7 +1642,9 @@ document.addEventListener("DOMContentLoaded", function() {
                     stopped: true,
                     answer: 'Stopped by user.',
                     hasGraph: false,
-                    elapsedSeconds: secondsSince(startedAt)
+                    elapsedSeconds: secondsSince(startedAt),
+                    firstReportNode: firstReportNode,
+                    lastReportNode: messagesContainer.lastElementChild
                 };
             }
 
@@ -1569,7 +1659,9 @@ document.addEventListener("DOMContentLoaded", function() {
                 stopped: false,
                 answer: errorText,
                 hasGraph: false,
-                elapsedSeconds: secondsSince(startedAt)
+                elapsedSeconds: secondsSince(startedAt),
+                firstReportNode: firstReportNode,
+                lastReportNode: messagesContainer.lastElementChild
             };
         } finally {
             if (activeRequest === requestState) {
@@ -1636,13 +1728,15 @@ document.addEventListener("DOMContentLoaded", function() {
             messageInput.value = '';
             stopQueueRequested = false;
             setQueueControls(true);
-            const queueStartMessage = addQueueStatus(
+            addQueueStatus(
                 `Queue started: ${questions.length} question(s).`
             );
 
             let completed = 0;
             let failed = 0;
             const results = [];
+            const pdfReports = [];
+            let pdfFailures = 0;
 
             for (let index = 0; index < questions.length; index += 1) {
                 if (stopQueueRequested) break;
@@ -1667,6 +1761,33 @@ document.addEventListener("DOMContentLoaded", function() {
                     elapsedSeconds: result.elapsedSeconds
                 });
 
+                const reportFilename = safeQuestionPdfFilename(
+                    questions[index],
+                    index + 1
+                );
+
+                try {
+                    const pdfBlob = await createMessageRangePdf(
+                        result.firstReportNode,
+                        result.lastReportNode,
+                        reportFilename,
+                        {
+                            questionNumber: index + 1,
+                            question: questions[index]
+                        }
+                    );
+                    pdfReports.push({
+                        filename: reportFilename,
+                        blob: pdfBlob
+                    });
+                } catch (error) {
+                    pdfFailures += 1;
+                    console.error(
+                        `Could not export PDF for question ${index + 1}:`,
+                        error
+                    );
+                }
+
                 if (result.success) {
                     completed += 1;
                 } else {
@@ -1675,23 +1796,50 @@ document.addEventListener("DOMContentLoaded", function() {
             }
 
             const wasStopped = stopQueueRequested;
-            const pdfFilename =
-                `vasq_batch_results_${exportTimestamp()}.pdf`;
+            const archiveFilename =
+                `vasq_question_reports_${exportTimestamp()}.zip`;
             const completionText = wasStopped
                 ? `Queue stopped. Completed: ${completed}; failed: ${failed}. `
                 : `Queue finished. Completed: ${completed}; failed: ${failed}. `;
             const queueEndMessage = addQueueStatus(
-                completionText + `PDF: ${pdfFilename}`
+                completionText + 'Preparing separate PDF reports...'
             );
 
             try {
-                await downloadMessageRangeAsPdf(
-                    queueStartMessage,
-                    queueEndMessage,
-                    pdfFilename
-                );
+                if (!pdfReports.length) {
+                    throw new Error('No PDF reports were generated.');
+                }
+
+                if (typeof JSZip === 'undefined') {
+                    pdfReports.forEach(function(report) {
+                        triggerBlobDownload(report.blob, report.filename);
+                    });
+                    queueEndMessage.textContent =
+                        completionText +
+                        `${pdfReports.length} separate PDF file(s) downloaded.`;
+                } else {
+                    const archive = new JSZip();
+                    pdfReports.forEach(function(report) {
+                        archive.file(report.filename, report.blob);
+                    });
+                    const archiveBlob = await archive.generateAsync({
+                        type: 'blob',
+                        compression: 'DEFLATE',
+                        compressionOptions: { level: 6 }
+                    });
+                    triggerBlobDownload(archiveBlob, archiveFilename);
+                    queueEndMessage.textContent =
+                        completionText +
+                        `${pdfReports.length} separate PDF report(s): ` +
+                        archiveFilename;
+                }
+
+                if (pdfFailures) {
+                    queueEndMessage.textContent +=
+                        ` PDF generation failed for ${pdfFailures} question(s).`;
+                }
             } catch (error) {
-                console.error('Could not export queue PDF:', error);
+                console.error('Could not export queue PDF reports:', error);
                 const fallbackFilename = downloadBatchResults(
                     results,
                     questions.length,
