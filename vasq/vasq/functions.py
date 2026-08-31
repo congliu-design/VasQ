@@ -731,6 +731,7 @@ def _splice_web_search_citations(response):
     """
     fallback_urls = []
     pieces = []
+    cited_urls = set()
     try:
         for item in getattr(response, "output", None) or []:
             item_type = getattr(item, "type", None)
@@ -756,6 +757,7 @@ def _splice_web_search_citations(response):
                     for annotation in annotations:
                         end = annotation.end_index
                         url = annotation.url
+                        cited_urls.add(url)
                         # OpenAI's web_search generation often already
                         # embeds its own markdown link to the cited URL
                         # directly in the text, right around where the
@@ -765,6 +767,9 @@ def _splice_web_search_citations(response):
                         # *original* text (not `spliced`, which may already
                         # have later-position markers inserted) around this
                         # position for an existing link to this exact URL.
+                        # Its label is left as-is here (rewritten to the
+                        # canonical form in one pass below, alongside any
+                        # marker inserted just now) -- not skipped outright.
                         window_start = max(0, end - 300)
                         window_end = min(len(text), end + 50)
                         if f"]({url})" in text[window_start:window_end]:
@@ -788,6 +793,25 @@ def _splice_web_search_citations(response):
         text_with_inline_sources = "\n".join(p for p in pieces if p.strip())
     else:
         text_with_inline_sources = str(getattr(response, "output_text", "") or "").strip()
+
+    # Force every markdown link whose URL exactly matches one of this
+    # response's own url_citation annotations onto the same
+    # mechanically-derived label -- whether that link was just inserted
+    # above or was already present verbatim in the model's own text and
+    # therefore skipped. A citation's visible text must depend only on
+    # its URL string, never on model-chosen wording, so that a later
+    # rewriting stage either copies the (label, url) pair unchanged (and
+    # a downstream label-equality check can trust it) or visibly changes
+    # the label (and that check can safely distrust it).
+    for url in cited_urls:
+        canonical_label = _source_label(url)
+        existing_link_pattern = re.compile(
+            r"\[[^\]]*\]\(" + re.escape(url) + r"\)"
+        )
+        text_with_inline_sources = existing_link_pattern.sub(
+            f"[{canonical_label}]({url})",
+            text_with_inline_sources,
+        )
 
     seen = set()
     unique_fallback = []
