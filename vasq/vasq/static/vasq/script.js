@@ -1735,7 +1735,7 @@ document.addEventListener("DOMContentLoaded", function() {
             let completed = 0;
             let failed = 0;
             const results = [];
-            const pdfReports = [];
+            let pdfSuccesses = 0;
             let pdfFailures = 0;
 
             for (let index = 0; index < questions.length; index += 1) {
@@ -1776,10 +1776,11 @@ document.addEventListener("DOMContentLoaded", function() {
                             question: questions[index]
                         }
                     );
-                    pdfReports.push({
-                        filename: reportFilename,
-                        blob: pdfBlob
-                    });
+                    // Download this question's report the moment it's
+                    // ready -- don't wait for the rest of the queue and
+                    // don't bundle it into an archive with the others.
+                    triggerBlobDownload(pdfBlob, reportFilename);
+                    pdfSuccesses += 1;
                 } catch (error) {
                     pdfFailures += 1;
                     console.error(
@@ -1796,59 +1797,33 @@ document.addEventListener("DOMContentLoaded", function() {
             }
 
             const wasStopped = stopQueueRequested;
-            const archiveFilename =
-                `vasq_question_reports_${exportTimestamp()}.zip`;
             const completionText = wasStopped
                 ? `Queue stopped. Completed: ${completed}; failed: ${failed}. `
                 : `Queue finished. Completed: ${completed}; failed: ${failed}. `;
-            const queueEndMessage = addQueueStatus(
-                completionText + 'Preparing separate PDF reports...'
-            );
+            let summaryText =
+                completionText +
+                `${pdfSuccesses} PDF report(s) downloaded individually.`;
 
-            try {
-                if (!pdfReports.length) {
-                    throw new Error('No PDF reports were generated.');
-                }
+            if (pdfFailures) {
+                summaryText +=
+                    ` PDF generation failed for ${pdfFailures} question(s).`;
+            }
 
-                if (typeof JSZip === 'undefined') {
-                    pdfReports.forEach(function(report) {
-                        triggerBlobDownload(report.blob, report.filename);
-                    });
-                    queueEndMessage.textContent =
-                        completionText +
-                        `${pdfReports.length} separate PDF file(s) downloaded.`;
-                } else {
-                    const archive = new JSZip();
-                    pdfReports.forEach(function(report) {
-                        archive.file(report.filename, report.blob);
-                    });
-                    const archiveBlob = await archive.generateAsync({
-                        type: 'blob',
-                        compression: 'DEFLATE',
-                        compressionOptions: { level: 6 }
-                    });
-                    triggerBlobDownload(archiveBlob, archiveFilename);
-                    queueEndMessage.textContent =
-                        completionText +
-                        `${pdfReports.length} separate PDF report(s): ` +
-                        archiveFilename;
-                }
-
-                if (pdfFailures) {
-                    queueEndMessage.textContent +=
-                        ` PDF generation failed for ${pdfFailures} question(s).`;
-                }
-            } catch (error) {
-                console.error('Could not export queue PDF reports:', error);
+            if (!pdfSuccesses && results.length) {
+                // Every PDF attempt failed -- fall back to one combined
+                // text file so the queue's answers aren't lost entirely.
                 const fallbackFilename = downloadBatchResults(
                     results,
                     questions.length,
                     wasStopped
                 );
-                queueEndMessage.textContent =
+                summaryText =
                     completionText +
-                    `PDF export failed; text fallback downloaded: ${fallbackFilename}`;
+                    'PDF export failed for all questions; text fallback ' +
+                    `downloaded: ${fallbackFilename}`;
             }
+
+            addQueueStatus(summaryText);
 
             stopQueueRequested = false;
             setQueueControls(false);
