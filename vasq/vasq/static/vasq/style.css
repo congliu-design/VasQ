@@ -490,6 +490,17 @@ img.header-logo {
   overflow-wrap: anywhere;
 }
 
+/* html2canvas can paint the underline of a wrapped link on the preceding
+   text line. Keep links blue and clickable in the PDF, but remove the visual
+   decoration that causes those misplaced horizontal lines. */
+.vasq-pdf-document .system-message a,
+.vasq-pdf-document .system-message a:visited {
+  color: #0645ad;
+  text-decoration: none !important;
+  text-decoration-line: none !important;
+  border-bottom: none !important;
+}
+
 .vasq-pdf-document .system-message table {
   width: 100%;
   max-width: 100%;

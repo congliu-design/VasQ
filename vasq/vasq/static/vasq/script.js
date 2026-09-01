@@ -562,6 +562,33 @@ document.addEventListener("DOMContentLoaded", function() {
                                 'important'
                             );
                         });
+
+                        // Wrapped link underlines can be painted one line too
+                        // high by html2canvas, making ordinary text look
+                        // struck through. Preserve the links themselves while
+                        // removing only their visual decoration in the PDF
+                        // rendering clone.
+                        clonedDocument
+                            .querySelectorAll(
+                                '.vasq-pdf-document .system-message a'
+                            )
+                            .forEach(function(link) {
+                                link.style.setProperty(
+                                    'text-decoration',
+                                    'none',
+                                    'important'
+                                );
+                                link.style.setProperty(
+                                    'text-decoration-line',
+                                    'none',
+                                    'important'
+                                );
+                                link.style.setProperty(
+                                    'border-bottom',
+                                    'none',
+                                    'important'
+                                );
+                            });
                     }
                 },
                 jsPDF: {
