@@ -558,12 +558,15 @@ def call_api(
         ),
     }
 
+    if model.startswith("gpt-5.6"):
+        request_args["reasoning_effort"] = os.getenv(
+            "OPENAI_MAIN_REASONING_EFFORT",
+            "medium",
+        )
+        
     if functions:
         request_args["functions"] = functions
-        
-        if model.startswith("gpt-5.6"):
-            request_args["reasoning_effort"] = "none"
-
+    
     if response_format is not None:
         request_args["response_format"] = response_format
             
