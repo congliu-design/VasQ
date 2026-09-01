@@ -398,6 +398,86 @@ document.addEventListener("DOMContentLoaded", function() {
         });
     }
 
+    function wrapPdfMessageTextBlocks(exportDocument) {
+        const blockTags = new Set([
+            'BLOCKQUOTE',
+            'DIV',
+            'FIGURE',
+            'H1',
+            'H2',
+            'H3',
+            'H4',
+            'H5',
+            'H6',
+            'HR',
+            'IMG',
+            'OL',
+            'P',
+            'PRE',
+            'SECTION',
+            'TABLE',
+            'UL'
+        ]);
+
+        exportDocument.querySelectorAll(
+            '.system-message'
+        ).forEach(function(message) {
+            const originalNodes = Array.from(message.childNodes);
+            if (!originalNodes.length) return;
+
+            const fragment = document.createDocumentFragment();
+            let currentBlock = null;
+            let previousNodeWasBreak = false;
+
+            function startTextBlock() {
+                currentBlock = document.createElement('div');
+                currentBlock.className = 'vasq-pdf-text-block';
+                fragment.appendChild(currentBlock);
+                return currentBlock;
+            }
+
+            originalNodes.forEach(function(node) {
+                const isElement = node.nodeType === 1;
+                const tagName = isElement ? node.tagName : '';
+
+                if (isElement && blockTags.has(tagName)) {
+                    currentBlock = null;
+                    previousNodeWasBreak = false;
+                    fragment.appendChild(node);
+                    return;
+                }
+
+                if (isElement && tagName === 'BR') {
+                    if (currentBlock) {
+                        currentBlock = null;
+                    } else if (previousNodeWasBreak) {
+                        const spacer = document.createElement('div');
+                        spacer.className = 'vasq-pdf-text-spacer';
+                        spacer.setAttribute('aria-hidden', 'true');
+                        fragment.appendChild(spacer);
+                    }
+
+                    previousNodeWasBreak = true;
+                    return;
+                }
+
+                if (
+                    node.nodeType === 3 &&
+                    !node.textContent.trim() &&
+                    !currentBlock
+                ) {
+                    return;
+                }
+
+                if (!currentBlock) startTextBlock();
+                currentBlock.appendChild(node);
+                previousNodeWasBreak = false;
+            });
+
+            message.replaceChildren(fragment);
+        });
+    }
+
     function markCompactPdfMessages(exportDocument, useLandscape) {
         const maximumHeight = useLandscape ? 650 : 980;
 
@@ -480,6 +560,7 @@ document.addEventListener("DOMContentLoaded", function() {
         }
 
         groupPdfTables(exportDocument);
+        wrapPdfMessageTextBlocks(exportDocument);
 
         document.body.appendChild(exportHost);
         markCompactPdfMessages(exportDocument, useLandscape);
@@ -602,6 +683,8 @@ document.addEventListener("DOMContentLoaded", function() {
                         '.user-message',
                         '.queue-status-message',
                         '.vasq-pdf-keep-together',
+                        '.vasq-pdf-text-block',
+                        '.vasq-pdf-text-spacer',
                         '.vasq-pdf-plot',
                         '.vasq-pdf-table-block',
                         '.vasq-pdf-document tr'

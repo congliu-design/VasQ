@@ -501,6 +501,24 @@ img.header-logo {
   border-bottom: none !important;
 }
 
+/* The chat renderer stores much of the answer as text nodes separated by
+   <br> elements. html2pdf cannot find safe page boundaries inside those raw
+   nodes, so the PDF clone wraps them in these blocks before rendering. */
+.vasq-pdf-document .vasq-pdf-text-block,
+.vasq-pdf-document .vasq-pdf-text-spacer {
+  max-width: 100%;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.vasq-pdf-document .vasq-pdf-text-block {
+  min-width: 0;
+}
+
+.vasq-pdf-document .vasq-pdf-text-spacer {
+  height: 0.7em;
+}
+
 .vasq-pdf-document .system-message table {
   width: 100%;
   max-width: 100%;
